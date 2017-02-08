@@ -3,10 +3,24 @@
 import tensorflow as tf, numpy as np
 from matplotlib import pyplot as plt
 
-from tensorflow.examples.tutorials.mnist import input_data
-mnist = input_data.read_data_sets('MNIST_data', one_hot=True)
-
 DTYPE = tf.float32
+
+USE_MNIST = 0
+if USE_MNIST:
+    from tensorflow.examples.tutorials.mnist import input_data
+    mnist = input_data.read_data_sets('MNIST_data', one_hot=True)
+else:
+    import generate
+    training_data = [np.load(generate.FILE_IMAGES), np.load(generate.FILE_LABELS)]
+def next_batch(batch_size):
+    if USE_MNIST:
+        batch = mnist.train.next_batch(batch_size)
+        batch = [batch[0].reshape([-1, 28, 28, 1]), batch[1]]
+    else:
+        num_samples = training_data[0].shape[0]
+        indices = np.random.permutation(num_samples)[:batch_size]
+        batch = [training_data[0][indices], training_data[1][indices]]
+    return batch
 
 LOG_DIR = '/tmp/tflogdir'
 if tf.gfile.Exists(LOG_DIR):
@@ -77,9 +91,8 @@ def local_contrast_norm(x, gaussian_weights):
 
 sess = tf.InteractiveSession()
 
-x = tf.placeholder(DTYPE, shape=[None, 784])
+x_image = tf.placeholder(DTYPE, shape=[None, 28, 28, 1])
 y = tf.placeholder(DTYPE, shape=[None, 10])
-x_image = tf.reshape(x, [-1,28,28,1])
 
 GAUSS_W = gaussian_filter(5)
 
@@ -132,9 +145,8 @@ writer = tf.summary.FileWriter(LOG_DIR, sess.graph)
 sess.run(tf.global_variables_initializer())
 
 for i in range(500):
-    batch = mnist.train.next_batch(1000)
-    feed_dict = {x: batch[0], y: batch[1]}
-
+    batch = next_batch(1000)
+    feed_dict = {x_image: batch[0], y: batch[1]}
     train_step.run(feed_dict=feed_dict)
 
     if 0:

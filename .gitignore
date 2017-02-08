@@ -1,2 +1,3 @@
 .idea
+*.npy
 MNIST_data
