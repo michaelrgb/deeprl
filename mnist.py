@@ -1,9 +1,8 @@
 #!/usr/bin/python
 
 import tensorflow as tf, numpy as np
+from utils import *
 from matplotlib import pyplot as plt
-
-DTYPE = tf.float32
 
 USE_MNIST = 0
 if USE_MNIST:
@@ -39,18 +38,6 @@ def imshow(nparray):
     plt.close()
     plt.imshow(nparray, **kwargs)
     plt.colorbar()
-
-def conv2d(x, W):
-    return tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding='SAME')
-def max_pool_2x2(x):
-    return tf.nn.max_pool(x, ksize=[1, 2, 2, 1],
-                          strides=[1, 2, 2, 1], padding='SAME')
-def weight_variable(shape):
-    return tf.Variable(initial_value=tf.truncated_normal(shape, stddev=0.1))
-def bias_variable(shape):
-    return weight_variable(shape)
-    return tf.Variable(initial_value=tf.constant(0.1, shape=shape))
-
 
 def gaussian_filter(kernel_size):
     x = np.zeros((kernel_size, kernel_size, 1, 1), dtype=DTYPE.name)
