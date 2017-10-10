@@ -2,7 +2,6 @@
 
 import tensorflow as tf, numpy as np
 from utils import *
-from matplotlib import pyplot as plt
 
 USE_MNIST = 0
 if USE_MNIST:
@@ -24,20 +23,6 @@ def next_batch(batch_size):
 LOG_DIR = '/tmp/tflogdir'
 if tf.gfile.Exists(LOG_DIR):
     tf.gfile.DeleteRecursively(LOG_DIR)
-
-def imshow(nparray):
-    kwargs = {'interpolation': 'nearest'}
-    shape = nparray.shape
-    if shape[-1] == 1:
-        # If its greyscale then remove the 3rd dimension if any
-        nparray = nparray.reshape((shape[0], shape[1]))
-        # Plot negative pixels on the blue channel
-        kwargs['cmap'] = 'bwr'
-        kwargs['vmin'] = -1.
-        kwargs['vmax'] = 1.
-    plt.close()
-    plt.imshow(nparray, **kwargs)
-    plt.colorbar()
 
 def gaussian_filter(kernel_size):
     x = np.zeros((kernel_size, kernel_size, 1, 1), dtype=DTYPE.name)
