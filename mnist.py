@@ -24,43 +24,6 @@ LOG_DIR = '/tmp/tflogdir'
 if tf.gfile.Exists(LOG_DIR):
     tf.gfile.DeleteRecursively(LOG_DIR)
 
-def gaussian_filter(kernel_size):
-    x = np.zeros((kernel_size, kernel_size, 1, 1), dtype=DTYPE.name)
-
-    def gauss(x, y, sigma=2.0):
-        Z = 2 * np.pi * sigma ** 2
-        return 1. / Z * np.exp(-(x ** 2 + y ** 2) / (2. * sigma ** 2))
-
-    mid = np.floor(kernel_size / 2.)
-    for i in xrange(0, kernel_size):
-        for j in xrange(0, kernel_size):
-            x[i, j, 0, 0] = gauss(i - mid, j - mid)
-
-    weights = x / np.sum(x)
-    return tf.constant(weights, DTYPE)
-
-def local_contrast_norm(x, gaussian_weights):
-    # Move the input channels into the batches
-    shape = tf.shape(x)
-    x = tf.reshape(x, [shape[0]*shape[3], shape[1], shape[2], 1])
-
-    # For each pixel, remove local mean
-    mean = conv2d(x, gaussian_weights)
-    mean_subtracted = x - mean
-
-    # Calculate the local variance of the data
-    local_variance = tf.sqrt(conv2d(mean_subtracted ** 2, gaussian_weights))
-
-    # Divide by the local variance, with threshold to prevent divide-by-0
-    threshold = 1e-1
-    local_variance = tf.maximum(local_variance, threshold)
-    x = mean_subtracted / local_variance
-
-    # Restore the input channels
-    x = tf.reshape(x, shape)
-
-    return x
-
 sess = tf.InteractiveSession()
 
 x_image = tf.placeholder(DTYPE, shape=[None, 28, 28, 1])
