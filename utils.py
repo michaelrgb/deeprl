@@ -19,7 +19,7 @@ def max_pool(x, size=4, stride=1, padding='VALID'):
     return tf.nn.max_pool(x, ksize=[1, size, size, 1],
                           strides=[1, stride, stride, 1], padding=padding)
 def lrelu(x):
-    return tf.maximum(x, x*0.01)
+    return tf.maximum(x, x*1e-3)
 
 def weight_variable(shape, init_zeros=False):
     return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else tf.truncated_normal(shape, stddev=0.1, seed=0))

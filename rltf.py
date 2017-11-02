@@ -1,16 +1,15 @@
 # coding=utf8
 
-GAMMA = 0.99
+GAMMA = 0.9
 STATE_FRAMES = 4
-ER_SIZE = 1000
+ER_SIZE = 500
 GRADIENT_CORRECTION = True
 COPDAC = True
-STATE_FEATURES = 1000
-FULLY_CONNECTED_LAYERS = 3
-LEARNING_RATE_LINEAR = 1e-5
-LEARNING_RATE_CONV = 1e-12
-MOMENTUM = 0.9
+FULLY_CONNECTED_LAYERS = 5
+FULLY_CONNECTED_NODES = 100
+LEARNING_RATE_LINEAR = 1e-4
 
+IDEAL_POLICY = False
 SAVE_SUMMARIES = False
 SHOW_OBS = False
 MAX_EPISODE_STATES = 10000
@@ -31,7 +30,6 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing.WINDOW_H = 600
 elif ENV_NAME == 'MountainCar-v0':
     envu.max_speed *= 2 # Cant seem to get up mountain
-    STATE_FRAMES = 1
 FRAME_DIM = list(env.observation_space.shape)
 ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
 
@@ -62,10 +60,10 @@ def layer_conv(x, conv_width, conv_stride, input_channels, output_channels):
     #x = [tf.nn.dropout(i, keep_prob=0.5) for i in x]
     return x, [W_conv, b_conv]
 
-def make_conv(x):
+def make_conv(x, chan_in):
     with tf.name_scope('layer0'):
         chan_out = 32
-        x, w = layer_conv(x, 5, 2, STATE_DIM[-1], chan_out)
+        x, w = layer_conv(x, 5, 2, chan_in, chan_out)
         conv_weights = w
     with tf.name_scope('layer1'):
         chan_in = chan_out; chan_out *= 2
@@ -104,56 +102,115 @@ def layer_linear_sum(x, inputs, outputs, init_zeros=False):
         variable_summaries(W_f)
     x = wrapList(x)
     x = [tf.matmul(i, W_f) for i in x]
-    return x, W_f
+    return x, [W_f]
 
 with tf.name_scope('experience_replay'):
-    er_state =      tf.Variable(tf.zeros([ER_SIZE] + STATE_DIM),    False, name='state')
-    er_next_state = tf.Variable(tf.zeros([ER_SIZE] + STATE_DIM),    False, name='next_state')
-    er_action =     tf.Variable(tf.zeros([ER_SIZE, ACTION_DIM]),    False, name='action')
-    er_reward =     tf.Variable(tf.zeros([ER_SIZE, 1]),             False, name='reward')
+    np_state =      np.zeros([ER_SIZE] + STATE_DIM, dtype=DTYPE.name)
+    np_next_state = np.zeros([ER_SIZE] + STATE_DIM, dtype=DTYPE.name)
+    np_action =     np.zeros([ER_SIZE, ACTION_DIM], dtype=DTYPE.name)
+    np_reward =     np.zeros([ER_SIZE, 1], dtype=DTYPE.name)
+    er_state =      tf.Variable(np_state,       False, name='state')
+    er_next_state = tf.Variable(np_next_state,  False, name='next_state')
+    er_action =     tf.Variable(np_action,      False, name='action')
+    er_reward =     tf.Variable(np_reward,      False, name='reward')
 
 def init_vars(): sess.run(tf.global_variables_initializer())
 
 state_ph = tf.placeholder(tf.float32, [None] + STATE_DIM)
 with tf.name_scope('conv_net'):
-    states = [er_state, er_next_state, state_ph]
-    if CONV_NET:
-        conv_net, shared_weights = make_conv(states)
+    value_weights = []
+    states, num_flat_inputs = [er_state, er_next_state, state_ph], STATE_DIM[0]
+
+    conv_channels = STATE_DIM[-1]
+    do_conv = CONV_NET
+    if 0:#not do_conv:
+        conv_channels = 1
+        width_2d = 32
+        states, value_weights = layer_fully_connected(states, num_flat_inputs, width_2d*width_2d)
+        states = [tf.reshape(i, [-1, width_2d, width_2d, 1]) for i in states]
+        do_conv = True
+
+    if do_conv:
+        LEARNING_RATE_LINEAR /= 10
+        states, w = make_conv(states, conv_channels)
+        value_weights += w
         # Calculate topmost convolution dimensionality to create fully-connected layer
         init_vars()
-        conv_net, num_flat_inputs = layer_reshape_flat(conv_net, conv_net[0].eval())
-    else:
-        shared_weights = []
-        conv_net, num_flat_inputs = states, STATE_DIM[0]
-with tf.name_scope('state_features'):
-    state_features = conv_net
+        states, num_flat_inputs = layer_reshape_flat(states, conv_net[0].eval())
+
+with tf.name_scope('fully_connected'):
+    state_features = []
+    policy_weights = []
+    value_inputs = states
+    policy_inputs = states
     for i in range(FULLY_CONNECTED_LAYERS):
-        state_features, w = layer_fully_connected(state_features, num_flat_inputs, STATE_FEATURES)
-        shared_weights += w
-        num_flat_inputs = STATE_FEATURES
+        value_inputs, w = layer_fully_connected(value_inputs, num_flat_inputs, FULLY_CONNECTED_NODES)
+        value_weights += w
+        state_features += [value_inputs[0]]
+        policy_inputs, w = layer_fully_connected(policy_inputs, num_flat_inputs, FULLY_CONNECTED_NODES)
+        policy_weights += w
+        num_flat_inputs = FULLY_CONNECTED_NODES
 
 if COPDAC:
     with tf.name_scope('policy'):
         # a = μ_θ(s)
-        [policy, policy_ph], policy_weights = layer_linear_sum([state_features[0], state_features[2]], STATE_FEATURES, ACTION_DIM)
-        [policy_grad], w_weights = layer_linear_sum(state_features[0], STATE_FEATURES, ACTION_DIM)
+        policy, w = layer_linear_sum([policy_inputs[0], policy_inputs[2]], FULLY_CONNECTED_NODES, ACTION_DIM)
+        policy_weights += w
+
+        #policy = [tf.nn.softmax(i) for i in policy]
+        [policy_er, policy_ph] = policy
+
+        if IDEAL_POLICY:
+            # MountainCar: go with momentum
+            policy_er = tf.where(er_state[:, 1] < 0., tf.constant([[1., 0., 0]]*ER_SIZE), tf.constant([[0., 0., 1.]]*ER_SIZE))
+            policy_ph = tf.where(state_ph[:, 1] < 0., tf.constant([[1., 0., 0]]), tf.constant([[0., 0., 1.]]))
 
 # Qw(s, a) = (a − μ_θ(s)) T ∇_θ[μ_θ(s)] T w + V_v(s)
 with tf.name_scope('state_value'):
     # Baseline value, independent of action a
-    q_value, baseline_weights = layer_linear_sum(state_features, STATE_FEATURES, 1)
+    state_value, state_value_weights = layer_linear_sum(value_inputs, FULLY_CONNECTED_NODES, 1)
+    state_value_weights = value_weights + state_value_weights
+    q_value = state_value[:]
+
 if COPDAC:
-    with tf.name_scope('q_value'):
+    off_policy = tf.expand_dims(er_action - policy_er, 1)
+
+    action_adv = 0.
+    policy_grad, w_weights = 0., []
+    td_approx, td_approx_weights = 0., []
+    for features in state_features:
         # φ(s, a) = ∇_θ[μ_θ(s)](a − μ_θ(s))
-        state_action_features = tf.expand_dims(state_features[0], 2) * tf.expand_dims(er_action - policy, 1)
-        # Advantage of taking action a over action μ_θ(s)
-        action_adv = tf.reduce_sum(state_action_features * tf.expand_dims(w_weights, 0), axis=[1, 2])
-        action_adv = tf.expand_dims(action_adv, 1)
-        # q_value[1] is by definition the same as V_v(s_t+1)
-        q_value[0] += action_adv
+        state_action_features = tf.expand_dims(features, 2) * off_policy
+
+        with tf.name_scope('q_value'):
+            # Change policy in direction of local advantage
+            [grad], w = layer_linear_sum(features, FULLY_CONNECTED_NODES, ACTION_DIM)
+            policy_grad += grad
+            w_weights += w
+
+            # Advantage of taking action a over action μ_θ(s)
+            adv = tf.reduce_sum(state_action_features * w, axis=[1, 2])
+            adv = tf.expand_dims(adv, 1)
+            action_adv += adv
+
+        with tf.name_scope('td_approx'):
+            # Approximate TD error from state AND state-action features
+            [approx], w = layer_linear_sum(features, FULLY_CONNECTED_NODES, 1)
+            td_approx += approx
+            td_approx_weights += w
+
+            sa_size = FULLY_CONNECTED_NODES*ACTION_DIM
+            state_action_features = tf.reshape(state_action_features, [ER_SIZE, sa_size])
+            [approx], w = layer_linear_sum(state_action_features, sa_size, 1)
+            td_approx += approx
+            td_approx_weights += w
+
+if GRADIENT_CORRECTION:
+    # q_value[1] by definition == V_v(s_t+1)
+    q_value[0] += action_adv
 
 with tf.name_scope('td_error'):
-    td_error = er_reward + GAMMA*tf.stop_gradient(q_value[1]) - q_value[0]
+    td_error = er_reward + GAMMA*q_value[1] - q_value[0]
 
     td_error_sq = td_error**2
     td_error_sum = tf.reduce_sum(td_error_sq)
@@ -162,64 +219,63 @@ with tf.name_scope('td_error'):
 
 with tf.name_scope('td_approx'):
     if GRADIENT_CORRECTION:
-        [td_approx], td_approx_weights = layer_linear_sum(state_features[0], STATE_FEATURES, 1, True)
         td_approx_sum = tf.reduce_sum((td_error - td_approx)**2)
         tf.summary.scalar('loss', td_approx_sum)
     else:
         td_approx_sum = tf.constant(0.)
 
-opt_approx = tf.train.RMSPropOptimizer(LEARNING_RATE_LINEAR, momentum=MOMENTUM)
-opt_td = tf.train.RMSPropOptimizer(LEARNING_RATE_LINEAR/4, momentum=MOMENTUM)
-opt_policy = tf.train.RMSPropOptimizer(LEARNING_RATE_LINEAR/100, momentum=MOMENTUM)
+opt_approx = tf.train.AdamOptimizer(LEARNING_RATE_LINEAR, epsilon=.1)
+opt_td = tf.train.AdamOptimizer(LEARNING_RATE_LINEAR/4, epsilon=.1)
+opt_policy = tf.train.AdamOptimizer(LEARNING_RATE_LINEAR/10, epsilon=.1)
 apply_ops = []
 
 # compute_gradients() sums up gradients for all instances, whereas TDC requires a
 # multiple of features at s_t+1 to be subtracted from those at s_t.
 # Therefore use auto-diff to calculate linear "features" of the Q function,
 # and then multiply those features by the TD error etc using custom gradients.
-def replace_gradient(expr, custom_grad):
-    new_op_name = 'new_op_' + str(replace_gradient.counter)
-    replace_gradient.counter += 1
+def gradient_override(expr, custom_grad):
+    new_op_name = 'new_op_' + str(gradient_override.counter)
+    gradient_override.counter += 1
     @tf.RegisterGradient(new_op_name)
     def _grad_(op, grad):
         return -custom_grad
     g = tf.get_default_graph()
     with g.gradient_override_map({"Identity": new_op_name}):
         return tf.identity(expr)
-replace_gradient.counter = 0
+gradient_override.counter = 0
 
-repl = replace_gradient(q_value[0], td_error)
-td_weights = shared_weights + [baseline_weights]
-grad_s = opt_td.compute_gradients(repl, var_list=td_weights)
+repl = gradient_override(state_value[0], td_error)
+grad_s = opt_td.compute_gradients(repl, var_list=state_value_weights)
 if COPDAC:
-    grad_w = opt_td.compute_gradients(repl, var_list=shared_weights+[w_weights])
+    repl = gradient_override(action_adv, td_error)
+    grad_w = opt_td.compute_gradients(repl, var_list=w_weights)
     apply_ops += [opt_td.apply_gradients(grad_w)]
 
 if GRADIENT_CORRECTION:
+    # Approximate the TD error
+    repl = gradient_override(td_approx, td_error-td_approx)
+    grad = opt_approx.compute_gradients(repl, var_list=td_approx_weights)
+    apply_ops += [opt_approx.apply_gradients(grad)]
+
     # TD error with gradient correction (TDC)
-    repl = replace_gradient(q_value[1], -GAMMA*td_approx)
-    grad_s2 = opt_td.compute_gradients(repl, var_list=td_weights)
-    for i in range(len(td_weights)):
+    repl = gradient_override(state_value[1], -GAMMA*td_approx)
+    grad_s2 = opt_td.compute_gradients(repl, var_list=state_value_weights)
+    for i in range(len(state_value_weights)):
         grad_s[i] = (grad_s[i][0] + grad_s2[i][0], grad_s[i][1])
 apply_ops += [opt_td.apply_gradients(grad_s)]
 
-# Approximate the TD error
-repl = replace_gradient(td_approx, td_error-td_approx)
-grad = opt_approx.compute_gradients(repl, var_list=shared_weights+[td_approx_weights])
-apply_ops += [opt_approx.apply_gradients(grad)]
-
 if COPDAC:
-    repl = replace_gradient(policy, policy_grad)
+    repl = gradient_override(policy_er, policy_grad)
     grad = opt_policy.compute_gradients(repl, var_list=policy_weights)
-    apply_ops += [opt_policy.apply_gradients(grad)]
-
-init_vars()
+    if not IDEAL_POLICY:
+        apply_ops += [opt_policy.apply_gradients(grad)]
 
 if SAVE_SUMMARIES:
     merged = tf.summary.merge_all()
     apply_ops += [merged]
     train_writer = tf.summary.FileWriter('/tmp/train', sess.graph)
 
+init_vars()
 on_policy = False
 enable_training = True
 def setup_key_actions(a):
@@ -272,25 +328,26 @@ def rl_loop():
 
         env_action = action if env.action_space.shape else np.argmax(action)
         reward_sum = 0.
+        done = False
         for frame in range(STATE_FRAMES):
             if SHOW_OBS:
                 print('Frame', states_sofar, frame); imshow(obs)
             env.render()
 
             obs, reward, done, info = env.step(env_action)
-            next_state[frame] = obs
             #imshow([obs, test_lcn(obs)])
             if ENV_NAME == 'MountainCar-v0':
-                done = False
                 # Mountain car env doesnt give any +reward
                 if obs[0] >= envu.goal_position:
                     reward = 1000.
-                    done = True
+                    obs = env.reset()
+                    #done = True
+            next_state[frame] = obs
             reward_sum += reward
         print('ER saves:', er_num_saves, 'Action taken:', action, 'Reward:', reward_sum)
         return states_sofar + 1, reward_sum, done
 
-    training_its = 0
+    training_epochs = 0
     def run_training_ops():
         r = sess.run([loss_argmin, td_error_sum, td_approx_sum] + apply_ops)
         save_index=r[0][0]
@@ -298,6 +355,7 @@ def rl_loop():
         r = dict(
             #save_index=save_index,
             er_num_saves=er_num_saves,
+            training_epochs=training_epochs,
             td_error_sum=r[1],
             td_approx_sum=r[2],
             policy_action=policy_action)
@@ -305,7 +363,7 @@ def rl_loop():
         #loss_eval = sess.run(td_error); print(loss_eval)
         if SAVE_SUMMARIES:
             summary = r[3]
-            train_writer.add_summary(summary, training_its)
+            train_writer.add_summary(summary, training_epochs)
         return save_index
 
     global on_policy
@@ -320,15 +378,15 @@ def rl_loop():
             # Calculate the policy actions:
             [policy_action] = sess.run(policy_ph, feed_dict={state_ph: [trans_state(state)]})
             if on_policy:
-                action = policy_action # On-policy
+                action = policy_action
 
         do_env_step = True
         do_training = enable_training and er_num_saves >= ER_SIZE
         if do_training:
             run_training_ops()
-            training_its += 1
+            training_epochs += 1
             # The GL env slows down training
-            #if training_its % 10:
+            #if training_epochs % 10:
             do_env_step = False
 
         if do_env_step:
@@ -341,23 +399,27 @@ def rl_loop():
                 if on_policy:
                     # Keep all the demonstrated actions
                     save_index = ER_SIZE/2 + er_num_saves % int(ER_SIZE/2)
-                sess.run([er_state[save_index].assign(trans_state(state)),
-                          er_next_state[save_index].assign(trans_state(next_state)),
-                          er_action[save_index].assign(action),
-                          er_reward[save_index].assign([reward_sum])])
-                #imshow([er_state[0][:,:,0:3].eval(), er_state[0][:,:,3:6].eval()])
-                er_num_saves += 1
+                np_state[save_index] = trans_state(state)
+                np_next_state[save_index] = trans_state(next_state)
+                np_action[save_index] = action
+                np_reward[save_index] = [reward_sum]
 
-                if er_num_saves == ER_SIZE/2:
+                er_num_saves += 1
+                if er_num_saves == ER_SIZE:
+                    # Update entire ER memory
+                    sess.run([er_state.assign(np_state),
+                              er_next_state.assign(np_next_state),
+                              er_action.assign(np_action),
+                              er_reward.assign(np_reward)])
+
                     np.savetxt(ACTIONS_CSV, er_action[0:er_num_saves].eval(), delimiter=',')
                     # Switch to target policy
                     on_policy = True
 
             state, next_state = next_state, state
-            if done:
-                states_sofar = 0
+            #if done: states_sofar = 0
         else:
             # Render needed for keyboard events
-            if not training_its % 5: env.render()
+            if not training_epochs % 5: env.render()
 
 rl_loop()
