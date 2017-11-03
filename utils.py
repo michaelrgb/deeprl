@@ -88,3 +88,58 @@ def local_contrast_norm(x, gaussian_weights):
     x = tf.reshape(x, [shape[0], shape[3], shape[1], shape[2]])
     x = tf.transpose(x, [0, 2, 3, 1])
     return x
+
+def layer_conv(x, conv_width, conv_stride, input_channels, output_channels):
+    with tf.name_scope('weights'):
+        W_conv = weight_variable([conv_width, conv_width, input_channels, output_channels])
+        variable_summaries(W_conv)
+    with tf.name_scope('bias'):
+        b_conv = weight_variable([output_channels])
+        variable_summaries(b_conv)
+    x = wrapList(x)
+    x = [local_contrast_norm(i, GAUSS_W) for i in x]
+    x = [conv2d(i, W_conv, stride=conv_stride) + b_conv for i in x]
+    return x, [W_conv, b_conv]
+
+def make_conv(x, chan_in):
+    conv_weights = []
+    chan_out = 32
+    for l in range(3):
+        with tf.name_scope('layer%i' % i):
+            x, w = layer_conv(x, 5, 2, chan_in, chan_out)
+            conv_weights += w
+            chan_in = chan_out; chan_out *= 2
+    return x, conv_weights
+
+def layer_reshape_flat(x, conv_eval):
+    input_size = conv_eval.shape[1]
+    input_channels = conv_eval.shape[3]
+    flat_size = input_size * input_size * input_channels
+    print('Convolution shape:', conv_eval.shape, 'resizing to flat:', flat_size)
+    x = wrapList(x)
+    x = [tf.reshape(i, [-1, flat_size]) for i in x]
+    return x, flat_size
+
+def layer_fully_connected(x, flat_size, outputs, activation=lrelu):
+    with tf.name_scope('weights'):
+        W_f = weight_variable([flat_size, outputs])
+        variable_summaries(W_f)
+    with tf.name_scope('bias'):
+        b_f = weight_variable([outputs])
+        variable_summaries(b_f)
+    x = wrapList(x)
+    x = [tf.matmul(i, W_f) + b_f for i in x]
+    if activation:
+        x = [activation(i) for i in x]
+    return x, [W_f, b_f]
+
+def layer_linear_sum(x, inputs, outputs, init_zeros=False):
+    with tf.name_scope('weights'):
+        W_f = weight_variable([inputs, outputs], init_zeros)
+        variable_summaries(W_f)
+    x = wrapList(x)
+    x = [tf.matmul(i, W_f) for i in x]
+    if outputs == 1:
+        # Remove dimension
+        x = [i[:, 0] for i in x]
+    return x, [W_f]
