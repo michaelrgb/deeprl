@@ -105,7 +105,7 @@ def make_conv(x, chan_in):
     conv_weights = []
     chan_out = 32
     for l in range(3):
-        with tf.name_scope('layer%i' % i):
+        with tf.name_scope('layer%i' % l):
             x, w = layer_conv(x, 5, 2, chan_in, chan_out)
             conv_weights += w
             chan_in = chan_out; chan_out *= 2
@@ -133,13 +133,18 @@ def layer_fully_connected(x, flat_size, outputs, activation=lrelu):
         x = [activation(i) for i in x]
     return x, [W_f, b_f]
 
-def layer_linear_sum(x, inputs, outputs, init_zeros=False):
+def layer_linear_sum(x, inputs, outputs=None, init_zeros=False):
     with tf.name_scope('weights'):
-        W_f = weight_variable([inputs, outputs], init_zeros)
+        W_f = weight_variable([inputs, outputs or 1], init_zeros)
         variable_summaries(W_f)
     x = wrapList(x)
     x = [tf.matmul(i, W_f) for i in x]
-    if outputs == 1:
+    if outputs is None:
         # Remove dimension
         x = [i[:, 0] for i in x]
     return x, [W_f]
+
+def layer_make_features(x, conditions):
+    x = wrapList(x)
+    x = [[tf.expand_dims(tf.cast(cond(i), DTYPE), 1) for cond in conditions] for i in x]
+    return [tf.concat(i, axis=1) for i in x]
