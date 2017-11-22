@@ -18,11 +18,18 @@ def conv2d(x, W, stride=1, padding='VALID'):
 def max_pool(x, size=4, stride=1, padding='VALID'):
     return tf.nn.max_pool(x, ksize=[1, size, size, 1],
                           strides=[1, stride, stride, 1], padding=padding)
+
+RELU_LEAK = 1e-3
 def lrelu(x):
-    return tf.maximum(x, x*1e-3)
+    #return tf.maximum(x, x*RELU_LEAK)
+    return tf.where(x > 0., x, x*RELU_LEAK)
+def lrelu_grad(x):
+    return tf.where(x > 0., tf.ones(x.shape), tf.constant(RELU_LEAK, shape=x.shape))
 
 def weight_variable(shape, init_zeros=False):
     return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else tf.truncated_normal(shape, stddev=0.1, seed=0))
+def clamp_weights(grads, clamp):
+    return [(tf.where(w > clamp, tf.abs(g), tf.where(w < -clamp, -tf.abs(g), g)), w) for g,w in grads]
 
 def imshow(imlist):
     import matplotlib.pyplot as plt
@@ -89,6 +96,7 @@ def local_contrast_norm(x, gaussian_weights):
     x = tf.transpose(x, [0, 2, 3, 1])
     return x
 
+GAUSS_W = gaussian_filter(5)
 def layer_conv(x, conv_width, conv_stride, input_channels, output_channels):
     with tf.name_scope('weights'):
         W_conv = weight_variable([conv_width, conv_width, input_channels, output_channels])
@@ -128,10 +136,10 @@ def layer_fully_connected(x, flat_size, outputs, activation=lrelu):
         b_f = weight_variable([outputs])
         variable_summaries(b_f)
     x = wrapList(x)
-    x = [tf.matmul(i, W_f) + b_f for i in x]
+    x = t = [tf.matmul(i, W_f) + b_f for i in x]
     if activation:
         x = [activation(i) for i in x]
-    return x, [W_f, b_f]
+    return x, [W_f, b_f], t
 
 def layer_linear_sum(x, inputs, outputs=None, init_zeros=False):
     with tf.name_scope('weights'):
