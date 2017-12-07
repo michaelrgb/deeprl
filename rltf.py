@@ -1,12 +1,10 @@
-# coding=utf8
-
-GAMMA = 0.99
+GAMMA = 0.999
 STATE_FRAMES = 4
 ER_SIZE = 500
 VALUE_LAYERS = 2
-VALUE_NODES = 20
 POLICY_LAYERS = 2
-POLICY_NODES = 10
+HIDDEN_NODES = 50
+STATE_ACTIONS = False
 
 import tensorflow as tf, numpy as np
 from utils import *
@@ -14,7 +12,7 @@ from utils import *
 LEARNING_RATE = 1e-3
 opt_approx = tf.train.AdamOptimizer(LEARNING_RATE, epsilon=2)
 opt_td = tf.train.AdamOptimizer(LEARNING_RATE/5, epsilon=2)
-opt_policy = tf.train.AdamOptimizer(LEARNING_RATE/10, epsilon=2)
+opt_policy = tf.train.AdamOptimizer(LEARNING_RATE/100, epsilon=2)
 
 SAVE_SUMMARIES = False
 SHOW_OBS = False
@@ -33,10 +31,11 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
 elif ENV_NAME == 'MountainCar-v0':
-    envu.max_speed *= 2 # Cant seem to get up mountain
     STATE_FRAMES = 1
-FRAME_DIM = list(env.observation_space.shape)
 ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
+FRAME_DIM = list(env.observation_space.shape)
+if STATE_ACTIONS:
+     FRAME_DIM[0] += ACTION_DIM
 
 TEST_FEATURES = False
 if TEST_FEATURES:
@@ -105,10 +104,12 @@ gradient_override.counter = 0
 
 all_td_error_sum = []
 all_td_approx_sum = []
+all_policy_minmax = []
 all_policy_ph = []
 for r in range(len(all_rewards)):
     states, num_flat_inputs = [er_state, er_next_state, state_ph], STATE_DIM[0]
     shared_layer = states
+    activation=lambda x: tf.nn.leaky_relu(x, alpha=1e-2)
     with tf.name_scope('conv_net'):
         value_weights = []
 
@@ -117,7 +118,7 @@ for r in range(len(all_rewards)):
         if 0:#not do_conv:
             conv_channels = 1
             width_2d = 32
-            shared_layer, value_weights, _ = layer_fully_connected(shared_layer, num_flat_inputs, width_2d*width_2d)
+            shared_layer, value_weights = layer_fully_connected(shared_layer, num_flat_inputs, width_2d*width_2d, activation)
             shared_layer = [tf.reshape(i, [-1, width_2d, width_2d, 1]) for i in shared_layer]
             do_conv = True
 
@@ -128,115 +129,54 @@ for r in range(len(all_rewards)):
             init_vars()
             shared_layer, num_flat_inputs = layer_reshape_flat(shared_layer, shared_layer[0].eval())
 
-    activation, activation_grad = lrelu, lrelu_grad
-    with tf.name_scope('fully_connected'):
-        value_layer = shared_layer
+    def make_state_network(num_layers, num_outputs, last_layer_activation=None):
+        weights = []
+        prev_output = shared_layer
         input_size = num_flat_inputs
-        for l in range(VALUE_LAYERS):
-            value_layer, w, _ = layer_fully_connected(value_layer, input_size, VALUE_NODES,
-                                                      activation=activation)
-            value_weights += w
-            input_size = VALUE_NODES
+        for l in range(num_layers):
+            prev_output, w = layer_fully_connected(prev_output, input_size, HIDDEN_NODES, activation)
+            weights += w
+            input_size = HIDDEN_NODES
+        output, w = layer_fully_connected(prev_output, HIDDEN_NODES, num_outputs, last_layer_activation)
+        weights += w
+        return output, prev_output, weights
 
     with tf.name_scope('policy'):
-        policy_layer = shared_layer
-        input_size = num_flat_inputs
-        policy_x, policy_r, policy_weights, policy_t = [], [], [], []
-        for l in range(POLICY_LAYERS):
-            policy_x += [policy_layer]
-            policy_layer, w, t = layer_fully_connected(policy_layer, input_size, POLICY_NODES,
-                                                       activation=activation)
-            policy_r += [policy_layer]
-            policy_weights += [w]
-            policy_t += [t[:2]]
-            input_size = POLICY_NODES
-
-        # a = μ_θ(s)
-        policy, [linear_w] = layer_linear_sum(policy_layer, input_size, ACTION_DIM)
-        policy_pre_activation = policy
-        policy = [tf.nn.softmax(i) for i in policy]
+        policy, _, policy_weights = make_state_network(POLICY_LAYERS, ACTION_DIM)
         all_policy_ph.append(policy[2])
-
-    # Backpropagate policy network for linear features of each layer
-    with tf.name_scope('policy_features'):
-        all_features = []
-        da_dr = [tf.expand_dims(linear_w, 0)]*2
-        for x,t,(w,b) in reversed(zip(policy_x, policy_t, policy_weights)):
-            dr_dt = [activation_grad(i) for i in t]
-            dt_dw = x
-
-            da_dt = [i*tf.expand_dims(j, 2) for (i,j) in zip(da_dr, dr_dt)]
-            da_db = da_dt
-            da_dw = [tf.expand_dims(i, 1)*tf.expand_dims(tf.expand_dims(j, -1), -1) for (i,j) in zip(da_dt, dt_dw)]
-            all_features += [da_db, da_dw]
-
-            # Backpropagate to previous layer
-            dt_dx = tf.expand_dims(tf.expand_dims(w, 0), -1)
-            da_dr = [tf.reduce_sum(tf.expand_dims(i, 1) * dt_dx, axis=2) for i in da_dt]
-        all_features = list(reversed(all_features))
-
-        policy_weights = [val for sub in policy_weights for val in sub] + [linear_w]
-        all_features += [[tf.expand_dims(i, -1) for i in policy_layer]] # Last hidden layer output is linear in policy
-
-    if 1:
-        # Test that features match up with compute_gradients()
-        init_vars()
-        for f, (features,weights) in enumerate(zip(all_features, policy_weights)):
-            diff = 0.
-            for a in range(ACTION_DIM):
-                idx = 0
-                grad = opt_td.compute_gradients(policy_pre_activation[0][idx, a], var_list=weights)
-                g = grad[0][0]
-                feat = features[0][idx]
-                if f == len(policy_weights)-1:
-                    g = g[..., a]
-                    feat = feat[..., 0]
-                else:
-                    feat = feat[..., a]
-                g = g.eval()
-                feat = feat.eval()
-                diff += g - feat
-            assert((diff < 1e-2).all())
-
-    with tf.name_scope('td_approx'):
-        [td_approx], td_approx_weights = layer_linear_sum(value_layer[0], VALUE_NODES, init_zeros=True)
-        td_approx_weights += value_weights
+        all_policy_minmax.append([tf.reduce_min(policy[0], axis=0), tf.reduce_max(policy[0], axis=0)])
 
     with tf.name_scope('state_value'):
         # Baseline value, independent of action a
-        state_value, w = layer_linear_sum(value_layer, VALUE_NODES)
+        state_value, value_layer, w = make_state_network(VALUE_LAYERS, None)
         value_weights += w
-        tf.summary.histogram('value', state_value[0])
 
-    adv_weights = []
-    adv_action, q_value = [0.]*2, [0.]*2
-    for features in all_features:
-        for i in range(2):
-            s_feat = features[i]
+    with tf.name_scope('local_advantage'):
+        adv_layer, _, adv_weights = make_state_network(VALUE_LAYERS, HIDDEN_NODES*ACTION_DIM, activation)
 
-            # φ(s, a) = ∇_θ[μ_θ(s)](a − μ_θ(s))
-            off_policy = er_action - policy[i]
-            slen = len(s_feat.shape)
-            for s in range(2, slen):
-                off_policy = tf.expand_dims(off_policy, 1)
-            sa_feat = s_feat * off_policy
+        # Advantage is linear in (action-policy)
+        off_policy = [er_action-i for i in policy]
+        adv_layer = [tf.reshape(i, [-1, HIDDEN_NODES, ACTION_DIM]) * tf.expand_dims(j, 1) \
+            for (i,j) in zip(adv_layer, off_policy)]
+        adv_layer = [tf.reshape(i, [-1, HIDDEN_NODES*ACTION_DIM]) for i in adv_layer]
 
-            if i == 0:
-                with tf.name_scope('td_approx'):
-                    # Approximate TD error from state AND state-action features
-                    w = weight_variable(sa_feat.shape[1:], init_zeros=True)
-                    approx = tf.reduce_sum(sa_feat * tf.expand_dims(w, 0), range(1, slen))
-                    td_approx += approx
-                    td_approx_weights += [w]
-                with tf.name_scope('adv_action'):
-                    adv_w = weight_variable(sa_feat.shape[1:])
-                    adv_weights += [adv_w]
-            # Advantage of taking action a over action μ_θ(s)
-            adv_action[i] = adv_action[i] + tf.reduce_sum(sa_feat * tf.expand_dims(adv_w, 0), range(1, slen))
+        adv_value, w = layer_fully_connected(adv_layer, HIDDEN_NODES*ACTION_DIM)
+        adv_weights += w
 
-            with tf.name_scope('q_value'):
-                # Qw(s, a) = (a − μ_θ(s)) T ∇_θ[μ_θ(s)] T w + V_v(s)
-                q_value[i] = adv_action[i] + state_value[i]
+        adv = adv_value[0]
+        adv_grad = tf.gradients(adv, off_policy[0])[0]
+        policy_grad = adv_grad * tf.expand_dims(adv, -1)
+
+    with tf.name_scope('td_approx'):
+        [td_approx], td_approx_weights = layer_fully_connected(value_layer[0], HIDDEN_NODES)
+        td_approx_weights += value_weights
+
+        [approx], w = layer_fully_connected(adv_layer[0], HIDDEN_NODES*ACTION_DIM)
+        td_approx += approx
+        td_approx_weights += adv_weights + w
+
+    with tf.name_scope('q_value'):
+        q_value = [i+j for i,j in zip(state_value, adv_value)]
 
     with tf.name_scope('td_error'):
         td_error = all_rewards[r] + GAMMA*q_value[1] - q_value[0]
@@ -252,10 +192,8 @@ for r in range(len(all_rewards)):
         tf.summary.scalar('loss', td_approx_sum)
         all_td_approx_sum.append([td_approx_sum])
 
-    # θ_t+1 = θ_t + α_θ*w_t
-    grad = [(-adv_weights[-1], policy_weights[-1])]
-    grad += [(-tf.reduce_sum(adv, axis=-1), w) for adv,w in zip(adv_weights[:-1], policy_weights[:-1])]
-    grad = clamp_weights(grad, 0.5)
+    repl = gradient_override(policy[0], policy_grad)
+    grad = opt_policy.compute_gradients(repl, var_list=policy_weights)
     apply_ops += [opt_policy.apply_gradients(grad)]
 
     # Approximate the TD error
@@ -264,8 +202,7 @@ for r in range(len(all_rewards)):
     apply_ops += [opt_approx.apply_gradients(grad)]
 
     # TD error with gradient correction (TDC)
-    for e, (value, weights), in enumerate(
-            [(state_value, value_weights), (adv_action, adv_weights)]):
+    for (value, weights) in [(q_value, value_weights+adv_weights)]:
         repl = gradient_override(value[0], td_error)
         grad_s = opt_td.compute_gradients(repl, var_list=weights)
         repl = gradient_override(value[1], -GAMMA*td_approx)
@@ -345,11 +282,14 @@ def rl_loop():
             env.render()
 
             obs, reward, done, info = env.step(env_action)
+            obs = list(obs)
+            if STATE_ACTIONS:
+                obs += list(action)
             if TEST_FEATURES:
-                obs = [float(f > 0.) for f in [
+                obs += [float(f > 0.) for f in [
                     obs[1],
                     -obs[1],
-                    ]] + list(obs)
+                    ]]
             #imshow([obs, test_lcn(obs)])
             if ENV_NAME == 'MountainCar-v0':
                 # Mountain car env doesnt give any +reward
@@ -370,16 +310,15 @@ def rl_loop():
             train_writer.add_summary(summary, training_epochs)
         r = dict(
             #save_index=save_index,
-            #er_num_saves=er_num_saves,
-            adv_weights=adv_weights[-1].eval(),
-            policy_weights=policy_weights[-1].eval(),
+            #policy_weights='\n'.join(str(w.eval()) for w in policy_weights),
             training_epochs=training_epochs,
             td_error_sum=r[1],
             td_approx_sum=r[2],
             policy_index=policy_index,
-            policy_action=policy_action,)
+            policy_action=policy_action,
+            policy_minmax=sess.run(all_policy_minmax[policy_index]))
         for k in sorted(r.keys()):
-            print(k, r[k])
+            print(k + ': ' + str(r[k]))
         print(' ')
         return save_index
 

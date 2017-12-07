@@ -19,13 +19,6 @@ def max_pool(x, size=4, stride=1, padding='VALID'):
     return tf.nn.max_pool(x, ksize=[1, size, size, 1],
                           strides=[1, stride, stride, 1], padding=padding)
 
-RELU_LEAK = 1e-3
-def lrelu(x):
-    #return tf.maximum(x, x*RELU_LEAK)
-    return tf.where(x > 0., x, x*RELU_LEAK)
-def lrelu_grad(x):
-    return tf.where(x > 0., tf.ones(x.shape), tf.constant(RELU_LEAK, shape=x.shape))
-
 def weight_variable(shape, init_zeros=False):
     return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else tf.truncated_normal(shape, stddev=0.1, seed=0))
 def clamp_weights(grads, clamp):
@@ -128,18 +121,21 @@ def layer_reshape_flat(x, conv_eval):
     x = [tf.reshape(i, [-1, flat_size]) for i in x]
     return x, flat_size
 
-def layer_fully_connected(x, flat_size, outputs, activation=lrelu):
+def layer_fully_connected(x, flat_size, outputs=None, activation=None):
     with tf.name_scope('weights'):
-        W_f = weight_variable([flat_size, outputs])
+        W_f = weight_variable([flat_size, outputs or 1])
         variable_summaries(W_f)
     with tf.name_scope('bias'):
-        b_f = weight_variable([outputs])
+        b_f = weight_variable([outputs or 1])
         variable_summaries(b_f)
     x = wrapList(x)
-    x = t = [tf.matmul(i, W_f) + b_f for i in x]
+    x = [tf.matmul(i, W_f) + b_f for i in x]
     if activation:
         x = [activation(i) for i in x]
-    return x, [W_f, b_f], t
+    if outputs is None:
+        # Remove dimension
+        x = [i[:, 0] for i in x]
+    return x, [W_f, b_f]
 
 def layer_linear_sum(x, inputs, outputs=None, init_zeros=False):
     with tf.name_scope('weights'):
