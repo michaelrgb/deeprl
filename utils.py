@@ -98,7 +98,6 @@ def layer_conv(x, conv_width, conv_stride, input_channels, output_channels):
         b_conv = weight_variable([output_channels])
         variable_summaries(b_conv)
     x = wrapList(x)
-    x = [local_contrast_norm(i, GAUSS_W) for i in x]
     x = [conv2d(i, W_conv, stride=conv_stride) + b_conv for i in x]
     return x, [W_conv, b_conv]
 
@@ -116,7 +115,7 @@ def layer_reshape_flat(x, conv_eval):
     input_size = conv_eval.shape[1]
     input_channels = conv_eval.shape[3]
     flat_size = input_size * input_size * input_channels
-    print('Convolution shape:', conv_eval.shape, 'resizing to flat:', flat_size)
+    print('layer_reshape_flat shape:', conv_eval.shape, 'resizing to flat:', flat_size)
     x = wrapList(x)
     x = [tf.reshape(i, [-1, flat_size]) for i in x]
     return x, flat_size
