@@ -22,17 +22,14 @@ x = x_image
 
 chan_in, chan_out = 1, 32
 [x], w = layer_conv(x, 7, 1, chan_in, chan_out)
-weights = w
 x = max_pool(x, size=3)
 
 chan_in = chan_out; chan_out *= 2
 [x], w = layer_conv(x, 7, 1, chan_in, chan_out)
-weights += w
 x = max_pool(x, size=3)
 
 chan_in = chan_out; chan_out *= 2
 [x], w = layer_conv(x, 7, 1, chan_in, chan_out)
-weights += w
 x = max_pool(x, size=3)
 
 init_vars()
@@ -44,19 +41,17 @@ HIDDEN_NODES = 1024
 
 for i in range(HIDDEN_LAYERS):
     x = tf.nn.dropout(x, keep_prob=dropout_keep)
-    [x], w = layer_fully_connected(x, flat_size, HIDDEN_NODES, activation=tf.nn.selu)
-    weights += w
+    [x] = layer_fully_connected(x, flat_size, HIDDEN_NODES, activation=tf.nn.selu)
     flat_size = HIDDEN_NODES
 
 x = tf.nn.dropout(x, keep_prob=dropout_keep)
-[y_out], w = layer_fully_connected(x, HIDDEN_NODES, 10, activation=None) # unscaled logits
-weights += w
+[y_out] = layer_fully_connected(x, HIDDEN_NODES, 10, activation=None) # unscaled logits
 
 LEARNING_RATE = 1e-3
 opt = tf.train.AdamOptimizer(LEARNING_RATE, epsilon=0.1)
 
 cross_entropy = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=y_truth, logits=y_out))
-grad = opt.compute_gradients(cross_entropy, var_list=weights)
+grad = opt.compute_gradients(cross_entropy, var_list=None)
 train_step = opt.apply_gradients(grad)
 
 correct_prediction = tf.equal(tf.argmax(y_out, 1), tf.argmax(y_truth, 1))

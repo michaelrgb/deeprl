@@ -11,8 +11,8 @@ from utils import *
 
 LEARNING_RATE = 1e-3
 opt_approx = tf.train.AdamOptimizer(LEARNING_RATE, epsilon=2)
-opt_td = tf.train.AdamOptimizer(LEARNING_RATE/5, epsilon=2)
-opt_policy = tf.train.AdamOptimizer(LEARNING_RATE/100, epsilon=2)
+opt_td = tf.train.AdamOptimizer(LEARNING_RATE/2, epsilon=2)
+opt_policy = tf.train.AdamOptimizer(LEARNING_RATE/10, epsilon=2)
 
 SAVE_SUMMARIES = False
 SHOW_OBS = False
@@ -43,32 +43,44 @@ if TEST_FEATURES:
     FRAME_DIM[0] += 2
 
 CONV_NET = len(FRAME_DIM) == 3
+GREYSCALE = CONV_NET
 STATE_DIM = FRAME_DIM[:]
+if GREYSCALE and STATE_DIM[-1] == 3:
+    STATE_DIM[-1] = 1
 STATE_DIM[-1] *= STATE_FRAMES
 
 sess = tf.InteractiveSession()
 
-def test_lcn(image, batch_idx=0):
-    frame_ph = tf.placeholder(tf.float32, [None] + list(image.shape[-3:]))
-    lcn_op = local_contrast_norm(frame_ph, GAUSS_W)
-    lcn = sess.run(lcn_op, feed_dict={frame_ph: np.expand_dims(image, 0)})
-    return lcn[batch_idx]
-
 REWARDS_GLOBAL = 1
 with tf.name_scope('experience_replay'):
-    np_state =      np.random.randn(*([ER_SIZE] + STATE_DIM)).astype(DTYPE.name)
-    np_next_state = np.random.randn(*([ER_SIZE] + STATE_DIM)).astype(DTYPE.name)
+    np_state =      np.random.randn(*([ER_SIZE, STATE_FRAMES] + FRAME_DIM)).astype(DTYPE.name)
+    np_next_state = np.random.randn(*([ER_SIZE, STATE_FRAMES] + FRAME_DIM)).astype(DTYPE.name)
     np_action =     np.random.randn(*([ER_SIZE, ACTION_DIM])).astype(DTYPE.name)
     np_reward =     np.random.randn(*([ER_SIZE, REWARDS_GLOBAL])).astype(DTYPE.name)
-    er_state =      tf.Variable(np_state,       False, name='state')
-    er_next_state = tf.Variable(np_next_state,  False, name='next_state')
+    er_state =      tf.Variable(tf.zeros([ER_SIZE] + STATE_DIM),  False, name='state')
+    er_next_state = tf.Variable(tf.zeros([ER_SIZE] + STATE_DIM),  False, name='next_state')
     er_action =     tf.Variable(np_action,      False, name='action')
     er_reward =     tf.Variable(np_reward,      False, name='reward')
 
 all_rewards = [er_reward[:, r] for r in range(REWARDS_GLOBAL)] + [
-tf.abs(er_next_state[:, 1]), # Momentum
--tf.abs(er_next_state[:, 1]), # Stop
 ]
+
+def init_vars(): sess.run(tf.global_variables_initializer())
+state_ph = tf.placeholder(tf.float32, [None] + STATE_DIM)
+
+if CONV_NET:
+    frame_ph = tf.placeholder(tf.float32, [None] + FRAME_DIM)
+    frame_norm = local_contrast_norm(frame_ph, GAUSS_W)
+    frame_grayscale = tf.reduce_sum(frame_norm, axis=-1)
+    frame_grayscale = tf.reshape(frame_grayscale, [-1, STATE_FRAMES] + FRAME_DIM[:-1])
+    frame_grayscale = tf.transpose(frame_grayscale, [0, 2, 3, 1]) # Move STATE_FRAMES into channels
+
+def trans_state(x):
+    if CONV_NET:
+        ret = frame_grayscale.eval(feed_dict={frame_ph: x})
+    else:
+        ret = [x.reshape(STATE_DIM)]
+    return ret
 
 enable_training = False
 def toggle_training():
@@ -76,16 +88,20 @@ def toggle_training():
     enable_training ^= 1
     if not enable_training:
         return
+
     # Upload entire ER memory
-    sess.run([er_state.assign(np_state),
-              er_next_state.assign(np_next_state),
-              er_action.assign(np_action),
+    if CONV_NET:
+        shape = [ER_SIZE * STATE_FRAMES] + FRAME_DIM
+        sess.run(er_state.assign(frame_grayscale), feed_dict={frame_ph: np_state.reshape(shape)})
+        sess.run(er_next_state.assign(frame_grayscale), feed_dict={frame_ph: np_next_state.reshape(shape)})
+        # imshow(test_lcn(np_state[0], sess))
+        # imshow([er_state[0][:,:,i].eval() for i in range(STATE_FRAMES)])
+    else:
+        shape = [ER_SIZE] + STATE_DIM
+        sess.run([er_state.assign(np_state.reshape(shape)),
+                  er_next_state.assign(np_next_state.reshape(shape))])
+    sess.run([er_action.assign(np_action),
               er_reward.assign(np_reward)])
-
-def init_vars(): sess.run(tf.global_variables_initializer())
-state_ph = tf.placeholder(tf.float32, [1] + STATE_DIM)
-
-apply_ops = []
 
 # compute_gradients() sums up gradients for all instances, whereas TDC requires a
 # multiple of features at s_t+1 to be subtracted from those at s_t.
@@ -106,74 +122,71 @@ all_td_error_sum = []
 all_td_approx_sum = []
 all_policy_minmax = []
 all_policy_ph = []
-for r in range(len(all_rewards)):
+apply_ops = []
+
+def make_acrl():
     states, num_flat_inputs = [er_state, er_next_state, state_ph], STATE_DIM[0]
     shared_layer = states
     activation=lambda x: tf.nn.leaky_relu(x, alpha=1e-2)
     with tf.name_scope('conv_net'):
-        value_weights = []
-
         conv_channels = STATE_DIM[-1]
         do_conv = CONV_NET
         if 0:#not do_conv:
             conv_channels = 1
             width_2d = 32
-            shared_layer, value_weights = layer_fully_connected(shared_layer, num_flat_inputs, width_2d*width_2d, activation)
+            shared_layer = layer_fully_connected(shared_layer, num_flat_inputs, width_2d*width_2d, activation)
             shared_layer = [tf.reshape(i, [-1, width_2d, width_2d, 1]) for i in shared_layer]
             do_conv = True
 
         if do_conv:
-            shared_layer, w = make_conv(shared_layer, conv_channels)
-            value_weights += w
+            shared_layer = make_conv(shared_layer, conv_channels)
             # Calculate topmost convolution dimensionality to create fully-connected layer
             init_vars()
             shared_layer, num_flat_inputs = layer_reshape_flat(shared_layer, shared_layer[0].eval())
 
     def make_state_network(num_layers, num_outputs, last_layer_activation=None):
-        weights = []
         prev_output = shared_layer
         input_size = num_flat_inputs
         for l in range(num_layers):
-            prev_output, w = layer_fully_connected(prev_output, input_size, HIDDEN_NODES, activation)
-            weights += w
+            prev_output = layer_fully_connected(prev_output, input_size, HIDDEN_NODES, activation)
             input_size = HIDDEN_NODES
-        output, w = layer_fully_connected(prev_output, HIDDEN_NODES, num_outputs, last_layer_activation)
-        weights += w
-        return output, prev_output, weights
+        output = layer_fully_connected(prev_output, input_size, num_outputs, last_layer_activation)
+        return output, prev_output
 
     with tf.name_scope('policy'):
-        policy, _, policy_weights = make_state_network(POLICY_LAYERS, ACTION_DIM)
+        policy, _ = make_state_network(POLICY_LAYERS, ACTION_DIM)
         all_policy_ph.append(policy[2])
         all_policy_minmax.append([tf.reduce_min(policy[0], axis=0), tf.reduce_max(policy[0], axis=0)])
 
     with tf.name_scope('state_value'):
         # Baseline value, independent of action a
-        state_value, value_layer, w = make_state_network(VALUE_LAYERS, None)
-        value_weights += w
+        state_value, value_layer = make_state_network(VALUE_LAYERS, None)
 
-    with tf.name_scope('local_advantage'):
-        adv_layer, _, adv_weights = make_state_network(VALUE_LAYERS, HIDDEN_NODES*ACTION_DIM, activation)
+    def make_advantage_network(offset):
+        offset_dim = int(offset.shape[1])
+        layer, _ = make_state_network(VALUE_LAYERS, HIDDEN_NODES*offset_dim, activation)
+        layer = [tf.reshape(i, [-1, HIDDEN_NODES, offset_dim]) * tf.expand_dims(offset, 1) for i in layer]
 
+        w = weight_variable([HIDDEN_NODES, offset_dim])
+        adv_action = [tf.reduce_sum(i * tf.expand_dims(w, 0), 1) for i in layer]
+        adv_value = [tf.reduce_sum(i, 1) for i in adv_action]
+        return adv_action, adv_value
+
+    with tf.name_scope('action_advantage'):
         # Advantage is linear in (action-policy)
-        off_policy = [er_action-i for i in policy]
-        adv_layer = [tf.reshape(i, [-1, HIDDEN_NODES, ACTION_DIM]) * tf.expand_dims(j, 1) \
-            for (i,j) in zip(adv_layer, off_policy)]
-        adv_layer = [tf.reshape(i, [-1, HIDDEN_NODES*ACTION_DIM]) for i in adv_layer]
+        off_policy = er_action-policy[0]
+        adv_action, adv_value = make_advantage_network(off_policy)
 
-        adv_value, w = layer_fully_connected(adv_layer, HIDDEN_NODES*ACTION_DIM)
-        adv_weights += w
-
-        adv = adv_value[0]
-        adv_grad = tf.gradients(adv, off_policy[0])[0]
-        policy_grad = adv_grad * tf.expand_dims(adv, -1)
+        adv_grad = tf.gradients(adv_value[0], off_policy)[0]
+        policy_grad = adv_grad * adv_action[0]
 
     with tf.name_scope('td_approx'):
-        [td_approx], td_approx_weights = layer_fully_connected(value_layer[0], HIDDEN_NODES)
-        td_approx_weights += value_weights
+        approx, _ = make_state_network(VALUE_LAYERS, None)
+        td_approx = approx[0]
 
-        [approx], w = layer_fully_connected(adv_layer[0], HIDDEN_NODES*ACTION_DIM)
-        td_approx += approx
-        td_approx_weights += adv_weights + w
+        _, approx = make_advantage_network(
+            tf.concat([tf.maximum(off_policy, 0.), tf.maximum(-off_policy, 0.)], axis=1))
+        td_approx += approx[0]
 
     with tf.name_scope('q_value'):
         q_value = [i+j for i,j in zip(state_value, adv_value)]
@@ -185,7 +198,6 @@ for r in range(len(all_rewards)):
         td_error_sum = tf.reduce_sum(td_error_sq)
         all_td_error_sum.append([td_error_sum])
         #loss_argmin = tf.argmin(td_error_sq, 0)
-        loss_argmin = tf.constant([0])
 
     with tf.name_scope('td_approx'):
         td_approx_sum = tf.reduce_sum((td_error - td_approx)**2)
@@ -193,16 +205,18 @@ for r in range(len(all_rewards)):
         all_td_approx_sum.append([td_approx_sum])
 
     repl = gradient_override(policy[0], policy_grad)
-    grad = opt_policy.compute_gradients(repl, var_list=policy_weights)
-    apply_ops += [opt_policy.apply_gradients(grad)]
+    grad = opt_policy.compute_gradients(repl, var_list=scope_vars('policy'))
+    grad = clamp_weights(grad, 1.)# Only needed if using an activation on policy
+    apply_ops.append(opt_policy.apply_gradients(grad))
 
     # Approximate the TD error
     repl = gradient_override(td_approx, td_error-td_approx)
-    grad = opt_approx.compute_gradients(repl, var_list=td_approx_weights)
-    apply_ops += [opt_approx.apply_gradients(grad)]
+    grad = opt_approx.compute_gradients(repl, var_list=scope_vars('td_approx'))
+    apply_ops.append(opt_approx.apply_gradients(grad))
 
     # TD error with gradient correction (TDC)
-    for (value, weights) in [(q_value, value_weights+adv_weights)]:
+    for (value, weights) in [(q_value,
+        scope_vars('state_value')+scope_vars('action_advantage')+scope_vars('conv_net'))]:
         repl = gradient_override(value[0], td_error)
         grad_s = opt_td.compute_gradients(repl, var_list=weights)
         repl = gradient_override(value[1], -GAMMA*td_approx)
@@ -210,7 +224,11 @@ for r in range(len(all_rewards)):
         for i in range(len(grad_s)):
             g = grad_s[i][0] + grad_s2[i][0]
             grad_s[i] = (g, grad_s[i][1])
-        apply_ops += [opt_td.apply_gradients(grad_s)]
+        apply_ops.append(opt_td.apply_gradients(grad_s))
+
+for r in range(len(all_rewards)):
+    with tf.name_scope('ac_' + str(r)):
+        make_acrl()
 
 td_error_sum = tf.concat(all_td_error_sum, axis=0)
 td_approx_sum = tf.concat(all_td_approx_sum, axis=0)
@@ -262,15 +280,11 @@ def rl_loop():
     er_num_saves = 0
     state = np.ones([STATE_FRAMES] + FRAME_DIM)
     next_state = np.ones_like(state)
-    def trans_state(x):
-        if CONV_NET:
-            dims = len(FRAME_DIM)
-            x = x.transpose(range(1, dims) + [0, 3]) / 255.
-        return x.reshape(STATE_DIM)
 
     def step_state(states_sofar):
         if states_sofar in [0, MAX_EPISODE_STATES]:
             # New episode
+            env.seed(0) # Same track everytime
             obs = env.reset()
             states_sofar = 0
 
@@ -297,23 +311,23 @@ def rl_loop():
                     reward = 1000.
             next_state[frame] = obs
             reward_sum += reward
-        print('ER saves:', er_num_saves, 'State:', state, 'Action taken:', action, 'Reward:', reward_sum)
+        print(dict(er_num_saves=er_num_saves, state='<image>' if CONV_NET else state,
+            action_taken=action, reward=reward_sum))
         return states_sofar + 1, reward_sum, done
 
     training_epochs = 0
     def run_training_ops():
-        r = sess.run([loss_argmin, td_error_sum, td_approx_sum] + apply_ops)
-        save_index=r[0][0]
+        r = sess.run([td_error_sum, td_approx_sum] + apply_ops)
+        #save_index=r[0][0]
         save_index = er_num_saves % ER_SIZE
         if SAVE_SUMMARIES:
             summary = r[-1]
             train_writer.add_summary(summary, training_epochs)
         r = dict(
-            #save_index=save_index,
             #policy_weights='\n'.join(str(w.eval()) for w in policy_weights),
             training_epochs=training_epochs,
-            td_error_sum=r[1],
-            td_approx_sum=r[2],
+            td_error_sum=r[0],
+            td_approx_sum=r[1],
             policy_index=policy_index,
             policy_action=policy_action,
             policy_minmax=sess.run(all_policy_minmax[policy_index]))
@@ -334,7 +348,7 @@ def rl_loop():
         if states_sofar > 0:
             # Calculate the policy actions:
             if policy_index != -1:
-                [policy_action] = sess.run(all_policy_ph[policy_index], feed_dict={state_ph: [trans_state(state)]})
+                [policy_action] = sess.run(all_policy_ph[policy_index], feed_dict={state_ph: trans_state(state)})
                 action = policy_action
 
         do_env_step = True
@@ -356,8 +370,8 @@ def rl_loop():
                 if policy_index != -1:
                     # Keep some demonstrated actions
                     save_index = ER_SIZE/2 + er_num_saves % int(ER_SIZE/2)
-                np_state[save_index] = trans_state(state)
-                np_next_state[save_index] = trans_state(next_state)
+                np_state[save_index] = state
+                np_next_state[save_index] = next_state
                 np_action[save_index] = action
                 np_reward[save_index] = [reward_sum]
 
