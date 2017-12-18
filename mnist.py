@@ -21,20 +21,20 @@ dropout_keep = tf.placeholder_with_default(1.0, shape=())
 x = x_image
 
 chan_in, chan_out = 1, 32
-[x], w = layer_conv(x, 7, 1, chan_in, chan_out)
+x = layer_conv(x, 7, 1, chan_in, chan_out)
 x = max_pool(x, size=3)
 
 chan_in = chan_out; chan_out *= 2
-[x], w = layer_conv(x, 7, 1, chan_in, chan_out)
+x = layer_conv(x, 7, 1, chan_in, chan_out)
 x = max_pool(x, size=3)
 
 chan_in = chan_out; chan_out *= 2
-[x], w = layer_conv(x, 7, 1, chan_in, chan_out)
+x = layer_conv(x, 7, 1, chan_in, chan_out)
 x = max_pool(x, size=3)
 
 init_vars()
 batch = next_batch(1)
-[x], flat_size = layer_reshape_flat(x, x.eval(feed_dict={x_image: batch[0]}))
+[x], flat_size = layer_reshape_flat(x, x[0].eval(feed_dict={x_image: batch[0]}))
 
 HIDDEN_LAYERS = 2
 HIDDEN_NODES = 1024

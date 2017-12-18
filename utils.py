@@ -16,8 +16,9 @@ def variable_summaries(var):
 def conv2d(x, W, stride=1, padding='VALID'):
     return tf.nn.conv2d(x, W, strides=[1, stride, stride, 1], padding=padding)
 def max_pool(x, size=4, stride=1, padding='VALID'):
-    return tf.nn.max_pool(x, ksize=[1, size, size, 1],
-                          strides=[1, stride, stride, 1], padding=padding)
+    x = wrapList(x)
+    return [tf.nn.max_pool(i, ksize=[1, size, size, 1],
+                           strides=[1, stride, stride, 1], padding=padding) for i in x]
 
 def weight_variable(shape, init_zeros=False):
     return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else tf.truncated_normal(shape, stddev=0.1, seed=0))
@@ -112,14 +113,6 @@ def layer_conv(x, conv_width, conv_stride, input_channels, output_channels):
         variable_summaries(b_conv)
     x = wrapList(x)
     x = [conv2d(i, W_conv, stride=conv_stride) + b_conv for i in x]
-    return x
-
-def make_conv(x, chan_in):
-    chan_out = 32
-    for l in range(3):
-        with tf.name_scope('layer%i' % l):
-            x = layer_conv(x, 5, 2, chan_in, chan_out)
-            chan_in = chan_out; chan_out *= 2
     return x
 
 def layer_reshape_flat(x, conv_eval):
