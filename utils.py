@@ -3,6 +3,8 @@ DTYPE = tf.float32
 
 def wrapList(value):
     return value if type(value) == list else [value]
+class Struct:
+    def __init__(self, **entries): self.__dict__.update(entries)
 
 def variable_summaries(var):
     tf.summary.scalar('min', tf.reduce_min(var))
