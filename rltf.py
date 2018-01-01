@@ -1,11 +1,14 @@
 import tensorflow as tf, numpy as np
-import multiprocessing, sys, os
+import sys, os, multiprocessing, time
 from utils import *
+from pprint import pprint
 
 flags = tf.app.flags
-# for i in {1..5}; do python rltf.py --async $i & done
+# for i in {1..10}; do python rltf.py --async $i & done
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
+ER_SIZE = 500
+flags.DEFINE_integer('epoch_steps', ER_SIZE*2, 'Apply gradients after N steps')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -15,7 +18,6 @@ if FLAGS.async:
 else:
     ER_BUFFER = True
     ER_BATCH = 100
-    ER_SIZE = 500
     server = tf.train.Server({'local': [PORT]}, protocol=PROTOCOL, start=True)
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
@@ -29,13 +31,13 @@ opt_td = tf.train.AdamOptimizer(LEARNING_RATE, epsilon=0.1)
 opt_policy = tf.train.AdamOptimizer(LEARNING_RATE/5, epsilon=0.1)
 
 SAVE_SUMMARIES = False
-MAX_EPISODE_STATES = 10000
 
 ENV_NAME = os.getenv('ENV')
 if not ENV_NAME:
     raise Exception('Missing ENV environment variable')
 RESIZE = None
 if ENV_NAME == 'CarRacing-v0':
+    import gym.envs.box2d
     car_racing = gym.envs.box2d.car_racing
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
@@ -62,7 +64,8 @@ STATE_DIM[-1] *= STATE_FRAMES
 if RESIZE:
     STATE_DIM[:2] = RESIZE
 
-training = Struct(epochs=0, enable=True, batch_start=0)
+training = Struct(enable=True, batch_start=0)
+epoch = Struct(count=0, td_error=0)
 app = Struct(policy_index=0, quit=False)
 MMAP_PATH = ENV_NAME + '_' + str(STATE_FRAMES) + '_%s.mmap'
 if 'r+' in sys.argv:
@@ -146,12 +149,15 @@ def save_batch():
 accum_ops = []
 apply_accum_ops = []
 zero_accum_ops = []
+def accum_value(value):
+    accum = tf.Variable(tf.zeros_like(value),trainable=False)
+    accum_ops.append(accum.assign_add(value))
+    zero_accum_ops.append(accum.assign(tf.zeros_like(value)))
+    return accum
 def accum_gradient(grads, opt):
     for g,w in grads:
-        accum = tf.Variable(tf.zeros_like(w),trainable=False)
-        accum_ops.append(accum.assign_add(g))
+        accum = accum_value(g)
         apply_accum_ops.append(opt.apply_gradients([(accum, w)]))
-        zero_accum_ops.append(accum.assign(tf.zeros_like(accum)))
 
 # compute_gradients() sums up gradients for all instances, whereas TDC requires a
 # multiple of features at s_t+1 to be subtracted from those at s_t.
@@ -210,7 +216,7 @@ def make_acrl():
         state_value = make_state_network(value_layer, VALUE_LAYERS, None)
 
     with tf.name_scope('policy'):
-        if 0:
+        if 1:
             if CONV_NET: policy_layer, _ = make_conv_net(states)
         else:
             # Share same conv network as critic
@@ -236,7 +242,6 @@ def make_acrl():
         td_error_sq = td_error**2
         td_error_sum = tf.reduce_sum(td_error_sq)
         all_td_error_sum.append([td_error_sum])
-        #loss_argmin = tf.argmin(td_error_sq, 0)
 
     repl = gradient_override(policy[0], policy_grad)
     grad = opt_policy.compute_gradients(repl, var_list=scope_vars('policy'))
@@ -259,7 +264,10 @@ for r in range(len(all_rewards)):
     with tf.name_scope('ac_' + str(r)):
         make_acrl()
 
-td_error_sum = tf.concat(all_td_error_sum, axis=0)
+batch_td_errror = tf.concat(all_td_error_sum, axis=0)
+accum_td_error = accum_value(batch_td_errror)
+step_count = accum_value(ER_BATCH-1)
+
 if SAVE_SUMMARIES:
     merged = tf.summary.merge_all()
     accum_ops += [merged]
@@ -338,8 +346,9 @@ if FLAGS.async:
     ]
 def step_state_upload():
     a = action.keyboard[:ACTION_DIM]
-    # Convert a[0] values to one-hot vector
-    a = [1. if a[0]+1. == i else 0. for i in range(ACTION_DIM)]
+    if not env.action_space.shape:
+        # Convert a[0] values to one-hot vector
+        a = [1. if a[0]+1. == i else 0. for i in range(ACTION_DIM)]
     action.to_take = a
 
     if state.count > 0:
@@ -351,7 +360,9 @@ def step_state_upload():
 
     # action = [1., 0., 0] if state.frames[0, 1] < 0. else [0., 0., 1.] # MountainCar: go with momentum
     save_rewards = step_to_frames()
-    save_action = np.where(action.to_take == np.max(action.to_take), 1., 0.)
+    save_action = action.to_take
+    if not env.action_space.shape:
+        save_action = np.where(action.to_take == np.max(action.to_take), 1., 0.)
     feed_dict = {
         frame_ph: [state.frames],
         action_ph: [save_action],
@@ -371,46 +382,54 @@ def step_state_upload():
             if np_states.flags.writeable:
                 save_batch()
 
-def run_training_ops():
-    r = sess.run([td_error_sum] + accum_ops)
+def train_accum_batch():
+    r = sess.run(accum_ops)
     if SAVE_SUMMARIES:
         summary = r[-1]
-        train_writer.add_summary(summary, training.epochs)
-    r = dict(
-        #policy_weights='\n'.join(str(w.eval()) for w in policy_weights),
-        training_epochs=training.epochs,
-        training_upload_batch='%i/%i' % (training.batch_start, ER_SIZE),
-        td_error_sum=r[0],
+        train_writer.add_summary(summary, epoch.count)
+    pprint(dict(
+        batch='%i/%i' % (training.batch_start, ER_SIZE),
         policy_index=app.policy_index,
         policy_action=action.policy,
-        policy_minmax=sess.run(all_policy_minmax[app.policy_index]))
-    for k in sorted(r.keys()):
-        print(k + ': ' + str(r[k]))
-    print(' ')
+        policy_minmax=sess.run(all_policy_minmax[app.policy_index])
+        ))
+
+def train_apply_gradients():
+    epoch.td_error = sess.run(accum_td_error)[0]
+    epoch.count += 1
+    sess.run(apply_accum_ops)
+    sess.run(zero_accum_ops)
+    pprint(dict(
+        epoch_count=epoch.count,
+        epoch_td_error=epoch.td_error))
 
 init_vars()
 def rl_loop():
     while not app.quit:
-        do_env_step = True
-        if training.enable and not FLAGS.async:
-            upload_batch()
-            run_training_ops()
-            training.epochs += 1
-            training.batch_start += ER_BATCH
-            do_env_step = False
-
-        if do_env_step:
+        if FLAGS.async:
             step_state_upload()
+            continue
+
+        if training.enable:
+            if training.batch_start < ER_SIZE:
+                upload_batch()
+                train_accum_batch()
+                training.batch_start += ER_BATCH
+            else:
+                env.render() # Render needed for keyboard events
+                # Give ER buffer and async agents equal time before applying gradients.
+                count = sess.run(step_count)
+                if count < FLAGS.epoch_steps:
+                    pprint(dict(step_count=count))
+                    time.sleep(1)
+                    continue
+
+                train_apply_gradients()
+                training.batch_start = 0
         else:
-            # Render needed for keyboard events
-            if not training.epochs % 5: env.render()
-
-        if not FLAGS.async and training.batch_start == ER_SIZE:
-            training.batch_start = 0
-            if training.enable:
-                sess.run(apply_accum_ops)
-                sess.run(zero_accum_ops)
-            if do_env_step:
+            if training.batch_start < ER_SIZE:
+                step_state_upload()
+            else:
                 training.enable = True
-
+                training.batch_start = 0
 rl_loop()
