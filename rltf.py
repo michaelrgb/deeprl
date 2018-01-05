@@ -23,12 +23,12 @@ sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 GAMMA = 0.999
 STATE_FRAMES = 2
-VALUE_LAYERS = 2
-POLICY_LAYERS = 2
-HIDDEN_NODES = 100
-LEARNING_RATE = 1e-3
-opt_td = tf.train.AdamOptimizer(LEARNING_RATE, epsilon=0.1)
-opt_policy = tf.train.AdamOptimizer(LEARNING_RATE/5, epsilon=0.1)
+HIDDEN_LAYERS = 2
+HIDDEN_NODES = 128
+
+learning_rate_ph = tf.placeholder(tf.float32, ())
+opt_td = tf.train.AdamOptimizer(learning_rate_ph, epsilon=0.1)
+opt_policy = tf.train.AdamOptimizer(learning_rate_ph/5, epsilon=0.1)
 
 SAVE_SUMMARIES = False
 
@@ -56,15 +56,15 @@ ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
 FRAME_DIM = list(env.observation_space.shape)
 
 CONV_NET = len(FRAME_DIM) == 3
-GREYSCALE = CONV_NET
 STATE_DIM = FRAME_DIM[:]
-if GREYSCALE and STATE_DIM[-1] == 3:
-    STATE_DIM[-1] = 1
+if CONV_NET:
+    if STATE_DIM[-1] == 3:
+        STATE_DIM[-1] = 1
+    if RESIZE:
+        STATE_DIM[:2] = RESIZE
 STATE_DIM[-1] *= STATE_FRAMES
-if RESIZE:
-    STATE_DIM[:2] = RESIZE
 
-training = Struct(enable=True, batch_start=0)
+training = Struct(enable=True, batch_start=0, learning_rate=1e-3)
 epoch = Struct(count=0, td_error=0)
 app = Struct(policy_index=0, quit=False)
 MMAP_PATH = ENV_NAME + '_' + str(STATE_FRAMES) + '_%s.mmap'
@@ -114,9 +114,7 @@ if CONV_NET:
     frame_to_state = tf.reshape(frame_ph, [-1] + FRAME_DIM) # Move STATE_FRAMES into batches
     if RESIZE:
         frame_to_state = tf.image.resize_images(frame_to_state, RESIZE, tf.image.ResizeMethod.AREA)
-    pre_lcn = frame_to_state # im = sess.run(pre_lcn, feed_dict={frame_ph: state.now})/255.
-    frame_to_state = local_contrast_norm(frame_to_state, GAUSS_W)
-    frame_to_state = tf.reduce_sum(frame_to_state, axis=-1) # Convert to grayscale
+    frame_to_state = tf.reduce_mean(frame_to_state/255., axis=-1) # Convert to grayscale
     frame_to_state = tf.reshape(frame_to_state, [-1, STATE_FRAMES] + STATE_DIM[:-1])
     frame_to_state = tf.transpose(frame_to_state, [0, 2, 3, 1]) # Move STATE_FRAMES into channels
 else:
@@ -191,44 +189,46 @@ def make_acrl():
         CONV_LAYERS = 4
         for l in range(CONV_LAYERS):
             with tf.name_scope('conv%i' % l):
-                x = layer_conv(x, 7, 2, chan_in, chan_out)
+                x = layer_conv(x, 8, 1, chan_in, chan_out)
                 chan_in = chan_out
+                chan_out *= 2
+                if l < 3: x = max_pool(x, 2, 2)
                 x = [activation(i) for i in x]
 
         # Calculate topmost convolution dimensionality to create fully-connected layer
         init_vars()
         return layer_reshape_flat(x, x[0].eval())
 
-    def make_state_network(prev_output, num_layers, num_outputs, last_layer_activation=None):
+    def make_state_network(prev_output, num_outputs):
         input_size = num_flat_inputs
-        for l in range(num_layers):
+        for l in range(HIDDEN_LAYERS):
             with tf.name_scope('fully%i' % l):
                 prev_output = layer_fully_connected(prev_output, input_size, HIDDEN_NODES, activation)
                 input_size = HIDDEN_NODES
-        with tf.name_scope('fully%i' % num_layers):
-            output = layer_fully_connected(prev_output, input_size, num_outputs, last_layer_activation)
+        with tf.name_scope('fully%i' % HIDDEN_LAYERS):
+            output = layer_fully_connected(prev_output, input_size, num_outputs, None)
         return output
 
-    with tf.name_scope('state_value'):
-        value_layer = states
-        if CONV_NET: value_layer, num_flat_inputs = make_conv_net(value_layer)
-        # Baseline value, independent of action a
-        state_value = make_state_network(value_layer, VALUE_LAYERS, None)
-
     with tf.name_scope('policy'):
+        policy_layer = states
         if 1:
-            if CONV_NET: policy_layer, _ = make_conv_net(states)
+            if CONV_NET: policy_layer, num_flat_inputs = make_conv_net(states)
         else:
             # Share same conv network as critic
             policy_layer = value_layer
-        policy = make_state_network(policy_layer, POLICY_LAYERS, ACTION_DIM)
+        policy = make_state_network(policy_layer, ACTION_DIM)
         all_policy_ph.append(policy[2])
         all_policy_minmax.append([tf.reduce_min(policy[0], axis=0), tf.reduce_max(policy[0], axis=0)])
 
-    with tf.name_scope('action_advantage'):
+    with tf.name_scope('value'):
+        value_layer = states
+        if CONV_NET: value_layer, num_flat_inputs = make_conv_net(value_layer)
+        # Baseline value, independent of action a
+        state_value = make_state_network(value_layer, None)
+
         # Advantage is linear in (action-policy)
         off_policy = er.action-policy[0]
-        [feature] = make_state_network(value_layer[0], VALUE_LAYERS, ACTION_DIM)
+        [feature] = make_state_network(value_layer[0], ACTION_DIM)
         adv_action = feature * off_policy
         adv_value = tf.reduce_sum(adv_action, 1)
         policy_grad = feature * adv_action
@@ -238,18 +238,16 @@ def make_acrl():
 
     with tf.name_scope('td_error'):
         td_error = all_rewards[r] + GAMMA*q_value[1] - q_value[0]
-
         td_error_sq = td_error**2
         td_error_sum = tf.reduce_sum(td_error_sq)
         all_td_error_sum.append([td_error_sum])
 
     repl = gradient_override(policy[0], policy_grad)
-    grad = opt_policy.compute_gradients(repl, var_list=scope_vars('policy'))
+    grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     accum_gradient(grad, opt_policy)
 
     # TD error with gradient correction (TDC)
-    for (value, weights) in [(q_value,
-        scope_vars('state_value')+scope_vars('action_advantage'))]:
+    for (value, weights) in [(q_value, scope_vars('value'))]:
         repl = gradient_override(value[0], td_error)
         grad_s = opt_td.compute_gradients(repl, var_list=weights)
         repl = gradient_override(value[1], -GAMMA*td_error)
@@ -395,13 +393,18 @@ def train_accum_batch():
         ))
 
 def train_apply_gradients():
+    epoch.prev_td_error = epoch.td_error
     epoch.td_error = sess.run(accum_td_error)[0]
     epoch.count += 1
-    sess.run(apply_accum_ops)
+    training.learning_rate *= 0.5 if epoch.td_error > epoch.prev_td_error else 2**0.5
+    training.learning_rate = max(training.learning_rate, 1e-6)
+    sess.run(apply_accum_ops, feed_dict={learning_rate_ph: training.learning_rate})
     sess.run(zero_accum_ops)
+    os.system('clear')
     pprint(dict(
         epoch_count=epoch.count,
-        epoch_td_error=epoch.td_error))
+        epoch_td_error=epoch.td_error,
+        learning_rate=training.learning_rate))
 
 init_vars()
 def rl_loop():
