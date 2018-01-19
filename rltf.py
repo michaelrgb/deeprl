@@ -6,6 +6,8 @@ from pprint import pprint
 flags = tf.app.flags
 # for i in {1..10}; do python rltf.py --async $i & done
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
+flags.DEFINE_integer('batches_async', 10, 'Batches to wait for from async agents')
+flags.DEFINE_integer('batches_keep', 5, 'Batches recorded from user actions')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 FLAGS = flags.FLAGS
 
@@ -57,13 +59,11 @@ if CONV_NET:
         STATE_DIM[:2] = RESIZE
 STATE_DIM[-1] *= STATE_FRAMES
 
-ER_BATCHES = 10
+FIRST_BATCH = -FLAGS.batches_keep
+LAST_BATCH = FLAGS.batches_async
 ER_BATCH_SIZE = 100
 
-training = Struct(enable=True, learning_rate=1e-3,
-    batches_recorded = 0,
-    batches_needed = ER_BATCHES/2
-)
+training = Struct(enable=True, learning_rate=1e-3, batches_recorded=0)
 epoch = Struct(count=0, td_error=0)
 app = Struct(policy_index=0, quit=False)
 
@@ -79,27 +79,26 @@ def mmap_batch(batch_num, mode, path=None):
         rewards= np.memmap(path % (batch_num, 'rewards'), DTYPE.name, mode, shape=(ER_BATCH_SIZE, REWARDS_GLOBAL)))
     batch.arrays = [batch.states, batch.actions, batch.rewards]
     return batch
-mmap_batch(FLAGS.async, 'w+', 'temp')# Make sure temp_batch exists
+temp_batch = mmap_batch(FLAGS.async, 'w+', 'temp')
 
 if FLAGS.async:
     def init_vars(): pass
     training.current_batch = FLAGS.async-1
 else:
     def init_vars(): sess.run(tf.global_variables_initializer())
-    training.current_batch = ER_BATCHES/2
+    training.current_batch = FIRST_BATCH
 
     if 'w+' in sys.argv:
         # Record new arrays
         app.policy_index = -1
     else:
-        training.batches_recorded = training.batches_needed
+        training.batches_recorded = FLAGS.batches_keep
 
     with tf.name_scope('experience_replay'):
         er = Struct(
             states= tf.Variable(tf.zeros([ER_BATCH_SIZE] + STATE_DIM), False, name='states'),
             actions=tf.Variable(tf.zeros([ER_BATCH_SIZE, ACTION_DIM]), False, name='actions'),
-            rewards=tf.Variable(tf.zeros([ER_BATCH_SIZE, REWARDS_GLOBAL]), False, name='rewards')
-        )
+            rewards=tf.Variable(tf.zeros([ER_BATCH_SIZE, REWARDS_GLOBAL]), False, name='rewards'))
         er.state =      er.states[:-1]
         er.next_state = er.states[1:]
         er.action =     er.actions[1:]
@@ -156,7 +155,7 @@ def make_acrl():
     states, num_flat_inputs = [frame_to_state], STATE_DIM[0]
     if not FLAGS.async:
         states = [er.state, er.next_state] + states
-    activation=lambda x: tf.nn.leaky_relu(x, alpha=1e-2)
+    activation = tf.nn.softsign if 1 else lambda x: tf.nn.leaky_relu(x, alpha=1e-2)
 
     def make_conv_net(x):
         conv_channels = STATE_DIM[-1]
@@ -193,6 +192,7 @@ def make_acrl():
             # Share same conv network as critic
             policy_layer = value_layer
         policy = make_state_network(policy_layer, ACTION_DIM)
+        policy = [tf.nn.softmax(i) for i in policy]
         all_policy_ph.append(policy[-1])
         all_policy_minmax.append([tf.reduce_min(policy[0], axis=0), tf.reduce_max(policy[0], axis=0)])
 
@@ -205,37 +205,37 @@ def make_acrl():
         if FLAGS.async:
             return
 
-        # Advantage is linear in (action-policy)
         off_policy = er.action-policy[0]
-        [feature] = make_state_network(value_layer[0], ACTION_DIM)
-        adv_action = feature * off_policy
-        adv_value = tf.reduce_sum(adv_action, 1)
-        policy_grad = feature * adv_action
+        [offset] = make_state_network(value_layer[0], ACTION_DIM)
+        q_offset = offset * off_policy
+        q_offset = tf.reduce_sum(q_offset, 1)
 
-    with tf.name_scope('q_value'):
-        q_value = [state_value[0]+adv_value, state_value[1]]
+    # Estimate action advantage from 1-step TD residual
+    target_value = all_rewards[r] + GAMMA*state_value[1]
+    adv_value = target_value - state_value[0]
+    adv_value = tf.maximum(0., adv_value)
 
-    with tf.name_scope('td_error'):
-        td_error = all_rewards[r] + GAMMA*q_value[1] - q_value[0]
-        td_error_sq = td_error**2
-        td_error_sum = tf.reduce_sum(td_error_sq)
-        all_td_error_sum.append([td_error_sum])
-
-    repl = gradient_override(policy[0], policy_grad)
+    log_prob = tf.reduce_sum(-off_policy**2, -1)
+    repl = gradient_override(log_prob, adv_value)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     accum_gradient(grad, opt_policy)
 
+    q_value = state_value[0] + q_offset
+    td_error = target_value - q_value
+    td_error_sum = tf.reduce_sum(td_error**2)
+    all_td_error_sum.append([td_error_sum])
+
     # TD error with gradient correction (TDC)
-    for (value, weights) in [(q_value, scope_vars('value'))]:
-        repl = gradient_override(value[0], td_error)
-        grad_s = opt_td.compute_gradients(repl, var_list=weights)
-        repl = gradient_override(value[1], -GAMMA*td_error)
-        grad_s2 = opt_td.compute_gradients(repl, var_list=weights)
-        for i in range(len(grad_s)):
-            g, g2 = grad_s[i][0], grad_s2[i][0]
-            if g2 is not None: g += g2
-            grad_s[i] = (g, grad_s[i][1])
-        accum_gradient(grad_s, opt_td)
+    weights = scope_vars('value')
+    repl = gradient_override(q_value, td_error)
+    grad_s = opt_td.compute_gradients(repl, var_list=weights)
+    repl = gradient_override(state_value[1], -GAMMA*td_error)
+    grad_s2 = opt_td.compute_gradients(repl, var_list=weights)
+    for i in range(len(grad_s)):
+        g, g2 = grad_s[i][0], grad_s2[i][0]
+        if g2 is not None: g += g2
+        grad_s[i] = (g, grad_s[i][1])
+    accum_gradient(grad_s, opt_td)
 
 for r in range(REWARDS_ALL):
     with tf.name_scope('ac_' + str(r)):
@@ -313,7 +313,7 @@ def step_state_upload():
             action.to_take = action.policy
 
     if not FLAGS.async and FLAGS.replay:
-        action.to_take = mmap.actions[training.current_batch + state.count]
+        action.to_take = mmap.actions[state.count]
 
     # action = [1., 0., 0] if state.frames[0, 1] < 0. else [0., 0., 1.] # MountainCar: go with momentum
     save_rewards = step_to_frames()
@@ -328,14 +328,13 @@ def step_state_upload():
     action.policy = ret[1]
 
     b = state.count
-    temp_batch = mmap_batch(FLAGS.async, 'r+', 'temp')# Could also be in RAM
     temp_batch.states[b] = frames_to_state
     temp_batch.rewards[b] = save_rewards
     temp_batch.actions[b] = save_action
 
     state.count += 1
     if state.count == ER_BATCH_SIZE:
-        if training.batches_recorded < training.batches_needed:
+        if training.batches_recorded < FLAGS.batches_keep:
             print('Replacing batch #%i' % training.current_batch)
             mmap = mmap_batch(training.current_batch, 'w+')
             mmap.states[:] = temp_batch.states
@@ -388,7 +387,7 @@ def train_accum_batch():
         summary = r[-1]
         train_writer.add_summary(summary, epoch.count)
     pprint(dict(
-        batch='%i/%i' % (training.current_batch, ER_BATCHES),
+        batch='%i/%i' % (training.current_batch, LAST_BATCH),
         policy_index=app.policy_index,
         policy_minmax=sess.run(all_policy_minmax[app.policy_index])
         ))
@@ -409,15 +408,15 @@ def train_apply_gradients():
 
 def rl_loop():
     while not app.quit:
-        if FLAGS.async or not training.enable or training.batches_recorded < training.batches_needed:
+        if FLAGS.async or not training.enable or training.batches_recorded < FLAGS.batches_keep:
             step_state_upload()
             continue
 
-        if training.current_batch < ER_BATCHES:
+        if training.current_batch < LAST_BATCH:
             train_accum_batch()
             training.current_batch += 1
         else:
             env.render() # Render needed for keyboard events
             train_apply_gradients()
-            training.current_batch = 0
+            training.current_batch = FIRST_BATCH
 rl_loop()
