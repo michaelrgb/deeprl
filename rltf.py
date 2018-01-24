@@ -4,7 +4,7 @@ from utils import *
 from pprint import pprint
 
 flags = tf.app.flags
-# for i in {1..10}; do python rltf.py --async $i & done
+# for i in {1..10}; do python rltf.py --async $i & sleep 1; done
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
 flags.DEFINE_integer('batches_async', 10, 'Batches to wait for from async agents')
 flags.DEFINE_integer('batches_keep', 5, 'Batches recorded from user actions')
@@ -23,7 +23,7 @@ HIDDEN_NODES = 128
 
 learning_rate_ph = tf.placeholder(tf.float32, ())
 opt_td = tf.train.AdamOptimizer(learning_rate_ph, epsilon=0.1)
-opt_policy = tf.train.AdamOptimizer(learning_rate_ph/5, epsilon=0.1)
+opt_policy = tf.train.AdamOptimizer(learning_rate_ph/10, epsilon=0.1)
 
 SAVE_SUMMARIES = False
 
@@ -48,6 +48,8 @@ env._max_episode_steps = None # Disable step limit for now
 envu = env.unwrapped
 
 ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
+ACTION_DISCRETE = not env.action_space.shape
+POLICY_SOFTMAX = ACTION_DISCRETE
 FRAME_DIM = list(env.observation_space.shape)
 
 CONV_NET = len(FRAME_DIM) == 3
@@ -134,7 +136,8 @@ def accum_value(value):
 def accum_gradient(grads, opt):
     for g,w in grads:
         accum = accum_value(g)
-        apply_accum_ops.append(opt.apply_gradients([(accum, w)]))
+        grad = [(accum, w)]
+        apply_accum_ops.append(opt.apply_gradients(grad))
 
 # compute_gradients() sums up gradients for all instances, whereas TDC requires a
 # multiple of features at s_t+1 to be subtracted from those at s_t.
@@ -159,7 +162,7 @@ def make_acrl():
     states, num_flat_inputs = [frame_to_state], STATE_DIM[0]
     if not FLAGS.async:
         states = [er.state, er.next_state] + states
-    activation = tf.nn.softsign if 1 else lambda x: tf.nn.leaky_relu(x, alpha=1e-2)
+    activation = tf.nn.softsign if 0 else lambda x: tf.nn.leaky_relu(x, alpha=1e-2)
 
     def make_conv_net(x):
         conv_channels = STATE_DIM[-1]
@@ -195,9 +198,11 @@ def make_acrl():
             # Share same conv network as critic
             policy_layer = value_layer
         policy = make_fully_connected(policy_layer, num_flat_inputs, ACTION_DIM)
-        policy_activated = policy if env.action_space.shape else [tf.nn.softmax(i) for i in policy]
-        all_policy_ph.append(policy_activated[-1])
-        all_policy_minmax.append([tf.reduce_min(policy[0], axis=0), tf.reduce_max(policy[0], axis=0)])
+        policy = [tf.nn.softmax(i) for i in policy] if POLICY_SOFTMAX else policy
+        all_policy_ph.append(policy[-1])
+        all_policy_minmax.append(tf.concat([
+            [tf.reduce_min(policy[0], axis=0)],
+            [tf.reduce_max(policy[0], axis=0)]], axis=0))
 
     if FLAGS.async:
         return
@@ -205,22 +210,34 @@ def make_acrl():
     with tf.name_scope('value'):
         value_layer = states
         if CONV_NET: value_layer, num_flat_inputs = make_conv_net(value_layer)
-
-        off_policy = er.action-policy[0]
-        on_policy = tf.zeros([ER_BATCH_SIZE-1, ACTION_DIM])
-        value_layer = [
-            tf.concat([value_layer[0], off_policy],axis=1),
-            tf.concat([value_layer[0], on_policy], axis=1), # Baseline value
-            tf.concat([value_layer[1], on_policy], axis=1)]
-        q_value, state_value, next_state_value = make_fully_connected(
-            value_layer, num_flat_inputs+ACTION_DIM, None)
+        if 1:
+            value_layer = make_fully_connected(value_layer, num_flat_inputs, 1+ACTION_DIM)
+            state_value, next_state_value = value_layer[0][:,0], value_layer[1][:,0]
+            policy_one_hot = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM)
+            off_policy_offset = tf.reduce_sum(er.action - policy_one_hot, -1)
+            q_value = state_value + off_policy_offset
+        else:
+            value_layer = [
+                tf.concat([value_layer[0], er.action],axis=1),
+                tf.concat([value_layer[0], policy[0]], axis=1),
+                tf.concat([value_layer[1], policy[1]], axis=1)]
+            q_value, state_value, next_state_value = make_fully_connected(
+                value_layer, num_flat_inputs+ACTION_DIM, None)
 
     # Estimate action advantage from 1-step TD residual
     target_value = all_rewards[r] + GAMMA*next_state_value
     adv_value = target_value - state_value
-    adv_value = tf.maximum(0., adv_value)
 
-    log_prob = tf.reduce_sum(-off_policy**2, -1)
+    if POLICY_SOFTMAX:
+        PROB_EPSILON = 1e-2
+        prob = tf.reduce_sum(er.action*policy[0], -1)
+        adv_value = tf.where(prob < PROB_EPSILON, tf.maximum(0., adv_value), adv_value)
+        adv_value = tf.where(prob > 1-PROB_EPSILON, tf.minimum(0., adv_value), adv_value)
+        log_prob = tf.log(prob)
+    else:
+        adv_value = tf.maximum(0., adv_value)
+        log_prob = tf.reduce_sum(-(er.action-policy[0])**2, -1)
+
     repl = gradient_override(log_prob, adv_value)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     accum_gradient(grad, opt_policy)
@@ -282,7 +299,7 @@ state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
 action = Struct(to_take=None, policy=None, keyboard=setup_key_actions())
 def step_to_frames():
     obs = state.last_obs
-    env_action = action.to_take if env.action_space.shape else np.argmax(action.to_take)
+    env_action = np.argmax(action.to_take) if ACTION_DISCRETE else action.to_take
     reward_sum = 0.
     for frame in range(STATE_FRAMES):
         if state.done:
@@ -310,14 +327,14 @@ def step_state_upload():
         return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
 
     a = action.keyboard[:ACTION_DIM]
-    if not env.action_space.shape:
+    if ACTION_DISCRETE:
         # Convert a[0] values to one-hot vector
         a = action_vector(a[0]+1.)
 
     if state.count > 0:
         if app.policy_index != -1:
             a = action.policy
-            if not env.action_space.shape:
+            if ACTION_DISCRETE:
                 # Sample from softmax probabilities
                 a = action_vector(np.random.choice(range(ACTION_DIM), p=a))
 
@@ -330,7 +347,7 @@ def step_state_upload():
     if not FLAGS.async:
         print(dict(state_count=state.count, state='<image>' if CONV_NET else state.frames,
             action_taken=action.to_take, reward=save_rewards))
-    if not env.action_space.shape:
+    if ACTION_DISCRETE:
         a = np.where(a == np.max(action.to_take), 1., 0.)
     ret = sess.run(ops_single_step, feed_dict={frame_ph: [state.frames]})
     frames_to_state = ret[0]
@@ -379,6 +396,9 @@ if not FLAGS.async:
         apply_accum_ops += [merged]
         train_writer = tf.summary.FileWriter('/tmp/train', sess.graph)
 
+    accum_ops.append(tf.concat([[p] for p in all_policy_minmax], axis=0))
+    accum_ops.append(tf.reduce_sum(er.reward, axis=0))
+
 def train_accum_batch():
     while True:
         try:
@@ -397,28 +417,31 @@ def train_accum_batch():
     # imshow([er.states[10][:,:,i].eval() for i in range(STATE_FRAMES)])
 
     r = sess.run(accum_ops)
-    if SAVE_SUMMARIES:
-        summary = r[-1]
-        train_writer.add_summary(summary, epoch.count)
-    pprint(dict(
-        batch='%i/%i' % (training.current_batch, LAST_BATCH),
-        policy_index=app.policy_index,
-        policy_minmax=sess.run(all_policy_minmax[app.policy_index])
-        ))
+    d = dict(
+        batch='%i/%i' % (training.current_batch, LAST_BATCH))
+    if app.policy_index != -1:
+        d.update(policy_minmax=r[-2][app.policy_index],
+                 reward_sum=r[-1][app.policy_index])
+    pprint(d)
 
 def train_apply_gradients():
     epoch.prev_td_error = epoch.td_error
     epoch.td_error = sess.run(accum_td_error)[0]
     epoch.count += 1
     training.learning_rate *= 0.5 if epoch.td_error > epoch.prev_td_error else 2**0.5
-    training.learning_rate = max(training.learning_rate, 1e-6)
-    sess.run(apply_accum_ops, feed_dict={learning_rate_ph: training.learning_rate})
+    training.learning_rate = max(training.learning_rate, 1e-4)
+    r = sess.run(apply_accum_ops, feed_dict={learning_rate_ph: training.learning_rate})
     sess.run(zero_accum_ops)
     os.system('clear')
     pprint(dict(
+        policy_index=app.policy_index,
         epoch_count=epoch.count,
         epoch_td_error=epoch.td_error,
         learning_rate='%.6f' % training.learning_rate))
+
+    if SAVE_SUMMARIES:
+        summary = r[-1]
+        train_writer.add_summary(summary, epoch.count)
 
 def rl_loop():
     while not app.quit:
