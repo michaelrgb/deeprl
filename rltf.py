@@ -21,9 +21,10 @@ STATE_FRAMES = 2
 HIDDEN_LAYERS = 2
 HIDDEN_NODES = 128
 
-learning_rate_ph = tf.placeholder(tf.float32, ())
-opt_td = tf.train.AdamOptimizer(learning_rate_ph, epsilon=0.1)
-opt_policy = tf.train.AdamOptimizer(learning_rate_ph/10, epsilon=0.1)
+ph = Struct(learning_rate=tf.placeholder(tf.float32, ()),
+    enable_tdc=tf.placeholder(tf.bool, ()))
+opt_td = tf.train.AdamOptimizer(ph.learning_rate, epsilon=0.1)
+opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10, epsilon=0.1)
 
 SAVE_SUMMARIES = False
 
@@ -66,8 +67,8 @@ LAST_BATCH = FLAGS.batches_async
 ER_BATCH_SIZE = 100
 
 training = Struct(enable=True, learning_rate=1e-3, batches_recorded=0, temp_batch=None)
-epoch = Struct(count=0, td_error=0)
-app = Struct(policy_index=0, quit=False)
+epoch = Struct(count=0, td_error=0, prev_td_error=0)
+app = Struct(policy_index=0, sample_actions=True, quit=False)
 
 def batch_paths(batch_num, path=None):
     if not path:
@@ -155,14 +156,14 @@ def gradient_override(expr, custom_grad):
 gradient_override.counter = 0
 
 all_td_error_sum = []
-all_policy_minmax = []
 all_policy_ph = []
+stats = Struct(reward_sum=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
 def make_acrl():
     states, num_flat_inputs = [frame_to_state], STATE_DIM[0]
     if not FLAGS.async:
         states = [er.state, er.next_state] + states
-    activation = tf.nn.softsign if 0 else lambda x: tf.nn.leaky_relu(x, alpha=1e-2)
+    activation = tf.nn.leaky_relu if 1 else tf.nn.softsign
 
     def make_conv_net(x):
         conv_channels = STATE_DIM[-1]
@@ -200,7 +201,7 @@ def make_acrl():
         policy = make_fully_connected(policy_layer, num_flat_inputs, ACTION_DIM)
         policy = [tf.nn.softmax(i) for i in policy] if POLICY_SOFTMAX else policy
         all_policy_ph.append(policy[-1])
-        all_policy_minmax.append(tf.concat([
+        stats._policy_minmax.append(tf.concat([
             [tf.reduce_min(policy[0], axis=0)],
             [tf.reduce_max(policy[0], axis=0)]], axis=0))
 
@@ -210,52 +211,64 @@ def make_acrl():
     with tf.name_scope('value'):
         value_layer = states
         if CONV_NET: value_layer, num_flat_inputs = make_conv_net(value_layer)
-        if 1:
-            value_layer = make_fully_connected(value_layer, num_flat_inputs, 1+ACTION_DIM)
-            state_value, next_state_value = value_layer[0][:,0], value_layer[1][:,0]
-            policy_one_hot = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM)
-            off_policy_offset = tf.reduce_sum(er.action - policy_one_hot, -1)
-            q_value = state_value + off_policy_offset
-        else:
-            value_layer = [
-                tf.concat([value_layer[0], er.action],axis=1),
-                tf.concat([value_layer[0], policy[0]], axis=1),
-                tf.concat([value_layer[1], policy[1]], axis=1)]
-            q_value, state_value, next_state_value = make_fully_connected(
-                value_layer, num_flat_inputs+ACTION_DIM, None)
 
-    # Estimate action advantage from 1-step TD residual
-    target_value = all_rewards[r] + GAMMA*next_state_value
-    adv_value = target_value - state_value
+        policy_one_hot = [tf.one_hot(tf.argmax(i, 1), ACTION_DIM) for i in policy]
+        off_policy = er.action - policy[0]
 
-    if POLICY_SOFTMAX:
+        [state_value, next_state_value, _] = make_fully_connected(value_layer, num_flat_inputs, None)
+        [adv_direction] = make_fully_connected(value_layer[0], num_flat_inputs, ACTION_DIM)
+        adv_action = adv_direction*off_policy
+        adv_q = tf.reduce_sum(adv_action, 1)
+        q_value = state_value + adv_q
+
+    is_on_policy = tf.reduce_sum(tf.abs(er.action-policy_one_hot[0]), -1) < 0.1
+    def multi_step(max_recurse, i=0):
+        z = tf.zeros(i)
+        next = tf.concat([next_state_value[i:], z], 0)
+        return tf.concat([all_rewards[r][i:], z], 0) + GAMMA*(tf.where(
+            tf.concat([is_on_policy[i+1:], tf.zeros(i+1, dtype=tf.bool)], 0),
+            multi_step(max_recurse, i+1),
+            next) if i < max_recurse else next)
+    target_value = multi_step(10)# 0 is 1-step TD
+    td_error = target_value - q_value
+    all_td_error_sum.append([tf.reduce_sum(td_error**2)])
+
+    stats.max_advantage.append(tf.reduce_max(tf.abs(adv_q)))
+    stats.on_policy_count.append(tf.reduce_sum(tf.cast(is_on_policy, tf.int32)))
+    stats.reward_sum.append(tf.reduce_sum(all_rewards[r]))
+
+    def clamp_adv(prob, adv):
         PROB_EPSILON = 1e-2
-        prob = tf.reduce_sum(er.action*policy[0], -1)
-        adv_value = tf.where(prob < PROB_EPSILON, tf.maximum(0., adv_value), adv_value)
-        adv_value = tf.where(prob > 1-PROB_EPSILON, tf.minimum(0., adv_value), adv_value)
+        adv = tf.where(prob < PROB_EPSILON, tf.maximum(0., adv), adv)
+        adv = tf.where(prob > 1-PROB_EPSILON, tf.minimum(0., adv), adv)
+        return adv
+    if POLICY_SOFTMAX:
+        if 0:
+            adv = target_value - state_value
+            prob = tf.reduce_sum(er.action*policy[0], -1)
+        else:
+            adv = adv_direction*adv_action
+            prob = policy[0]
         log_prob = tf.log(prob)
+        adv = clamp_adv(prob, adv)
     else:
-        adv_value = tf.maximum(0., adv_value)
         log_prob = tf.reduce_sum(-(er.action-policy[0])**2, -1)
+        adv = tf.maximum(0., adv_q)
 
-    repl = gradient_override(log_prob, adv_value)
+    repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     accum_gradient(grad, opt_policy)
-
-    td_error = target_value - q_value
-    td_error_sum = tf.reduce_sum(td_error**2)
-    all_td_error_sum.append([td_error_sum])
 
     # TD error with gradient correction (TDC)
     weights = scope_vars('value')
     repl = gradient_override(q_value, td_error)
-    grad_s = opt_td.compute_gradients(repl, var_list=weights)
+    grad_s = opt_td.compute_gradients(repl, weights)
     repl = gradient_override(next_state_value, -GAMMA*td_error)
-    grad_s2 = opt_td.compute_gradients(repl, var_list=weights)
+    grad_s2 = opt_td.compute_gradients(repl, weights)
     for i in range(len(grad_s)):
-        g, g2 = grad_s[i][0], grad_s2[i][0]
-        if g2 is not None: g += g2
-        grad_s[i] = (g, grad_s[i][1])
+        (g, w), g2 = grad_s[i], grad_s2[i][0]
+        if g2 is not None: g += tf.where(ph.enable_tdc, g2, tf.zeros(g2.shape))
+        grad_s[i] = (g, w)
     accum_gradient(grad_s, opt_td)
 
 for r in range(REWARDS_ALL):
@@ -276,12 +289,19 @@ def setup_key_actions():
         if k==ord('e'):
             app.policy_index = -1
             print('KEYBOARD POLICY')
-        if k >= ord('1') and k <= ord('9'):
+        elif k >= ord('1') and k <= ord('9'):
             app.policy_index = min(REWARDS_ALL-1, int(k - ord('1')))
-            print('policy_index:', app.policy_index)
-        if k==ord('t'):
-            training.enable ^= 1
-            print('training.enable:', training.enable)
+        elif k==ord('s'):
+            app.sample_actions ^= True
+        elif k==ord('t'):
+            training.enable ^= True
+        else:
+            return
+        print(dict(
+            policy_index=app.policy_index,
+            training_enable=training.enable,
+            sample_actions=app.sample_actions))
+
     def key_release(k, mod):
         if k==key.LEFT  and a[0]==-1.0: a[0] = 0
         if k==key.RIGHT and a[0]==+1.0: a[0] = 0
@@ -313,7 +333,7 @@ def step_to_frames():
         obs, reward, state.done, info = env.step(env_action)
         if ENV_NAME == 'MountainCar-v0':
             # Mountain car env doesnt give any +reward
-            if state.done: reward = 1000.
+            reward = 1. if state.done else 0.
         reward_sum += reward
     state.last_obs = obs
     return [reward_sum]
@@ -334,17 +354,19 @@ def step_state_upload():
     if state.count > 0:
         if app.policy_index != -1:
             a = action.policy
-            if ACTION_DISCRETE:
+            if ACTION_DISCRETE and app.sample_actions:
                 # Sample from softmax probabilities
                 a = action_vector(np.random.choice(range(ACTION_DIM), p=a))
 
+    save_paths = batch_paths(training.current_batch)
     if not FLAGS.async and FLAGS.replay:
-        a = mmap.actions[state.count]
+        batch = mmap_batch(save_paths, 'r')
+        a = batch.actions[state.count]
 
     # a = [1., 0., 0] if state.frames[0, 1] < 0. else [0., 0., 1.] # MountainCar: go with momentum
     action.to_take = a
     save_rewards = step_to_frames()
-    if not FLAGS.async:
+    if 0:#not FLAGS.async:
         print(dict(state_count=state.count, state='<image>' if CONV_NET else state.frames,
             action_taken=action.to_take, reward=save_rewards))
     if ACTION_DISCRETE:
@@ -369,7 +391,6 @@ def step_state_upload():
             training.temp_batch = None
 
             # Rename async batch files into server's ER batches.
-            save_paths = batch_paths(training.current_batch)
             for dst in save_paths:
                 os.system('rm -f ' + dst)
             for src,dst in zip(temp_paths, save_paths):
@@ -396,8 +417,8 @@ if not FLAGS.async:
         apply_accum_ops += [merged]
         train_writer = tf.summary.FileWriter('/tmp/train', sess.graph)
 
-    accum_ops.append(tf.concat([[p] for p in all_policy_minmax], axis=0))
-    accum_ops.append(tf.reduce_sum(er.reward, axis=0))
+    for s in sorted(stats.__dict__.keys()):
+        accum_ops.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
 
 def train_accum_batch():
     while True:
@@ -407,30 +428,28 @@ def train_accum_batch():
                 state_ph: batch.states,
                 action_ph: batch.actions,
                 reward_ph: batch.rewards}
+            break
         except:
             print('Waiting for batch %i...' % training.current_batch)
             time.sleep(0.1)
-            continue
-        break
 
     sess.run(ops_batch_upload, feed_dict=feed_dict)
     # imshow([er.states[10][:,:,i].eval() for i in range(STATE_FRAMES)])
 
-    r = sess.run(accum_ops)
-    d = dict(
-        batch='%i/%i' % (training.current_batch, LAST_BATCH))
+    r = sess.run(accum_ops, feed_dict={ph.enable_tdc: epoch.prev_td_error > 10000.})
+    sys.stdout.write('Batch %i/%i  ' % (training.current_batch, LAST_BATCH))
     if app.policy_index != -1:
-        d.update(policy_minmax=r[-2][app.policy_index],
-                 reward_sum=r[-1][app.policy_index])
-    pprint(d)
+        for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
+            sys.stdout.write(s+': ' + ('\n'if s[0]=='_'else'') + str(r[-i-1][app.policy_index])+'  ')
+        print('')
 
 def train_apply_gradients():
     epoch.prev_td_error = epoch.td_error
     epoch.td_error = sess.run(accum_td_error)[0]
     epoch.count += 1
     training.learning_rate *= 0.5 if epoch.td_error > epoch.prev_td_error else 2**0.5
-    training.learning_rate = max(training.learning_rate, 1e-4)
-    r = sess.run(apply_accum_ops, feed_dict={learning_rate_ph: training.learning_rate})
+    training.learning_rate = max(1e-3, min(1e-1, training.learning_rate))
+    r = sess.run(apply_accum_ops, feed_dict={ph.learning_rate: training.learning_rate})
     sess.run(zero_accum_ops)
     os.system('clear')
     pprint(dict(
