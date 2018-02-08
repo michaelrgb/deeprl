@@ -23,7 +23,9 @@ def max_pool(x, size=4, stride=1, padding='VALID'):
                            strides=[1, stride, stride, 1], padding=padding) for i in x]
 
 def weight_variable(shape, init_zeros=False):
-    return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else tf.truncated_normal(shape, stddev=0.1, seed=0))
+    stddev_init = 2. / sum(shape) # Xavier initialization
+    return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else
+        tf.truncated_normal(shape, stddev=stddev_init, seed=0))
 def scope_vars(scope_name):
     current = tf.contrib.framework.get_name_scope()
     if current: scope_name = current + '/' + scope_name
@@ -39,7 +41,7 @@ def imshow(imlist):
         imlist = [imlist[i] for i in range(imlist.shape[0])]
     else:
         imlist = wrapList(imlist)
-    f, axarr = plt.subplots(len(imlist))
+    f, axarr = plt.subplots(ncols=len(imlist))
     #axarr = wrapList(axarr)# Not list if only 1 image
     for i, nparray in enumerate(imlist):
         shape = nparray.shape

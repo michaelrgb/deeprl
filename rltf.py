@@ -9,6 +9,7 @@ flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients o
 flags.DEFINE_integer('batches_async', 10, 'Batches to wait for from async agents')
 flags.DEFINE_integer('batches_keep', 5, 'Batches recorded from user actions')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
+flags.DEFINE_float('learning_rate', 1e-3, 'Minimum learning rate')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -66,7 +67,7 @@ FIRST_BATCH = -FLAGS.batches_keep
 LAST_BATCH = FLAGS.batches_async
 ER_BATCH_SIZE = 100
 
-training = Struct(enable=True, learning_rate=1e-3, batches_recorded=0, temp_batch=None)
+training = Struct(enable=True, learning_rate=FLAGS.learning_rate, batches_recorded=0, temp_batch=None)
 epoch = Struct(count=0, td_error=0, prev_td_error=0)
 app = Struct(policy_index=0, sample_actions=True, quit=False)
 
@@ -80,11 +81,12 @@ def batch_paths(batch_num, path=None):
             path % (batch_num, 'rewards')]
 
 REWARDS_GLOBAL = REWARDS_ALL = 1
-def mmap_batch(paths, mode):
-    batch = Struct(
-        states=  np.memmap(paths[0], DTYPE.name, mode, shape=(ER_BATCH_SIZE,) + tuple(STATE_DIM)),
-        actions= np.memmap(paths[1], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_DIM)),
-        rewards= np.memmap(paths[2], DTYPE.name, mode, shape=(ER_BATCH_SIZE, REWARDS_GLOBAL)))
+def mmap_batch(paths, mode, only_actions=False):
+    batch = Struct(actions=np.memmap(paths[1], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_DIM)))
+    if only_actions:
+        return batch.actions
+    batch.states = np.memmap(paths[0], DTYPE.name, mode, shape=(ER_BATCH_SIZE,) + tuple(STATE_DIM))
+    batch.rewards = np.memmap(paths[2], DTYPE.name, mode, shape=(ER_BATCH_SIZE, REWARDS_GLOBAL))
     batch.arrays = [batch.states, batch.actions, batch.rewards]
     return batch
 
@@ -212,8 +214,9 @@ def make_acrl():
         value_layer = states
         if CONV_NET: value_layer, num_flat_inputs = make_conv_net(value_layer)
 
-        policy_one_hot = [tf.one_hot(tf.argmax(i, 1), ACTION_DIM) for i in policy]
+        # Learn from a minimum off_policy to keep advantage function stable when off_policy increases.
         off_policy = er.action - policy[0]
+        off_policy = tf.where(tf.abs(off_policy)<1e-2, tf.zeros(off_policy.shape), off_policy)
 
         [state_value, next_state_value, _] = make_fully_connected(value_layer, num_flat_inputs, None)
         [adv_direction] = make_fully_connected(value_layer[0], num_flat_inputs, ACTION_DIM)
@@ -221,6 +224,7 @@ def make_acrl():
         adv_q = tf.reduce_sum(adv_action, 1)
         q_value = state_value + adv_q
 
+    policy_one_hot = [tf.one_hot(tf.argmax(i, 1), ACTION_DIM) for i in policy]
     is_on_policy = tf.reduce_sum(tf.abs(er.action-policy_one_hot[0]), -1) < 0.1
     def multi_step(max_recurse, i=0):
         z = tf.zeros(i)
@@ -233,31 +237,21 @@ def make_acrl():
     td_error = target_value - q_value
     all_td_error_sum.append([tf.reduce_sum(td_error**2)])
 
-    stats.max_advantage.append(tf.reduce_max(tf.abs(adv_q)))
-    stats.on_policy_count.append(tf.reduce_sum(tf.cast(is_on_policy, tf.int32)))
-    stats.reward_sum.append(tf.reduce_sum(all_rewards[r]))
-
-    def clamp_adv(prob, adv):
-        PROB_EPSILON = 1e-2
-        adv = tf.where(prob < PROB_EPSILON, tf.maximum(0., adv), adv)
-        adv = tf.where(prob > 1-PROB_EPSILON, tf.minimum(0., adv), adv)
-        return adv
     if POLICY_SOFTMAX:
-        if 0:
-            adv = target_value - state_value
-            prob = tf.reduce_sum(er.action*policy[0], -1)
-        else:
-            adv = adv_direction*adv_action
-            prob = policy[0]
-        log_prob = tf.log(prob)
-        adv = clamp_adv(prob, adv)
+        log_prob = tf.log(tf.clip_by_value(policy[0], 1e-10, 1-1e-10))
+        adv = tf.sign(adv_direction)*adv_action
+        #adv = adv_direction*adv_action
     else:
         log_prob = tf.reduce_sum(-(er.action-policy[0])**2, -1)
-        adv = tf.maximum(0., adv_q)
+        adv = tf.maximum(0., adv_action)
 
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     accum_gradient(grad, opt_policy)
+
+    stats.max_advantage.append(tf.reduce_max(tf.abs(adv)))
+    stats.on_policy_count.append(tf.reduce_sum(tf.cast(is_on_policy, tf.int32)))
+    stats.reward_sum.append(tf.reduce_sum(all_rewards[r]))
 
     # TD error with gradient correction (TDC)
     weights = scope_vars('value')
@@ -360,8 +354,7 @@ def step_state_upload():
 
     save_paths = batch_paths(training.current_batch)
     if not FLAGS.async and FLAGS.replay:
-        batch = mmap_batch(save_paths, 'r')
-        a = batch.actions[state.count]
+        a = mmap_batch(save_paths, 'r', only_actions=True)[state.count]
 
     # a = [1., 0., 0] if state.frames[0, 1] < 0. else [0., 0., 1.] # MountainCar: go with momentum
     action.to_take = a
@@ -436,7 +429,7 @@ def train_accum_batch():
     sess.run(ops_batch_upload, feed_dict=feed_dict)
     # imshow([er.states[10][:,:,i].eval() for i in range(STATE_FRAMES)])
 
-    r = sess.run(accum_ops, feed_dict={ph.enable_tdc: epoch.prev_td_error > 10000.})
+    r = sess.run(accum_ops, feed_dict={ph.enable_tdc: epoch.prev_td_error > 0.})
     sys.stdout.write('Batch %i/%i  ' % (training.current_batch, LAST_BATCH))
     if app.policy_index != -1:
         for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
@@ -448,7 +441,7 @@ def train_apply_gradients():
     epoch.td_error = sess.run(accum_td_error)[0]
     epoch.count += 1
     training.learning_rate *= 0.5 if epoch.td_error > epoch.prev_td_error else 2**0.5
-    training.learning_rate = max(1e-3, min(1e-1, training.learning_rate))
+    training.learning_rate = max(FLAGS.learning_rate, min(1e-1, training.learning_rate))
     r = sess.run(apply_accum_ops, feed_dict={ph.learning_rate: training.learning_rate})
     sess.run(zero_accum_ops)
     os.system('clear')
