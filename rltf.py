@@ -6,9 +6,11 @@ from pprint import pprint
 flags = tf.app.flags
 # for i in {1..10}; do python rltf.py --async $i & sleep 1; done
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
-flags.DEFINE_integer('batches_async', 10, 'Batches to wait for from async agents')
-flags.DEFINE_integer('batches_keep', 5, 'Batches recorded from user actions')
+flags.DEFINE_integer('batch_async', 10, 'Batches to wait for from async agents')
+flags.DEFINE_integer('batch_per_async', 1, 'Batches recorded per async agent')
+flags.DEFINE_integer('batch_keep', 5, 'Batches recorded from user actions')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
+flags.DEFINE_boolean('er_all', False, 'Keep all batches in ER memory')
 flags.DEFINE_float('learning_rate', 1e-3, 'Minimum learning rate')
 FLAGS = flags.FLAGS
 
@@ -22,11 +24,6 @@ STATE_FRAMES = 2
 HIDDEN_LAYERS = 2
 HIDDEN_NODES = 128
 
-ph = Struct(learning_rate=tf.placeholder(tf.float32, ()),
-    enable_tdc=tf.placeholder(tf.bool, ()))
-opt_td = tf.train.AdamOptimizer(ph.learning_rate, epsilon=0.1)
-opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10, epsilon=0.1)
-
 SAVE_SUMMARIES = False
 
 ENV_NAME = os.getenv('ENV')
@@ -38,11 +35,11 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing = gym.envs.box2d.car_racing
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
-elif ENV_NAME == 'MountainCar-v0':
-    pass
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple
     RESIZE = [128, 128] # Was [512, 288]
+elif 'Bullet' in ENV_NAME:
+    import pybulletgym.envs
 
 import gym
 env = gym.make(ENV_NAME)
@@ -63,11 +60,12 @@ if CONV_NET:
         STATE_DIM[:2] = RESIZE
 STATE_DIM[-1] *= STATE_FRAMES
 
-FIRST_BATCH = -FLAGS.batches_keep
-LAST_BATCH = FLAGS.batches_async
+FIRST_BATCH = -FLAGS.batch_keep
+LAST_BATCH = FLAGS.batch_async
 ER_BATCH_SIZE = 100
+ER_BATCHES = FLAGS.batch_keep + FLAGS.batch_async if FLAGS.er_all else 1
 
-training = Struct(enable=True, learning_rate=FLAGS.learning_rate, batches_recorded=0, temp_batch=None)
+training = Struct(enable=True, learning_rate=FLAGS.learning_rate, batches_recorded=0, batches_mtime={}, temp_batch=None)
 epoch = Struct(count=0, td_error=0, prev_td_error=0)
 app = Struct(policy_index=0, sample_actions=True, quit=False)
 
@@ -90,43 +88,49 @@ def mmap_batch(paths, mode, only_actions=False):
     batch.arrays = [batch.states, batch.actions, batch.rewards]
     return batch
 
+ph = Struct(learning_rate=tf.placeholder(tf.float32, ()),
+    enable_tdc=tf.placeholder(tf.bool, ()),
+    batch_idx=tf.placeholder(tf.int32, ()),
+    state=tf.placeholder(tf.float32, [None] + STATE_DIM),
+    action=tf.placeholder(tf.float32, [None, ACTION_DIM]),
+    reward=tf.placeholder(tf.float32, [None, REWARDS_GLOBAL]),
+    frame=tf.placeholder(tf.float32, [None, STATE_FRAMES] + FRAME_DIM))
+opt_td = tf.train.AdamOptimizer(ph.learning_rate, epsilon=0.1)
+opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10, epsilon=0.1)
+
 if FLAGS.async:
+    FIRST_BATCH = (FLAGS.async-1)*FLAGS.batch_per_async
     def init_vars(): pass
-    training.current_batch = FLAGS.async-1
 else:
     def init_vars(): sess.run(tf.global_variables_initializer())
-    training.current_batch = FIRST_BATCH
 
     if 'w+' in sys.argv:
         # Record new arrays
         app.policy_index = -1
     else:
-        training.batches_recorded = FLAGS.batches_keep
+        training.batches_recorded = FLAGS.batch_keep
 
     with tf.name_scope('experience_replay'):
         er = Struct(
-            states= tf.Variable(tf.zeros([ER_BATCH_SIZE] + STATE_DIM), False, name='states'),
-            actions=tf.Variable(tf.zeros([ER_BATCH_SIZE, ACTION_DIM]), False, name='actions'),
-            rewards=tf.Variable(tf.zeros([ER_BATCH_SIZE, REWARDS_GLOBAL]), False, name='rewards'))
-        er.state =      er.states[:-1]
-        er.next_state = er.states[1:]
-        er.action =     er.actions[1:]
-        er.reward =     er.rewards[1:]
+            states= tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE] + STATE_DIM), False, name='states'),
+            actions=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE, ACTION_DIM]), False, name='actions'),
+            rewards=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE, REWARDS_GLOBAL]), False, name='rewards'))
+        er.state =      er.states[ph.batch_idx][:-1]
+        er.next_state = er.states[ph.batch_idx][1:]
+        er.action =     er.actions[ph.batch_idx][1:]
+        er.reward =     er.rewards[ph.batch_idx][1:]
         all_rewards = [er.reward[:, r] for r in range(REWARDS_ALL)] + []
+training.current_batch = FIRST_BATCH
 
-state_ph = tf.placeholder(tf.float32, [None] + STATE_DIM)
-action_ph = tf.placeholder(tf.float32, [None, ACTION_DIM])
-reward_ph = tf.placeholder(tf.float32, [None, REWARDS_GLOBAL])
-frame_ph = tf.placeholder(tf.float32, [None, STATE_FRAMES] + FRAME_DIM)
 if CONV_NET:
-    frame_to_state = tf.reshape(frame_ph, [-1] + FRAME_DIM) # Move STATE_FRAMES into batches
+    frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Move STATE_FRAMES into batches
     if RESIZE:
         frame_to_state = tf.image.resize_images(frame_to_state, RESIZE, tf.image.ResizeMethod.AREA)
     frame_to_state = tf.reduce_mean(frame_to_state/255., axis=-1) # Convert to grayscale
     frame_to_state = tf.reshape(frame_to_state, [-1, STATE_FRAMES] + STATE_DIM[:-1])
     frame_to_state = tf.transpose(frame_to_state, [0, 2, 3, 1]) # Move STATE_FRAMES into channels
 else:
-    frame_to_state = tf.reshape(frame_ph, [-1] + STATE_DIM)
+    frame_to_state = tf.reshape(ph.frame, [-1] + STATE_DIM)
 
 accum_ops = []
 apply_accum_ops = []
@@ -213,13 +217,17 @@ def make_acrl():
     with tf.name_scope('value'):
         value_layer = states
         if CONV_NET: value_layer, num_flat_inputs = make_conv_net(value_layer)
+        if 1:
+            value_layer = make_fully_connected(value_layer, num_flat_inputs, 1+ACTION_DIM)
+            [state_value, next_state_value, _] = [i[:,0] for i in value_layer]
+            adv_direction = value_layer[0][:,1:]
+        else:
+            [state_value, next_state_value, _] = make_fully_connected(value_layer, num_flat_inputs, None)
+            [adv_direction] = make_fully_connected(value_layer[0], num_flat_inputs, ACTION_DIM)
 
         # Learn from a minimum off_policy to keep advantage function stable when off_policy increases.
         off_policy = er.action - policy[0]
         off_policy = tf.where(tf.abs(off_policy)<1e-2, tf.zeros(off_policy.shape), off_policy)
-
-        [state_value, next_state_value, _] = make_fully_connected(value_layer, num_flat_inputs, None)
-        [adv_direction] = make_fully_connected(value_layer[0], num_flat_inputs, ACTION_DIM)
         adv_action = adv_direction*off_policy
         adv_q = tf.reduce_sum(adv_action, 1)
         q_value = state_value + adv_q
@@ -237,13 +245,11 @@ def make_acrl():
     td_error = target_value - q_value
     all_td_error_sum.append([tf.reduce_sum(td_error**2)])
 
+    adv = tf.sign(adv_direction)*adv_action
     if POLICY_SOFTMAX:
         log_prob = tf.log(tf.clip_by_value(policy[0], 1e-10, 1-1e-10))
-        adv = tf.sign(adv_direction)*adv_action
-        #adv = adv_direction*adv_action
     else:
-        log_prob = tf.reduce_sum(-(er.action-policy[0])**2, -1)
-        adv = tf.maximum(0., adv_action)
+        log_prob = policy[0]
 
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
@@ -269,10 +275,11 @@ for r in range(REWARDS_ALL):
     with tf.name_scope('ac_' + str(r)):
         make_acrl()
 
+envu.isRender = True # pybullet-gym
 env.reset(); env.render()# Gym needs at least 1 reset&render before valid observation
 def setup_key_actions():
     from pyglet.window import key
-    a = np.array([0.]*3)
+    a = np.array([0.]*max(3, ACTION_DIM))
 
     def key_press(k, mod):
         if k==0xff0d: restart = True
@@ -302,6 +309,8 @@ def setup_key_actions():
         if k==key.UP:    a[1] = 0
         if k==key.DOWN:  a[2] = 0
 
+    if not hasattr(envu, 'viewer'): # pybullet-gym
+        return a
     window = envu.viewer.window
     window.on_key_press = key_press
     window.on_key_release = key_release
@@ -348,9 +357,13 @@ def step_state_upload():
     if state.count > 0:
         if app.policy_index != -1:
             a = action.policy
-            if ACTION_DISCRETE and app.sample_actions:
-                # Sample from softmax probabilities
-                a = action_vector(np.random.choice(range(ACTION_DIM), p=a))
+            if app.sample_actions:
+                if POLICY_SOFTMAX:
+                    # Sample from softmax probabilities
+                    a = action_vector(np.random.choice(range(ACTION_DIM), p=a))
+                else:
+                    rand = 0.2
+                    a = np.clip(a + rand*(2*np.random.random(ACTION_DIM)-1.), -1., 1.)
 
     save_paths = batch_paths(training.current_batch)
     if not FLAGS.async and FLAGS.replay:
@@ -364,7 +377,7 @@ def step_state_upload():
             action_taken=action.to_take, reward=save_rewards))
     if ACTION_DISCRETE:
         a = np.where(a == np.max(action.to_take), 1., 0.)
-    ret = sess.run(ops_single_step, feed_dict={frame_ph: [state.frames]})
+    ret = sess.run(ops_single_step, feed_dict={ph.frame: [state.frames]})
     frames_to_state = ret[0]
     action.policy = ret[1]
 
@@ -378,7 +391,7 @@ def step_state_upload():
 
     state.count += 1
     if state.count == ER_BATCH_SIZE:
-        if training.batches_recorded < FLAGS.batches_keep:
+        if FLAGS.async or training.batches_recorded < FLAGS.batch_keep:
             print('Replacing batch #%i' % training.current_batch)
             for a in batch.arrays: a.flush()
             training.temp_batch = None
@@ -389,9 +402,11 @@ def step_state_upload():
             for src,dst in zip(temp_paths, save_paths):
                 os.system('mv ' + src + ' ' + dst)
 
-        if not FLAGS.async:
-            training.batches_recorded += 1
-            training.current_batch += 1
+        training.batches_recorded += 1
+        training.current_batch += 1
+        if FLAGS.async and training.batches_recorded == FLAGS.batch_per_async:
+            training.batches_recorded = 0
+            training.current_batch = FIRST_BATCH
         state.count = 0
 
 if not FLAGS.async:
@@ -400,9 +415,9 @@ if not FLAGS.async:
     init_vars()
 
     ops_batch_upload = [
-        er.states.assign(state_ph),
-        er.actions.assign(action_ph),
-        er.rewards.assign(reward_ph)
+        er.states[ph.batch_idx].assign(ph.state),
+        er.actions[ph.batch_idx].assign(ph.action),
+        er.rewards[ph.batch_idx].assign(ph.reward)
     ]
 
     if SAVE_SUMMARIES:
@@ -414,22 +429,28 @@ if not FLAGS.async:
         accum_ops.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
 
 def train_accum_batch():
+    batch_mtime = training.batches_mtime.get(training.current_batch)
+    paths = batch_paths(training.current_batch)
+    batch_idx = 0 if ER_BATCHES==1 else FLAGS.batch_keep+training.current_batch
     while True:
         try:
-            batch = mmap_batch(batch_paths(training.current_batch), 'r')
-            feed_dict = {
-                state_ph: batch.states,
-                action_ph: batch.actions,
-                reward_ph: batch.rewards}
+            mtime = os.path.getmtime(paths[0])
+            if ER_BATCHES == 1 or mtime != batch_mtime:
+                b = mmap_batch(paths, 'r')
+                feed_dict = {
+                    ph.state: b.states,
+                    ph.action: b.actions,
+                    ph.reward: b.rewards,
+                    ph.batch_idx: batch_idx}
+                sess.run(ops_batch_upload, feed_dict=feed_dict)
+                # imshow([er.states[10][:,:,i].eval() for i in range(STATE_FRAMES)])
+                training.batches_mtime[training.current_batch] = mtime
             break
         except:
             print('Waiting for batch %i...' % training.current_batch)
             time.sleep(0.1)
 
-    sess.run(ops_batch_upload, feed_dict=feed_dict)
-    # imshow([er.states[10][:,:,i].eval() for i in range(STATE_FRAMES)])
-
-    r = sess.run(accum_ops, feed_dict={ph.enable_tdc: epoch.prev_td_error > 0.})
+    r = sess.run(accum_ops, feed_dict={ph.enable_tdc: epoch.prev_td_error > 0., ph.batch_idx: batch_idx})
     sys.stdout.write('Batch %i/%i  ' % (training.current_batch, LAST_BATCH))
     if app.policy_index != -1:
         for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
@@ -457,7 +478,7 @@ def train_apply_gradients():
 
 def rl_loop():
     while not app.quit:
-        if FLAGS.async or not training.enable or training.batches_recorded < FLAGS.batches_keep:
+        if FLAGS.async or not training.enable or training.batches_recorded < FLAGS.batch_keep:
             step_state_upload()
             continue
 
