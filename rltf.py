@@ -21,7 +21,7 @@ sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 GAMMA = 0.999
 STATE_FRAMES = 2
-HIDDEN_LAYERS = 2
+HIDDEN_LAYERS = 3
 HIDDEN_NODES = 128
 
 SAVE_SUMMARIES = False
@@ -29,21 +29,19 @@ SAVE_SUMMARIES = False
 ENV_NAME = os.getenv('ENV')
 if not ENV_NAME:
     raise Exception('Missing ENV environment variable')
-RESIZE = None
 if ENV_NAME == 'CarRacing-v0':
     import gym.envs.box2d
     car_racing = gym.envs.box2d.car_racing
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
 elif ENV_NAME == 'FlappyBird-v0':
-    import gym_ple
-    RESIZE = [128, 128] # Was [512, 288]
+    import gym_ple # [512, 288]
 elif 'Bullet' in ENV_NAME:
     import pybulletgym.envs
 
 import gym
 env = gym.make(ENV_NAME)
-env._max_episode_steps = None # Disable step limit for now
+#env._max_episode_steps = None # Disable step limit
 envu = env.unwrapped
 
 ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
@@ -56,6 +54,7 @@ STATE_DIM = FRAME_DIM[:]
 if CONV_NET:
     if STATE_DIM[-1] == 3:
         STATE_DIM[-1] = 1
+    RESIZE = [84, 84] # DQN
     if RESIZE:
         STATE_DIM[:2] = RESIZE
 STATE_DIM[-1] *= STATE_FRAMES
@@ -172,21 +171,17 @@ def make_acrl():
     activation = tf.nn.leaky_relu if 1 else tf.nn.softsign
 
     def make_conv_net(x):
-        conv_channels = STATE_DIM[-1]
-        chan_in = conv_channels
+        chan_in = STATE_DIM[-1]
         chan_out = 32
-        CONV_LAYERS = 4
+        CONV_LAYERS = 3
         for l in range(CONV_LAYERS):
             with tf.name_scope('conv%i' % l):
-                x = layer_conv(x, 8, 1, chan_in, chan_out)
+                x = layer_conv(x, 7, 1, chan_in, chan_out)
                 chan_in = chan_out
                 chan_out *= 2
-                if l < 3: x = max_pool(x, 2, 2)
+                if l < 3: x = max_pool(x, 4, 2)
                 x = [activation(i) for i in x]
-
-        # Calculate topmost convolution dimensionality to create fully-connected layer
-        init_vars()
-        return layer_reshape_flat(x, x[0].eval())
+        return layer_reshape_flat(x, x[0].shape)
 
     def make_fully_connected(prev_output, input_size, num_outputs):
         for l in range(HIDDEN_LAYERS):
@@ -199,11 +194,7 @@ def make_acrl():
 
     with tf.name_scope('policy'):
         policy_layer = states
-        if 1:
-            if CONV_NET: policy_layer, num_flat_inputs = make_conv_net(states)
-        else:
-            # Share same conv network as critic
-            policy_layer = value_layer
+        if CONV_NET: policy_layer, num_flat_inputs = make_conv_net(states)
         policy = make_fully_connected(policy_layer, num_flat_inputs, ACTION_DIM)
         policy = [tf.nn.softmax(i) for i in policy] if POLICY_SOFTMAX else policy
         all_policy_ph.append(policy[-1])
@@ -216,7 +207,9 @@ def make_acrl():
 
     with tf.name_scope('value'):
         value_layer = states
-        if CONV_NET: value_layer, num_flat_inputs = make_conv_net(value_layer)
+        if CONV_NET:
+            if 1: value_layer, num_flat_inputs = make_conv_net(value_layer)
+            else: value_layer = policy_layer # Share same conv network as policy
         if 1:
             value_layer = make_fully_connected(value_layer, num_flat_inputs, 1+ACTION_DIM)
             [state_value, next_state_value, _] = [i[:,0] for i in value_layer]
@@ -232,8 +225,8 @@ def make_acrl():
         adv_q = tf.reduce_sum(adv_action, 1)
         q_value = state_value + adv_q
 
-    policy_one_hot = [tf.one_hot(tf.argmax(i, 1), ACTION_DIM) for i in policy]
-    is_on_policy = tf.reduce_sum(tf.abs(er.action-policy_one_hot[0]), -1) < 0.1
+    policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
+    is_on_policy = tf.reduce_sum(tf.abs(er.action-policy_action), -1) < 0.1
     def multi_step(max_recurse, i=0):
         z = tf.zeros(i)
         next = tf.concat([next_state_value[i:], z], 0)
@@ -443,7 +436,7 @@ def train_accum_batch():
                     ph.reward: b.rewards,
                     ph.batch_idx: batch_idx}
                 sess.run(ops_batch_upload, feed_dict=feed_dict)
-                # imshow([er.states[10][:,:,i].eval() for i in range(STATE_FRAMES)])
+                # imshow([er.states[batch_idx][10][:,:,i].eval() for i in range(STATE_FRAMES)])
                 training.batches_mtime[training.current_batch] = mtime
             break
         except:

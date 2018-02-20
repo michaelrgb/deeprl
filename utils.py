@@ -23,9 +23,8 @@ def max_pool(x, size=4, stride=1, padding='VALID'):
                            strides=[1, stride, stride, 1], padding=padding) for i in x]
 
 def weight_variable(shape, init_zeros=False):
-    stddev_init = 2. / sum(shape) # Xavier initialization
     return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else
-        tf.truncated_normal(shape, stddev=stddev_init, seed=0))
+        tf.contrib.layers.xavier_initializer(seed=0)(shape))
 def scope_vars(scope_name):
     current = tf.contrib.framework.get_name_scope()
     if current: scope_name = current + '/' + scope_name
@@ -117,13 +116,15 @@ def layer_conv(x, conv_width, conv_stride, input_channels, output_channels):
         variable_summaries(b_conv)
     x = wrapList(x)
     x = [conv2d(i, W_conv, stride=conv_stride) + b_conv for i in x]
+    print('layer_conv shape:', x[0].shape.as_list())
     return x
 
-def layer_reshape_flat(x, conv_eval):
-    input_size = conv_eval.shape[1]
-    input_channels = conv_eval.shape[3]
+def layer_reshape_flat(x, conv_shape):
+    conv_shape = conv_shape.as_list()
+    input_size = conv_shape[1]
+    input_channels = conv_shape[3]
     flat_size = input_size * input_size * input_channels
-    print('layer_reshape_flat shape:', conv_eval.shape, 'resizing to flat:', flat_size)
+    print('layer_reshape_flat shape:', conv_shape, 'resizing to flat:', flat_size)
     x = wrapList(x)
     x = [tf.reshape(i, [-1, flat_size]) for i in x]
     return x, flat_size
