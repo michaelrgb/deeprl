@@ -10,6 +10,7 @@ flags.DEFINE_integer('batch_async', 10, 'Batches to wait for from async agents')
 flags.DEFINE_integer('batch_per_async', 1, 'Batches recorded per async agent')
 flags.DEFINE_integer('batch_keep', 5, 'Batches recorded from user actions')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
+flags.DEFINE_boolean('record', False, 'Record over kept batches')
 flags.DEFINE_boolean('er_all', False, 'Keep all batches in ER memory')
 flags.DEFINE_float('learning_rate', 1e-3, 'Minimum learning rate')
 FLAGS = flags.FLAGS
@@ -54,6 +55,7 @@ STATE_DIM = FRAME_DIM[:]
 if CONV_NET:
     if STATE_DIM[-1] == 3:
         STATE_DIM[-1] = 1
+    FRAME_LCN = False
     RESIZE = [84, 84] # DQN
     if RESIZE:
         STATE_DIM[:2] = RESIZE
@@ -103,7 +105,7 @@ if FLAGS.async:
 else:
     def init_vars(): sess.run(tf.global_variables_initializer())
 
-    if 'w+' in sys.argv:
+    if FLAGS.record or FLAGS.replay:
         # Record new arrays
         app.policy_index = -1
     else:
@@ -125,7 +127,11 @@ if CONV_NET:
     frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Move STATE_FRAMES into batches
     if RESIZE:
         frame_to_state = tf.image.resize_images(frame_to_state, RESIZE, tf.image.ResizeMethod.AREA)
-    frame_to_state = tf.reduce_mean(frame_to_state/255., axis=-1) # Convert to grayscale
+    if FRAME_LCN:
+        frame_to_state = local_contrast_norm(frame_to_state, GAUSS_W)
+        frame_to_state = tf.reduce_sum(frame_to_state, axis=-1)
+    else:
+        frame_to_state = tf.reduce_mean(frame_to_state/255., axis=-1) # Convert to grayscale
     frame_to_state = tf.reshape(frame_to_state, [-1, STATE_FRAMES] + STATE_DIM[:-1])
     frame_to_state = tf.transpose(frame_to_state, [0, 2, 3, 1]) # Move STATE_FRAMES into channels
 else:
@@ -147,8 +153,7 @@ def accum_gradient(grads, opt):
 
 # compute_gradients() sums up gradients for all instances, whereas TDC requires a
 # multiple of features at s_t+1 to be subtracted from those at s_t.
-# Therefore use auto-diff to calculate linear "features" of the Q function,
-# and then multiply those features by the TD error etc using custom gradients.
+# Therefore use custom gradients to pre-multiply instances before batch is summed together.
 def gradient_override(expr, custom_grad):
     new_op_name = 'new_op_' + str(gradient_override.counter)
     gradient_override.counter += 1
@@ -181,6 +186,7 @@ def make_acrl():
                 chan_out *= 2
                 if l < 3: x = max_pool(x, 4, 2)
                 x = [activation(i) for i in x]
+                x = [tf.nn.local_response_normalization(i) for i in x]
         return layer_reshape_flat(x, x[0].shape)
 
     def make_fully_connected(prev_output, input_size, num_outputs):
@@ -238,7 +244,7 @@ def make_acrl():
     td_error = target_value - q_value
     all_td_error_sum.append([tf.reduce_sum(td_error**2)])
 
-    adv = tf.sign(adv_direction)*adv_action
+    adv = adv_action / adv_direction
     if POLICY_SOFTMAX:
         log_prob = tf.log(tf.clip_by_value(policy[0], 1e-10, 1-1e-10))
     else:
@@ -379,6 +385,7 @@ def step_state_upload():
         training.temp_batch = mmap_batch(temp_paths, 'w+')
     batch = training.temp_batch
     batch.states[state.count] = frames_to_state
+    # imshow([frames_to_state[:,:,i] for i in range(STATE_FRAMES)])
     batch.rewards[state.count] = save_rewards
     batch.actions[state.count] = a
 
