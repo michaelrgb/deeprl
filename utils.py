@@ -129,14 +129,15 @@ def layer_reshape_flat(x, conv_shape):
     x = [tf.reshape(i, [-1, flat_size]) for i in x]
     return x, flat_size
 
-def layer_fully_connected(x, flat_size, outputs=None, activation=None):
+def layer_fully_connected(x, outputs=None, activation=None):
+    x = wrapList(x)
+    inputs = x[0].shape.as_list()[-1]
     with tf.name_scope('weights'):
-        W_f = weight_variable([flat_size, outputs or 1])
+        W_f = weight_variable([inputs, outputs or 1])
         variable_summaries(W_f)
     with tf.name_scope('bias'):
         b_f = weight_variable([outputs or 1])
         variable_summaries(b_f)
-    x = wrapList(x)
     x = [tf.matmul(i, W_f) + b_f for i in x]
     if activation:
         x = [activation(i) for i in x]

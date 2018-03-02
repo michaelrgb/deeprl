@@ -1,4 +1,5 @@
 import tensorflow as tf, numpy as np
+from tensorflow.contrib import rnn
 import sys, os, multiprocessing, time
 from utils import *
 from pprint import pprint
@@ -22,8 +23,10 @@ sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 GAMMA = 0.999
 STATE_FRAMES = 2
-HIDDEN_LAYERS = 3
+HIDDEN_LAYERS = 2
 HIDDEN_NODES = 128
+LSTM_NODES = 256
+LSTM_NET = True
 
 SAVE_SUMMARIES = False
 
@@ -166,44 +169,59 @@ def gradient_override(expr, custom_grad):
 gradient_override.counter = 0
 
 all_td_error_sum = []
-all_policy_ph = []
+all_policy = []
 stats = Struct(reward_sum=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
-def make_acrl():
-    states, num_flat_inputs = [frame_to_state], STATE_DIM[0]
-    if not FLAGS.async:
-        states = [er.state, er.next_state] + states
-    activation = tf.nn.leaky_relu if 1 else tf.nn.softsign
+activation = tf.nn.leaky_relu if 1 else tf.nn.softsign
+def make_fully_connected(x, outputs):
+    for l in range(HIDDEN_LAYERS):
+        with tf.name_scope('fully%i' % l):
+            x = layer_fully_connected(x, HIDDEN_NODES, activation)
+    with tf.name_scope('fully%i' % HIDDEN_LAYERS):
+        output = layer_fully_connected(x, outputs, None)
+    return output
 
-    def make_conv_net(x):
-        chan_in = STATE_DIM[-1]
-        chan_out = 32
-        CONV_LAYERS = 3
-        for l in range(CONV_LAYERS):
-            with tf.name_scope('conv%i' % l):
-                x = layer_conv(x, 7, 1, chan_in, chan_out)
-                chan_in = chan_out
-                chan_out *= 2
-                if l < 3: x = max_pool(x, 4, 2)
-                x = [activation(i) for i in x]
-                x = [tf.nn.local_response_normalization(i) for i in x]
-        return layer_reshape_flat(x, x[0].shape)
-
-    def make_fully_connected(prev_output, input_size, num_outputs):
+def make_conv_net(x):
+    if not CONV_NET:
+        # If no conv, add layers before LSTM
         for l in range(HIDDEN_LAYERS):
-            with tf.name_scope('fully%i' % l):
-                prev_output = layer_fully_connected(prev_output, input_size, HIDDEN_NODES, activation)
-                input_size = HIDDEN_NODES
-        with tf.name_scope('fully%i' % HIDDEN_LAYERS):
-            output = layer_fully_connected(prev_output, input_size, num_outputs, None)
-        return output
+            with tf.name_scope('pre%i' % l):
+                x = layer_fully_connected(x, HIDDEN_NODES, activation)
+                x = [tf.nn.local_response_normalization(
+                    tf.expand_dims(tf.expand_dims(i, 1), 1))[:,0,0,:] for i in x]
+        return x
 
+    chan_in = STATE_DIM[-1]
+    chan_out = 32
+    CONV_LAYERS = 3
+    for l in range(CONV_LAYERS):
+        with tf.name_scope('conv%i' % l):
+            x = layer_conv(x, 7, 1, chan_in, chan_out)
+            chan_in = chan_out
+            chan_out *= 2
+            if l < 3: x = max_pool(x, 4, 2)
+            x = [activation(i) for i in x]
+            x = [tf.nn.local_response_normalization(i) for i in x]
+    return layer_reshape_flat(x, x[0].shape)[0]
+
+def make_acrl():
     with tf.name_scope('policy'):
-        policy_layer = states
-        if CONV_NET: policy_layer, num_flat_inputs = make_conv_net(states)
-        policy = make_fully_connected(policy_layer, num_flat_inputs, ACTION_DIM)
+        policy_layer = make_conv_net([frame_to_state] if FLAGS.async else [er.state, frame_to_state])
+        p = Struct()
+        if LSTM_NET:
+            cell = rnn.BasicLSTMCell(LSTM_NODES)
+            scope = tf.contrib.framework.get_name_scope()
+            if not FLAGS.async:
+                [policy_layer[0]], _ = rnn.static_rnn(cell, [policy_layer[0]], dtype=tf.float32, scope=scope)
+            p.policy_lstm_saved = tf.contrib.rnn.LSTMStateTuple(
+                *[tf.Variable(s, trainable=False) for s in cell.zero_state(1, DTYPE)])
+            [policy_layer[-1]], final_state = rnn.static_rnn(cell, [policy_layer[-1]], initial_state=p.policy_lstm_saved, scope=scope)
+            p.lstm_save_ops = [p.policy_lstm_saved[i].assign(final_state[i]) for i in range(2)]
+
+        policy = make_fully_connected(policy_layer, ACTION_DIM)
         policy = [tf.nn.softmax(i) for i in policy] if POLICY_SOFTMAX else policy
-        all_policy_ph.append(policy[-1])
+        p.policy = policy[-1]
+        all_policy.append(p)
         stats._policy_minmax.append(tf.concat([
             [tf.reduce_min(policy[0], axis=0)],
             [tf.reduce_max(policy[0], axis=0)]], axis=0))
@@ -212,24 +230,25 @@ def make_acrl():
         return
 
     with tf.name_scope('value'):
-        value_layer = states
-        if CONV_NET:
-            if 1: value_layer, num_flat_inputs = make_conv_net(value_layer)
-            else: value_layer = policy_layer # Share same conv network as policy
-        if 1:
-            value_layer = make_fully_connected(value_layer, num_flat_inputs, 1+ACTION_DIM)
+        value_layer = make_conv_net([er.state, er.next_state, frame_to_state])
+        if LSTM_NET:
+            cell = rnn.BasicLSTMCell(LSTM_NODES)
+            scope = tf.contrib.framework.get_name_scope()
+            value_layer, _ = rnn.static_rnn(cell, value_layer, dtype=tf.float32, scope=scope)
+
+        if 0:
+            value_layer = make_fully_connected(value_layer, 1+ACTION_DIM)
             [state_value, next_state_value, _] = [i[:,0] for i in value_layer]
             adv_direction = value_layer[0][:,1:]
         else:
-            [state_value, next_state_value, _] = make_fully_connected(value_layer, num_flat_inputs, None)
-            [adv_direction] = make_fully_connected(value_layer[0], num_flat_inputs, ACTION_DIM)
+            [state_value, next_state_value, _] = make_fully_connected(value_layer, None)
+            [adv_direction] = make_fully_connected(value_layer[0], ACTION_DIM)
 
         # Learn from a minimum off_policy to keep advantage function stable when off_policy increases.
         off_policy = er.action - policy[0]
         off_policy = tf.where(tf.abs(off_policy)<1e-2, tf.zeros(off_policy.shape), off_policy)
         adv_action = adv_direction*off_policy
-        adv_q = tf.reduce_sum(adv_action, 1)
-        q_value = state_value + adv_q
+        q_value = state_value + tf.reduce_sum(adv_action, -1)
 
     policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
     is_on_policy = tf.reduce_sum(tf.abs(er.action-policy_action), -1) < 0.1
@@ -244,11 +263,16 @@ def make_acrl():
     td_error = target_value - q_value
     all_td_error_sum.append([tf.reduce_sum(td_error**2)])
 
-    adv = adv_action / adv_direction
     if POLICY_SOFTMAX:
-        log_prob = tf.log(tf.clip_by_value(policy[0], 1e-10, 1-1e-10))
+        prob = tf.reduce_sum(policy[0]*er.action, -1)
+        log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
     else:
-        log_prob = policy[0]
+        log_prob = -tf.reduce_sum((policy[0]-er.action)**2, -1)
+        prob = tf.exp(log_prob)
+
+    adv = target_value - state_value
+    adv = tf.where(prob < 1e-2, tf.maximum(0., adv),
+          tf.where(prob > 1-1e-2, tf.minimum(0., adv), adv))
 
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
@@ -342,8 +366,8 @@ def step_to_frames():
 
 ops_single_step = [
     frame_to_state[0],
-    all_policy_ph[0][0],# Policy from uploaded state
-]
+    all_policy[0].policy[0],# Policy from uploaded state,
+] + ([op for p in all_policy for op in p.lstm_save_ops] if LSTM_NET else [])
 def step_state_upload():
     def action_vector(action_index):
         return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
@@ -362,7 +386,8 @@ def step_state_upload():
                     a = action_vector(np.random.choice(range(ACTION_DIM), p=a))
                 else:
                     rand = 0.2
-                    a = np.clip(a + rand*(2*np.random.random(ACTION_DIM)-1.), -1., 1.)
+                    a += rand*(2*np.random.random(ACTION_DIM)-1.)
+                    if not ACTION_DISCRETE: a = np.clip(a, -1., 1.)
 
     save_paths = batch_paths(training.current_batch)
     if not FLAGS.async and FLAGS.replay:
@@ -451,7 +476,7 @@ def train_accum_batch():
             time.sleep(0.1)
 
     r = sess.run(accum_ops, feed_dict={ph.enable_tdc: epoch.prev_td_error > 0., ph.batch_idx: batch_idx})
-    sys.stdout.write('Batch %i/%i  ' % (training.current_batch, LAST_BATCH))
+    sys.stdout.write('Batch %i/(%i+%i)  ' % (training.current_batch, FLAGS.batch_keep, FLAGS.batch_async))
     if app.policy_index != -1:
         for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
             sys.stdout.write(s+': ' + ('\n'if s[0]=='_'else'') + str(r[-i-1][app.policy_index])+'  ')
