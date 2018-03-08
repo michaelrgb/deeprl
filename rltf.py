@@ -104,7 +104,6 @@ opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10, epsilon=0.1)
 
 if FLAGS.async:
     FIRST_BATCH = (FLAGS.async-1)*FLAGS.batch_per_async
-    def init_vars(): pass
 else:
     def init_vars(): sess.run(tf.global_variables_initializer())
 
@@ -206,16 +205,20 @@ def make_conv_net(x):
 
 def make_acrl():
     with tf.name_scope('policy'):
-        policy_layer = make_conv_net([frame_to_state] if FLAGS.async else [er.state, frame_to_state])
+        policy_layer = make_conv_net(([er.state, er.next_state] if not FLAGS.async else []) + [frame_to_state])
         p = Struct()
         if LSTM_NET:
             cell = rnn.BasicLSTMCell(LSTM_NODES)
             scope = tf.contrib.framework.get_name_scope()
             if not FLAGS.async:
-                [policy_layer[0]], _ = rnn.static_rnn(cell, [policy_layer[0]], dtype=tf.float32, scope=scope)
-            p.policy_lstm_saved = tf.contrib.rnn.LSTMStateTuple(
-                *[tf.Variable(s, trainable=False) for s in cell.zero_state(1, DTYPE)])
-            [policy_layer[-1]], final_state = rnn.static_rnn(cell, [policy_layer[-1]], initial_state=p.policy_lstm_saved, scope=scope)
+                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(policy_layer[:2]), dtype=tf.float32, scope=scope)
+                policy_layer[:2] = tf.unstack(stacked)
+            with tf.name_scope(str(FLAGS.async)):
+                p.policy_lstm_saved = tf.contrib.rnn.LSTMStateTuple(
+                    *[tf.Variable(s, trainable=False) for s in cell.zero_state(1, DTYPE)])
+                sess.run(tf.variables_initializer(p.policy_lstm_saved))
+            stacked, final_state = tf.nn.dynamic_rnn(cell, tf.stack(policy_layer[-1:]), initial_state=p.policy_lstm_saved, scope=scope)
+            policy_layer[-1:] = tf.unstack(stacked)
             p.lstm_save_ops = [p.policy_lstm_saved[i].assign(final_state[i]) for i in range(2)]
 
         policy = make_fully_connected(policy_layer, ACTION_DIM)
@@ -234,24 +237,26 @@ def make_acrl():
         if LSTM_NET:
             cell = rnn.BasicLSTMCell(LSTM_NODES)
             scope = tf.contrib.framework.get_name_scope()
-            value_layer, _ = rnn.static_rnn(cell, value_layer, dtype=tf.float32, scope=scope)
-
-        if 0:
+            stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[:2]), dtype=tf.float32, scope=scope)
+            value_layer[:2] = tf.unstack(stacked)
+            stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[-1:]), dtype=tf.float32, scope=scope)
+            value_layer[-1:] = tf.unstack(stacked)
+        if 1:
             value_layer = make_fully_connected(value_layer, 1+ACTION_DIM)
-            [state_value, next_state_value, _] = [i[:,0] for i in value_layer]
-            adv_direction = value_layer[0][:,1:]
+            state_value = [i[:,0] for i in value_layer]
+            adv_direction = [i[:,1:] for i in value_layer]
         else:
-            [state_value, next_state_value, _] = make_fully_connected(value_layer, None)
-            [adv_direction] = make_fully_connected(value_layer[0], ACTION_DIM)
-
-        # Learn from a minimum off_policy to keep advantage function stable when off_policy increases.
-        off_policy = er.action - policy[0]
-        off_policy = tf.where(tf.abs(off_policy)<1e-2, tf.zeros(off_policy.shape), off_policy)
-        adv_action = adv_direction*off_policy
-        q_value = state_value + tf.reduce_sum(adv_action, -1)
+            state_value = make_fully_connected(value_layer, None)
+            adv_direction = make_fully_connected(value_layer, ACTION_DIM)
+        act_value = [tf.reduce_sum(i, 1) for i in [
+                        adv_direction[0]*policy[0],
+                        adv_direction[1]*policy[1],
+                        adv_direction[0]*er.action]]
+        q_value = state_value[0] + act_value[2]
+        [state_value, next_state_value] = [state_value[i] + act_value[i] for i in range(2)]
 
     policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
-    is_on_policy = tf.reduce_sum(tf.abs(er.action-policy_action), -1) < 0.1
+    is_on_policy = tf.reduce_sum(tf.abs(er.action-policy_action), 1) < 0.1
     def multi_step(max_recurse, i=0):
         z = tf.zeros(i)
         next = tf.concat([next_state_value[i:], z], 0)
@@ -263,16 +268,16 @@ def make_acrl():
     td_error = target_value - q_value
     all_td_error_sum.append([tf.reduce_sum(td_error**2)])
 
-    if POLICY_SOFTMAX:
-        prob = tf.reduce_sum(policy[0]*er.action, -1)
-        log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
-    else:
-        log_prob = -tf.reduce_sum((policy[0]-er.action)**2, -1)
-        prob = tf.exp(log_prob)
-
     adv = target_value - state_value
-    adv = tf.where(prob < 1e-2, tf.maximum(0., adv),
-          tf.where(prob > 1-1e-2, tf.minimum(0., adv), adv))
+    if POLICY_SOFTMAX:
+        prob = tf.reduce_sum(policy[0]*er.action, 1)
+        log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
+        adv = tf.where(prob < 1e-2, tf.maximum(0., adv),
+              tf.where(prob > 1-1e-2, tf.minimum(0., adv), adv))
+    else:
+        log_prob = -(policy[0]-er.action)**2
+        adv = tf.where(adv > 0., adv, tf.zeros(adv.shape))
+        adv = tf.tile(tf.expand_dims(adv, 1), [1, ACTION_DIM])
 
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
@@ -341,7 +346,7 @@ def setup_key_actions():
     return a
 
 state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
-               count=0, last_obs=None, done=True)
+               count=0, last_obs=None, done=True, last_pos_reward=0)
 action = Struct(to_take=None, policy=None, keyboard=setup_key_actions())
 def step_to_frames():
     obs = state.last_obs
@@ -360,6 +365,11 @@ def step_to_frames():
         if ENV_NAME == 'MountainCar-v0':
             # Mountain car env doesnt give any +reward
             reward = 1. if state.done else 0.
+        elif ENV_NAME == 'CarRacing-v0':
+            if state.last_pos_reward > 100:
+                state.done = True # Reset track if spinning
+                reward = -100
+        state.last_pos_reward = 0 if reward>0. or state.done else state.last_pos_reward+1
         reward_sum += reward
     state.last_obs = obs
     return [reward_sum]
