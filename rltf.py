@@ -25,8 +25,9 @@ GAMMA = 0.999
 STATE_FRAMES = 2
 HIDDEN_LAYERS = 2
 HIDDEN_NODES = 128
-LSTM_NODES = 256
-LSTM_NET = True
+LSTM_NODES = 128
+LSTM_LAYER = True
+SHARED_LAYERS = False
 
 SAVE_SUMMARIES = False
 
@@ -172,56 +173,63 @@ all_policy = []
 stats = Struct(reward_sum=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
 activation = tf.nn.leaky_relu if 1 else tf.nn.softsign
-def make_fully_connected(x, outputs):
+def make_dense_layers(x, outputs):
     for l in range(HIDDEN_LAYERS):
-        with tf.name_scope('fully%i' % l):
-            x = layer_fully_connected(x, HIDDEN_NODES, activation)
-    with tf.name_scope('fully%i' % HIDDEN_LAYERS):
-        output = layer_fully_connected(x, outputs, None)
-    return output
+        dense = tf.layers.Dense(HIDDEN_NODES, activation,
+            _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % l)
+        x = [dense.apply(i) for i in x]
+    dense = tf.layers.Dense(outputs, None,
+        _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % HIDDEN_LAYERS)
+    return [dense.apply(i) for i in x]
 
 def make_conv_net(x):
     if not CONV_NET:
         # If no conv, add layers before LSTM
         for l in range(HIDDEN_LAYERS):
-            with tf.name_scope('pre%i' % l):
-                x = layer_fully_connected(x, HIDDEN_NODES, activation)
-                x = [tf.nn.local_response_normalization(
-                    tf.expand_dims(tf.expand_dims(i, 1), 1))[:,0,0,:] for i in x]
+            dense = tf.layers.Dense(HIDDEN_NODES, activation,
+                _scope=tf.contrib.framework.get_name_scope() + '/pre%i' % l)
+            x = [dense.apply(i) for i in x]
+            x = [tf.nn.local_response_normalization(
+                tf.expand_dims(tf.expand_dims(i, 1), 1))[:,0,0,:] for i in x]
         return x
 
-    chan_in = STATE_DIM[-1]
-    chan_out = 32
+    filters = 32
     CONV_LAYERS = 3
     for l in range(CONV_LAYERS):
-        with tf.name_scope('conv%i' % l):
-            x = layer_conv(x, 7, 1, chan_in, chan_out)
-            chan_in = chan_out
-            chan_out *= 2
-            if l < 3: x = max_pool(x, 4, 2)
-            x = [activation(i) for i in x]
-            x = [tf.nn.local_response_normalization(i) for i in x]
-    return layer_reshape_flat(x, x[0].shape)[0]
+        conv = tf.layers.Conv2D(filters, 7, 1,
+            _scope=tf.contrib.framework.get_name_scope() + '/conv%i' % l)
+        filters *= 2
+        next_x = []
+        for i in x:
+            i = conv.apply(i)
+            [i] = max_pool(i, 4, 2)
+            i = activation(i)
+            i = tf.nn.local_response_normalization(i)
+            next_x.append(i)
+        x = next_x
+    return [tf.layers.flatten(i) for i in x]
 
 def make_acrl():
-    with tf.name_scope('policy'):
-        policy_layer = make_conv_net(([er.state, er.next_state] if not FLAGS.async else []) + [frame_to_state])
+    with tf.name_scope('shared'):
+        shared_layer = make_conv_net(([er.state, er.next_state] if not FLAGS.async else []) + [frame_to_state])
         p = Struct()
-        if LSTM_NET:
+        if LSTM_LAYER:
             cell = rnn.BasicLSTMCell(LSTM_NODES)
             scope = tf.contrib.framework.get_name_scope()
             if not FLAGS.async:
-                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(policy_layer[:2]), dtype=tf.float32, scope=scope)
-                policy_layer[:2] = tf.unstack(stacked)
+                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(shared_layer[:2]), dtype=tf.float32, scope=scope)
+                shared_layer[:2] = tf.unstack(stacked)
             with tf.name_scope(str(FLAGS.async)):
-                p.policy_lstm_saved = tf.contrib.rnn.LSTMStateTuple(
+                p.lstm_saved_state = tf.contrib.rnn.LSTMStateTuple(
                     *[tf.Variable(s, trainable=False) for s in cell.zero_state(1, DTYPE)])
-                sess.run(tf.variables_initializer(p.policy_lstm_saved))
-            stacked, final_state = tf.nn.dynamic_rnn(cell, tf.stack(policy_layer[-1:]), initial_state=p.policy_lstm_saved, scope=scope)
-            policy_layer[-1:] = tf.unstack(stacked)
-            p.lstm_save_ops = [p.policy_lstm_saved[i].assign(final_state[i]) for i in range(2)]
+                sess.run(tf.variables_initializer(p.lstm_saved_state))
+            stacked, final_state = tf.nn.dynamic_rnn(cell, tf.stack(shared_layer[-1:]), initial_state=p.lstm_saved_state, scope=scope)
+            shared_layer[-1:] = tf.unstack(stacked)
+            p.lstm_save_ops = [p.lstm_saved_state[i].assign(final_state[i]) for i in range(2)]
+        shared_weights = scope_vars()
 
-        policy = make_fully_connected(policy_layer, ACTION_DIM)
+    with tf.name_scope('policy'):
+        policy = make_dense_layers(shared_layer, ACTION_DIM)
         policy = [tf.nn.softmax(i) for i in policy] if POLICY_SOFTMAX else policy
         p.policy = policy[-1]
         all_policy.append(p)
@@ -232,22 +240,27 @@ def make_acrl():
     if FLAGS.async:
         return
 
+    if SHARED_LAYERS:
+        value_layer = shared_layer
+    else:
+        with tf.name_scope('non_shared'):
+            value_layer = make_conv_net([er.state, er.next_state, frame_to_state])
+            if LSTM_LAYER:
+                cell = rnn.BasicLSTMCell(LSTM_NODES)
+                scope = tf.contrib.framework.get_name_scope()
+                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[:2]), dtype=tf.float32, scope=scope)
+                value_layer[:2] = tf.unstack(stacked)
+                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[-1:]), dtype=tf.float32, scope=scope)
+                value_layer[-1:] = tf.unstack(stacked)
+            shared_weights = scope_vars()
     with tf.name_scope('value'):
-        value_layer = make_conv_net([er.state, er.next_state, frame_to_state])
-        if LSTM_NET:
-            cell = rnn.BasicLSTMCell(LSTM_NODES)
-            scope = tf.contrib.framework.get_name_scope()
-            stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[:2]), dtype=tf.float32, scope=scope)
-            value_layer[:2] = tf.unstack(stacked)
-            stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[-1:]), dtype=tf.float32, scope=scope)
-            value_layer[-1:] = tf.unstack(stacked)
         if 1:
-            value_layer = make_fully_connected(value_layer, 1+ACTION_DIM)
+            value_layer = make_dense_layers(value_layer, 1+ACTION_DIM)
             state_value = [i[:,0] for i in value_layer]
             adv_direction = [i[:,1:] for i in value_layer]
         else:
-            state_value = make_fully_connected(value_layer, None)
-            adv_direction = make_fully_connected(value_layer, ACTION_DIM)
+            state_value = make_dense_layers(value_layer, None)
+            adv_direction = make_dense_layers(value_layer, ACTION_DIM)
         act_value = [tf.reduce_sum(i, 1) for i in [
                         adv_direction[0]*policy[0],
                         adv_direction[1]*policy[1],
@@ -280,7 +293,7 @@ def make_acrl():
         adv = tf.tile(tf.expand_dims(adv, 1), [1, ACTION_DIM])
 
     repl = gradient_override(log_prob, adv)
-    grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
+    grad = opt_policy.compute_gradients(repl, scope_vars('policy')+scope_vars('shared'))
     accum_gradient(grad, opt_policy)
 
     stats.max_advantage.append(tf.reduce_max(tf.abs(adv)))
@@ -288,7 +301,7 @@ def make_acrl():
     stats.reward_sum.append(tf.reduce_sum(all_rewards[r]))
 
     # TD error with gradient correction (TDC)
-    weights = scope_vars('value')
+    weights = scope_vars('value')+shared_weights
     repl = gradient_override(q_value, td_error)
     grad_s = opt_td.compute_gradients(repl, weights)
     repl = gradient_override(next_state_value, -GAMMA*td_error)
@@ -377,7 +390,7 @@ def step_to_frames():
 ops_single_step = [
     frame_to_state[0],
     all_policy[0].policy[0],# Policy from uploaded state,
-] + ([op for p in all_policy for op in p.lstm_save_ops] if LSTM_NET else [])
+] + ([op for p in all_policy for op in p.lstm_save_ops] if LSTM_LAYER else [])
 def step_state_upload():
     def action_vector(action_index):
         return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
