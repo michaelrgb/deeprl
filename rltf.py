@@ -96,7 +96,7 @@ def mmap_batch(paths, mode, only_actions=False):
 ph = Struct(learning_rate=tf.placeholder(tf.float32, ()),
     enable_tdc=tf.placeholder(tf.bool, ()),
     batch_idx=tf.placeholder(tf.int32, ()),
-    state=tf.placeholder(tf.float32, [None] + STATE_DIM),
+    states=tf.placeholder(tf.float32, [None] + STATE_DIM),
     action=tf.placeholder(tf.float32, [None, ACTION_DIM]),
     reward=tf.placeholder(tf.float32, [None, REWARDS_GLOBAL]),
     frame=tf.placeholder(tf.float32, [None, STATE_FRAMES] + FRAME_DIM))
@@ -113,18 +113,17 @@ else:
         app.policy_index = -1
     else:
         training.batches_recorded = FLAGS.batch_keep
-
-    with tf.name_scope('experience_replay'):
-        er = Struct(
-            states= tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE] + STATE_DIM), False, name='states'),
-            actions=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE, ACTION_DIM]), False, name='actions'),
-            rewards=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE, REWARDS_GLOBAL]), False, name='rewards'))
-        er.state =      er.states[ph.batch_idx][:-1]
-        er.next_state = er.states[ph.batch_idx][1:]
-        er.action =     er.actions[ph.batch_idx][1:]
-        er.reward =     er.rewards[ph.batch_idx][1:]
-        all_rewards = [er.reward[:, r] for r in range(REWARDS_ALL)] + []
 training.current_batch = FIRST_BATCH
+
+with tf.name_scope('experience_replay'):
+    er = Struct(
+        states= tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE] + STATE_DIM), False, name='states'),
+        actions=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE-1, ACTION_DIM]), False, name='actions'),
+        rewards=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE-1, REWARDS_GLOBAL]), False, name='rewards'))
+    er.batch_states = er.states[ph.batch_idx]
+    er.batch_action = er.actions[ph.batch_idx]
+    er.batch_reward = er.rewards[ph.batch_idx]
+    all_rewards = [er.batch_reward[:, r] for r in range(REWARDS_ALL)] + []
 
 if CONV_NET:
     frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Move STATE_FRAMES into batches
@@ -172,7 +171,7 @@ all_td_error_sum = []
 all_policy = []
 stats = Struct(reward_sum=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
-activation = tf.nn.leaky_relu if 1 else tf.nn.softsign
+activation = tf.nn.leaky_relu
 def make_dense_layers(x, outputs):
     for l in range(HIDDEN_LAYERS):
         dense = tf.layers.Dense(HIDDEN_NODES, activation,
@@ -183,49 +182,45 @@ def make_dense_layers(x, outputs):
     return [dense.apply(i) for i in x]
 
 def make_conv_net(x):
-    if not CONV_NET:
-        # If no conv, add layers before LSTM
-        for l in range(HIDDEN_LAYERS):
-            dense = tf.layers.Dense(HIDDEN_NODES, activation,
-                _scope=tf.contrib.framework.get_name_scope() + '/pre%i' % l)
-            x = [dense.apply(i) for i in x]
-            x = [tf.nn.local_response_normalization(
-                tf.expand_dims(tf.expand_dims(i, 1), 1))[:,0,0,:] for i in x]
-        return x
-
     filters = 32
-    CONV_LAYERS = 3
-    for l in range(CONV_LAYERS):
-        conv = tf.layers.Conv2D(filters, 7, 1,
+    CONV_LAYERS = 4
+    for l in range(CONV_LAYERS if CONV_NET else 0):
+        conv = tf.layers.Conv2D(filters, 3, 2,
             _scope=tf.contrib.framework.get_name_scope() + '/conv%i' % l)
-        filters *= 2
-        next_x = []
-        for i in x:
-            i = conv.apply(i)
-            [i] = max_pool(i, 4, 2)
-            i = activation(i)
-            i = tf.nn.local_response_normalization(i)
-            next_x.append(i)
-        x = next_x
-    return [tf.layers.flatten(i) for i in x]
+        x = [conv.apply(i) for i in x]
+        print(x[0].shape)
+    x = [tf.layers.flatten(i) for i in x]
+    print(x[0].shape)
+
+    # Add layers before LSTM
+    for l in range(0 if CONV_NET else HIDDEN_LAYERS):
+        dense = tf.layers.Dense(HIDDEN_NODES, activation,
+            _scope=tf.contrib.framework.get_name_scope() + '/pre%i' % l)
+        x = [dense.apply(i) for i in x]
+    return x
+
+def make_next_state_pair(x):
+    x = [x[0][:-1], x[0][1:], x[1]]
+    return x
 
 def make_acrl():
+    input_states = [er.batch_states, frame_to_state]
+    p = Struct()
     with tf.name_scope('shared'):
-        shared_layer = make_conv_net(([er.state, er.next_state] if not FLAGS.async else []) + [frame_to_state])
-        p = Struct()
+        shared_layer = make_conv_net(input_states)
         if LSTM_LAYER:
             cell = rnn.BasicLSTMCell(LSTM_NODES)
             scope = tf.contrib.framework.get_name_scope()
-            if not FLAGS.async:
-                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(shared_layer[:2]), dtype=tf.float32, scope=scope)
-                shared_layer[:2] = tf.unstack(stacked)
+            stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(shared_layer[:1]), dtype=tf.float32, scope=scope)
+            shared_layer[:1] = tf.unstack(stacked)
             with tf.name_scope(str(FLAGS.async)):
                 p.lstm_saved_state = tf.contrib.rnn.LSTMStateTuple(
                     *[tf.Variable(s, trainable=False) for s in cell.zero_state(1, DTYPE)])
                 sess.run(tf.variables_initializer(p.lstm_saved_state))
-            stacked, final_state = tf.nn.dynamic_rnn(cell, tf.stack(shared_layer[-1:]), initial_state=p.lstm_saved_state, scope=scope)
-            shared_layer[-1:] = tf.unstack(stacked)
-            p.lstm_save_ops = [p.lstm_saved_state[i].assign(final_state[i]) for i in range(2)]
+                stacked, final_state = tf.nn.dynamic_rnn(cell, tf.stack(shared_layer[-1:]), initial_state=p.lstm_saved_state, scope=scope)
+                shared_layer[-1:] = tf.unstack(stacked)
+                p.lstm_save_ops = [p.lstm_saved_state[i].assign(final_state[i]) for i in range(2)]
+        shared_layer = make_next_state_pair(shared_layer)
         shared_weights = scope_vars()
 
     with tf.name_scope('policy'):
@@ -244,32 +239,38 @@ def make_acrl():
         value_layer = shared_layer
     else:
         with tf.name_scope('non_shared'):
-            value_layer = make_conv_net([er.state, er.next_state, frame_to_state])
+            value_layer = make_conv_net(input_states)
             if LSTM_LAYER:
                 cell = rnn.BasicLSTMCell(LSTM_NODES)
                 scope = tf.contrib.framework.get_name_scope()
-                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[:2]), dtype=tf.float32, scope=scope)
-                value_layer[:2] = tf.unstack(stacked)
-                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[-1:]), dtype=tf.float32, scope=scope)
-                value_layer[-1:] = tf.unstack(stacked)
+                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[:1]), dtype=tf.float32, scope=scope)
+                value_layer[:1] = tf.unstack(stacked)
+                with tf.name_scope(str(FLAGS.async)):
+                    # Not used currently
+                    stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[-1:]), dtype=tf.float32, scope=scope)
+                    value_layer[-1:] = tf.unstack(stacked)
+            value_layer = make_next_state_pair(value_layer)
             shared_weights = scope_vars()
+
     with tf.name_scope('value'):
+        value_layer =   [value_layer[0], value_layer[0],  value_layer[1]]
+        value_actions = [policy[0],      er.batch_action, policy[1]]
+        # Include actions as input to dense layers
+        value_layer = [tf.concat([value_layer[i], value_actions[i]], 1) for i in range(3)]
+
         if 1:
             value_layer = make_dense_layers(value_layer, 1+ACTION_DIM)
-            state_value = [i[:,0] for i in value_layer]
+            avg_value = [i[:,0] for i in value_layer]
             adv_direction = [i[:,1:] for i in value_layer]
         else:
-            state_value = make_dense_layers(value_layer, None)
+            avg_value = make_dense_layers(value_layer, None)
             adv_direction = make_dense_layers(value_layer, ACTION_DIM)
-        act_value = [tf.reduce_sum(i, 1) for i in [
-                        adv_direction[0]*policy[0],
-                        adv_direction[1]*policy[1],
-                        adv_direction[0]*er.action]]
-        q_value = state_value[0] + act_value[2]
-        [state_value, next_state_value] = [state_value[i] + act_value[i] for i in range(2)]
+
+        [state_value, q_value, next_state_value] = [avg_value[i] + tf.reduce_sum(
+            adv_direction[i]*value_actions[i], 1) for i in range(3)]
 
     policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
-    is_on_policy = tf.reduce_sum(tf.abs(er.action-policy_action), 1) < 0.1
+    is_on_policy = tf.reduce_sum(tf.abs(er.batch_action-policy_action), 1) < 0.1
     def multi_step(max_recurse, i=0):
         z = tf.zeros(i)
         next = tf.concat([next_state_value[i:], z], 0)
@@ -282,14 +283,14 @@ def make_acrl():
     all_td_error_sum.append([tf.reduce_sum(td_error**2)])
 
     adv = target_value - state_value
+    adv = tf.maximum(0., adv)
     if POLICY_SOFTMAX:
-        prob = tf.reduce_sum(policy[0]*er.action, 1)
+        prob = tf.reduce_sum(policy[0]*er.batch_action, 1)
         log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
         adv = tf.where(prob < 1e-2, tf.maximum(0., adv),
               tf.where(prob > 1-1e-2, tf.minimum(0., adv), adv))
     else:
-        log_prob = -(policy[0]-er.action)**2
-        adv = tf.where(adv > 0., adv, tf.zeros(adv.shape))
+        log_prob = -(policy[0]-er.batch_action)**2
         adv = tf.tile(tf.expand_dims(adv, 1), [1, ACTION_DIM])
 
     repl = gradient_override(log_prob, adv)
@@ -316,6 +317,10 @@ for r in range(REWARDS_ALL):
     with tf.name_scope('ac_' + str(r)):
         make_acrl()
 
+state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
+               count=0, last_obs=None, last_pos_reward=0,
+               done=True, next_reset=False)
+
 envu.isRender = True # pybullet-gym
 env.reset(); env.render()# Gym needs at least 1 reset&render before valid observation
 def setup_key_actions():
@@ -337,6 +342,8 @@ def setup_key_actions():
             app.sample_actions ^= True
         elif k==ord('t'):
             training.enable ^= True
+        elif k==ord('r'):
+            state.next_reset = True
         else:
             return
         print(dict(
@@ -358,15 +365,15 @@ def setup_key_actions():
     window.on_close = lambda: setattr(app, 'quit', True)
     return a
 
-state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
-               count=0, last_obs=None, done=True, last_pos_reward=0)
 action = Struct(to_take=None, policy=None, keyboard=setup_key_actions())
 def step_to_frames():
     obs = state.last_obs
     env_action = np.argmax(action.to_take) if ACTION_DISCRETE else action.to_take
     reward_sum = 0.
     for frame in range(STATE_FRAMES):
+        state.done |= state.next_reset
         if state.done:
+            state.next_reset = False
             # New episode
             env.seed(0) # Same track everytime
             obs = env.reset()
@@ -463,9 +470,9 @@ if not FLAGS.async:
     init_vars()
 
     ops_batch_upload = [
-        er.states[ph.batch_idx].assign(ph.state),
-        er.actions[ph.batch_idx].assign(ph.action),
-        er.rewards[ph.batch_idx].assign(ph.reward)
+        er.batch_states.assign(ph.states),
+        er.batch_action.assign(ph.action),
+        er.batch_reward.assign(ph.reward)
     ]
 
     if SAVE_SUMMARIES:
@@ -486,12 +493,12 @@ def train_accum_batch():
             if ER_BATCHES == 1 or mtime != batch_mtime:
                 b = mmap_batch(paths, 'r')
                 feed_dict = {
-                    ph.state: b.states,
-                    ph.action: b.actions,
-                    ph.reward: b.rewards,
+                    ph.states: b.states,
+                    ph.action: b.actions[1:],
+                    ph.reward: b.rewards[1:],
                     ph.batch_idx: batch_idx}
                 sess.run(ops_batch_upload, feed_dict=feed_dict)
-                # imshow([er.states[batch_idx][10][:,:,i].eval() for i in range(STATE_FRAMES)])
+                # imshow([er.batch_states[10][:,:,i].eval(feed_dict) for i in range(STATE_FRAMES)])
                 training.batches_mtime[training.current_batch] = mtime
             break
         except:
