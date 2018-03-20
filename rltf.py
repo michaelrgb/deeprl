@@ -5,7 +5,7 @@ from utils import *
 from pprint import pprint
 
 flags = tf.app.flags
-# for i in {1..10}; do python rltf.py --async $i & sleep 1; done
+# for i in {1..10}; do python rltf.py --async $i --batch_per_async 1 & sleep 1; done
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
 flags.DEFINE_integer('batch_async', 10, 'Batches to wait for from async agents')
 flags.DEFINE_integer('batch_per_async', 1, 'Batches recorded per async agent')
@@ -13,7 +13,7 @@ flags.DEFINE_integer('batch_keep', 5, 'Batches recorded from user actions')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
 flags.DEFINE_boolean('er_all', False, 'Keep all batches in ER memory')
-flags.DEFINE_float('learning_rate', 1e-3, 'Minimum learning rate')
+flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -23,7 +23,7 @@ sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 GAMMA = 0.999
 STATE_FRAMES = 2
-HIDDEN_LAYERS = 2
+HIDDEN_LAYERS = 3
 HIDDEN_NODES = 128
 LSTM_NODES = 128
 LSTM_LAYER = True
@@ -46,7 +46,7 @@ elif 'Bullet' in ENV_NAME:
 
 import gym
 env = gym.make(ENV_NAME)
-#env._max_episode_steps = None # Disable step limit
+env._max_episode_steps = None # Disable step limit
 envu = env.unwrapped
 
 ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
@@ -70,9 +70,9 @@ LAST_BATCH = FLAGS.batch_async
 ER_BATCH_SIZE = 100
 ER_BATCHES = FLAGS.batch_keep + FLAGS.batch_async if FLAGS.er_all else 1
 
-training = Struct(enable=True, learning_rate=FLAGS.learning_rate, batches_recorded=0, batches_mtime={}, temp_batch=None)
+training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None)
 epoch = Struct(count=0, td_error=0, prev_td_error=0)
-app = Struct(policy_index=0, sample_actions=True, quit=False)
+app = Struct(policy_index=0, sample_actions=False, quit=False)
 
 def batch_paths(batch_num, path=None):
     if not path:
@@ -171,21 +171,21 @@ all_td_error_sum = []
 all_policy = []
 stats = Struct(reward_sum=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
-activation = tf.nn.leaky_relu
 def make_dense_layers(x, outputs):
     for l in range(HIDDEN_LAYERS):
-        dense = tf.layers.Dense(HIDDEN_NODES, activation,
+        dense = tf.layers.Dense(HIDDEN_NODES, tf.nn.leaky_relu,
             _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % l)
         x = [dense.apply(i) for i in x]
-    dense = tf.layers.Dense(outputs, None,
-        _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % HIDDEN_LAYERS)
+    if outputs:
+        dense = tf.layers.Dense(outputs, None,
+            _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % HIDDEN_LAYERS)
     return [dense.apply(i) for i in x]
 
 def make_conv_net(x):
     filters = 32
-    CONV_LAYERS = 4
+    CONV_LAYERS = 3
     for l in range(CONV_LAYERS if CONV_NET else 0):
-        conv = tf.layers.Conv2D(filters, 3, 2,
+        conv = tf.layers.Conv2D(filters, 8, 2,
             _scope=tf.contrib.framework.get_name_scope() + '/conv%i' % l)
         x = [conv.apply(i) for i in x]
         print(x[0].shape)
@@ -193,10 +193,8 @@ def make_conv_net(x):
     print(x[0].shape)
 
     # Add layers before LSTM
-    for l in range(0 if CONV_NET else HIDDEN_LAYERS):
-        dense = tf.layers.Dense(HIDDEN_NODES, activation,
-            _scope=tf.contrib.framework.get_name_scope() + '/pre%i' % l)
-        x = [dense.apply(i) for i in x]
+    if not CONV_NET:
+        with tf.name_scope('pre_lstm'): x = make_dense_layers(x, None)
     return x
 
 def make_next_state_pair(x):
@@ -225,7 +223,7 @@ def make_acrl():
 
     with tf.name_scope('policy'):
         policy = make_dense_layers(shared_layer, ACTION_DIM)
-        policy = [tf.nn.softmax(i) for i in policy] if POLICY_SOFTMAX else policy
+        policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else tf.tanh(i) for i in policy]
         p.policy = policy[-1]
         all_policy.append(p)
         stats._policy_minmax.append(tf.concat([
@@ -258,16 +256,12 @@ def make_acrl():
         # Include actions as input to dense layers
         value_layer = [tf.concat([value_layer[i], value_actions[i]], 1) for i in range(3)]
 
-        if 1:
-            value_layer = make_dense_layers(value_layer, 1+ACTION_DIM)
-            avg_value = [i[:,0] for i in value_layer]
-            adv_direction = [i[:,1:] for i in value_layer]
-        else:
-            avg_value = make_dense_layers(value_layer, None)
-            adv_direction = make_dense_layers(value_layer, ACTION_DIM)
+        value_layer = make_dense_layers(value_layer, 1+ACTION_DIM)
+        avg_value = [i[:,0] for i in value_layer]
+        adv_direction = [i[:,1:] for i in value_layer]
 
-        [state_value, q_value, next_state_value] = [avg_value[i] + tf.reduce_sum(
-            adv_direction[i]*value_actions[i], 1) for i in range(3)]
+        [state_value, q_value, next_state_value] = [(tf.reduce_sum(
+            adv_direction[i]*value_actions[i], 1) if 1 else 0) + avg_value[i] for i in range(3)]
 
     policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
     is_on_policy = tf.reduce_sum(tf.abs(er.batch_action-policy_action), 1) < 0.1
@@ -290,8 +284,10 @@ def make_acrl():
         adv = tf.where(prob < 1e-2, tf.maximum(0., adv),
               tf.where(prob > 1-1e-2, tf.minimum(0., adv), adv))
     else:
-        log_prob = -(policy[0]-er.batch_action)**2
+        off_policy = policy[0]-er.batch_action
+        log_prob = -(off_policy)**2
         adv = tf.tile(tf.expand_dims(adv, 1), [1, ACTION_DIM])
+        adv = tf.where(tf.abs(off_policy)<0.1, tf.zeros(adv.shape), adv)# Prevent overfitting
 
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy')+scope_vars('shared'))
@@ -417,7 +413,6 @@ def step_state_upload():
                 else:
                     rand = 0.2
                     a += rand*(2*np.random.random(ACTION_DIM)-1.)
-                    if not ACTION_DISCRETE: a = np.clip(a, -1., 1.)
 
     save_paths = batch_paths(training.current_batch)
     if not FLAGS.async and FLAGS.replay:
@@ -516,16 +511,14 @@ def train_apply_gradients():
     epoch.prev_td_error = epoch.td_error
     epoch.td_error = sess.run(accum_td_error)[0]
     epoch.count += 1
-    training.learning_rate *= 0.5 if epoch.td_error > epoch.prev_td_error else 2**0.5
-    training.learning_rate = max(FLAGS.learning_rate, min(1e-1, training.learning_rate))
-    r = sess.run(apply_accum_ops, feed_dict={ph.learning_rate: training.learning_rate})
+    r = sess.run(apply_accum_ops, feed_dict={ph.learning_rate: FLAGS.learning_rate})
     sess.run(zero_accum_ops)
     os.system('clear')
     pprint(dict(
         policy_index=app.policy_index,
         epoch_count=epoch.count,
         epoch_td_error=epoch.td_error,
-        learning_rate='%.6f' % training.learning_rate))
+        learning_rate='%.6f' % FLAGS.learning_rate))
 
     if SAVE_SUMMARIES:
         summary = r[-1]
