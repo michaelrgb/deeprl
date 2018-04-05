@@ -21,7 +21,7 @@ if not FLAGS.async:
     server = tf.train.Server({'local': [PORT]}, protocol=PROTOCOL, start=True)
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
-GAMMA = 0.999
+GAMMA = 0.99
 STATE_FRAMES = 2
 HIDDEN_LAYERS = 3
 HIDDEN_NODES = 128
@@ -71,7 +71,7 @@ ER_BATCH_SIZE = 100
 ER_BATCHES = FLAGS.batch_keep + FLAGS.batch_async if FLAGS.er_all else 1
 
 training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None)
-epoch = Struct(count=0, td_error=0, prev_td_error=0)
+epoch = Struct(count=0)
 app = Struct(policy_index=0, sample_actions=False, quit=False)
 
 def batch_paths(batch_num, path=None):
@@ -148,10 +148,15 @@ def accum_value(value):
     zero_accum_ops.append(accum.assign(tf.zeros_like(value)))
     return accum
 def accum_gradient(grads, opt):
-    for g,w in grads:
-        accum = accum_value(g)
-        grad = [(accum, w)]
-        apply_accum_ops.append(opt.apply_gradients(grad))
+    global_norm = None
+    grads, vars = zip(*grads)
+    grads = [accum_value(g) for g in grads]
+    if True:
+        # Clip gradients by global norm to prevent destabilizing policy
+        grads,global_norm = tf.clip_by_global_norm(grads, 50.)
+    grads = zip(grads, vars)
+    apply_accum_ops.append(opt.apply_gradients(grads))
+    return global_norm
 
 # compute_gradients() sums up gradients for all instances, whereas TDC requires a
 # multiple of features at s_t+1 to be subtracted from those at s_t.
@@ -167,9 +172,8 @@ def gradient_override(expr, custom_grad):
         return tf.identity(expr)
 gradient_override.counter = 0
 
-all_td_error_sum = []
 all_policy = []
-stats = Struct(reward_sum=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
+stats = Struct(reward_sum=[], td_error=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
 def make_dense_layers(x, outputs):
     for l in range(HIDDEN_LAYERS):
@@ -272,9 +276,8 @@ def make_acrl():
             tf.concat([is_on_policy[i+1:], tf.zeros(i+1, dtype=tf.bool)], 0),
             multi_step(max_recurse, i+1),
             next) if i < max_recurse else next)
-    target_value = multi_step(10)# 0 is 1-step TD
+    target_value = multi_step(0)# 0 is 1-step TD
     td_error = target_value - q_value
-    all_td_error_sum.append([tf.reduce_sum(td_error**2)])
 
     adv = target_value - state_value
     adv = tf.maximum(0., adv)
@@ -287,15 +290,15 @@ def make_acrl():
         off_policy = policy[0]-er.batch_action
         log_prob = -(off_policy)**2
         adv = tf.tile(tf.expand_dims(adv, 1), [1, ACTION_DIM])
-        adv = tf.where(tf.abs(off_policy)<0.1, tf.zeros(adv.shape), adv)# Prevent overfitting
 
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy')+scope_vars('shared'))
-    accum_gradient(grad, opt_policy)
+    p.global_norm = accum_gradient(grad, opt_policy)
 
-    stats.max_advantage.append(tf.reduce_max(tf.abs(adv)))
+    stats.max_advantage.append(tf.reduce_max(adv))
     stats.on_policy_count.append(tf.reduce_sum(tf.cast(is_on_policy, tf.int32)))
     stats.reward_sum.append(tf.reduce_sum(all_rewards[r]))
+    stats.td_error.append(tf.reduce_sum(td_error**2))
 
     # TD error with gradient correction (TDC)
     weights = scope_vars('value')+shared_weights
@@ -460,8 +463,7 @@ def step_state_upload():
         state.count = 0
 
 if not FLAGS.async:
-    batch_td_errror = tf.concat(all_td_error_sum, axis=0)
-    accum_td_error = accum_value(batch_td_errror)
+    accum_td_error = accum_value(tf.concat([stats.td_error], 0))
     init_vars()
 
     ops_batch_upload = [
@@ -500,7 +502,7 @@ def train_accum_batch():
             print('Waiting for batch %i...' % training.current_batch)
             time.sleep(0.1)
 
-    r = sess.run(accum_ops, feed_dict={ph.enable_tdc: epoch.prev_td_error > 0., ph.batch_idx: batch_idx})
+    r = sess.run(accum_ops, feed_dict={ph.enable_tdc: True, ph.batch_idx: batch_idx})
     sys.stdout.write('Batch %i/(%i+%i)  ' % (training.current_batch, FLAGS.batch_keep, FLAGS.batch_async))
     if app.policy_index != -1:
         for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
@@ -508,16 +510,17 @@ def train_accum_batch():
         print('')
 
 def train_apply_gradients():
-    epoch.prev_td_error = epoch.td_error
-    epoch.td_error = sess.run(accum_td_error)[0]
+    r = sess.run([accum_td_error,
+                  tf.concat([[p.global_norm] for p in all_policy], 0)] + apply_accum_ops,
+        feed_dict={ph.learning_rate: FLAGS.learning_rate})
     epoch.count += 1
-    r = sess.run(apply_accum_ops, feed_dict={ph.learning_rate: FLAGS.learning_rate})
     sess.run(zero_accum_ops)
     os.system('clear')
     pprint(dict(
         policy_index=app.policy_index,
         epoch_count=epoch.count,
-        epoch_td_error=epoch.td_error,
+        epoch_td_error=          r[0][app.policy_index],
+        epoch_policy_global_norm=r[1][app.policy_index],
         learning_rate='%.6f' % FLAGS.learning_rate))
 
     if SAVE_SUMMARIES:
