@@ -21,8 +21,10 @@ if not FLAGS.async:
     server = tf.train.Server({'local': [PORT]}, protocol=PROTOCOL, start=True)
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
+STATE_FRAMES = 2    # Frames an action is repeated for, combined into a state
+ADJACENT_STATES = 2 # Combined adjacent states, fed to value/policy function
+
 GAMMA = 0.99
-STATE_FRAMES = 2
 HIDDEN_LAYERS = 3
 HIDDEN_NODES = 128
 LSTM_NODES = 128
@@ -125,6 +127,14 @@ with tf.name_scope('experience_replay'):
     er.batch_reward = er.rewards[ph.batch_idx]
     all_rewards = [er.batch_reward[:, r] for r in range(REWARDS_ALL)] + []
 
+    # Combine adjacent states for more temporal context
+    states = er.batch_states
+    er.adjacent_states = []
+    for i in range(ADJACENT_STATES):
+        er.adjacent_states.append(states)
+        states = tf.concat([tf.expand_dims(tf.zeros(STATE_DIM), 0), er.batch_states[:-1]], 0)
+    er.adjacent_states = tf.concat(er.adjacent_states, -1)
+
 if CONV_NET:
     frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Move STATE_FRAMES into batches
     if RESIZE:
@@ -151,9 +161,8 @@ def accum_gradient(grads, opt):
     global_norm = None
     grads, vars = zip(*grads)
     grads = [accum_value(g) for g in grads]
-    if True:
-        # Clip gradients by global norm to prevent destabilizing policy
-        grads,global_norm = tf.clip_by_global_norm(grads, 50.)
+    # Clip gradients by global norm to prevent destabilizing policy
+    grads,global_norm = tf.clip_by_global_norm(grads, 50.)
     grads = zip(grads, vars)
     apply_accum_ops.append(opt.apply_gradients(grads))
     return global_norm
@@ -206,7 +215,8 @@ def make_next_state_pair(x):
     return x
 
 def make_acrl():
-    input_states = [er.batch_states, frame_to_state]
+    input_states = [er.adjacent_states,
+        tf.expand_dims(tf.concat([frame_to_state[i] for i in range(ADJACENT_STATES)], -1), 0)]
     p = Struct()
     with tf.name_scope('shared'):
         shared_layer = make_conv_net(input_states)
@@ -258,7 +268,12 @@ def make_acrl():
         value_layer =   [value_layer[0], value_layer[0],  value_layer[1]]
         value_actions = [policy[0],      er.batch_action, policy[1]]
         # Include actions as input to dense layers
-        value_layer = [tf.concat([value_layer[i], value_actions[i]], 1) for i in range(3)]
+        if 0:
+            with tf.name_scope('value_actions'):
+                value_layer = [i*j for i,j in zip(value_layer,
+                    make_dense_layers(value_actions, None))]
+        else:
+            value_layer = [tf.concat([value_layer[i], value_actions[i]], 1) for i in range(3)]
 
         value_layer = make_dense_layers(value_layer, 1+ACTION_DIM)
         avg_value = [i[:,0] for i in value_layer]
@@ -316,7 +331,7 @@ for r in range(REWARDS_ALL):
     with tf.name_scope('ac_' + str(r)):
         make_acrl()
 
-state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
+state = Struct(frames=np.zeros([ADJACENT_STATES, STATE_FRAMES] + FRAME_DIM),
                count=0, last_obs=None, last_pos_reward=0,
                done=True, next_reset=False)
 
@@ -369,6 +384,7 @@ def step_to_frames():
     obs = state.last_obs
     env_action = np.argmax(action.to_take) if ACTION_DISCRETE else action.to_take
     reward_sum = 0.
+    state.frames[1:] = state.frames[:-1]
     for frame in range(STATE_FRAMES):
         state.done |= state.next_reset
         if state.done:
@@ -378,7 +394,7 @@ def step_to_frames():
             obs = env.reset()
         env.render()
         #imshow([obs, test_lcn(obs, sess)[0]])
-        state.frames[frame] = obs
+        state.frames[0, frame] = obs
 
         obs, reward, state.done, info = env.step(env_action)
         if ENV_NAME == 'MountainCar-v0':
@@ -421,7 +437,6 @@ def step_state_upload():
     if not FLAGS.async and FLAGS.replay:
         a = mmap_batch(save_paths, 'r', only_actions=True)[state.count]
 
-    # a = [1., 0., 0] if state.frames[0, 1] < 0. else [0., 0., 1.] # MountainCar: go with momentum
     action.to_take = a
     save_rewards = step_to_frames()
     if 0:#not FLAGS.async:
@@ -429,16 +444,16 @@ def step_state_upload():
             action_taken=action.to_take, reward=save_rewards))
     if ACTION_DISCRETE:
         a = np.where(a == np.max(action.to_take), 1., 0.)
-    ret = sess.run(ops_single_step, feed_dict={ph.frame: [state.frames]})
-    frames_to_state = ret[0]
+    ret = sess.run(ops_single_step, feed_dict={ph.frame: state.frames})
+    created_state = ret[0][0] # Save only most recent state into batch
     action.policy = ret[1]
 
     temp_paths = batch_paths(FLAGS.async, 'temp')
     if not training.temp_batch:
         training.temp_batch = mmap_batch(temp_paths, 'w+')
     batch = training.temp_batch
-    batch.states[state.count] = frames_to_state
-    # imshow([frames_to_state[:,:,i] for i in range(STATE_FRAMES)])
+    batch.states[state.count] = created_state
+    # imshow([created_state[:,:,i] for i in range(STATE_FRAMES)])
     batch.rewards[state.count] = save_rewards
     batch.actions[state.count] = a
 
@@ -495,7 +510,7 @@ def train_accum_batch():
                     ph.reward: b.rewards[1:],
                     ph.batch_idx: batch_idx}
                 sess.run(ops_batch_upload, feed_dict=feed_dict)
-                # imshow([er.batch_states[10][:,:,i].eval(feed_dict) for i in range(STATE_FRAMES)])
+                # imshow([er.adjacent_states[10][:,:,i].eval(feed_dict) for i in range(ADJACENT_STATES*STATE_FRAMES)])
                 training.batches_mtime[training.current_batch] = mtime
             break
         except:
