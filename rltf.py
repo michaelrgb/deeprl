@@ -184,31 +184,45 @@ gradient_override.counter = 0
 all_policy = []
 stats = Struct(reward_sum=[], td_error=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
-def make_dense_layers(x, outputs):
-    for l in range(HIDDEN_LAYERS):
-        dense = tf.layers.Dense(HIDDEN_NODES, tf.nn.leaky_relu,
+def make_dense_layers(x, outputs, hidden_layers=HIDDEN_LAYERS, activation=tf.tanh):#tf.nn.leaky_relu):
+    for l in range(hidden_layers):
+        dense = tf.layers.Dense(HIDDEN_NODES, activation,
             _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % l)
         x = [dense.apply(i) for i in x]
     if outputs:
         dense = tf.layers.Dense(outputs, None,
-            _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % HIDDEN_LAYERS)
-    return [dense.apply(i) for i in x]
+            _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % hidden_layers)
+        x = [dense.apply(i) for i in x]
+    return x
 
 def make_conv_net(x):
     filters = 32
     CONV_LAYERS = 3
     for l in range(CONV_LAYERS if CONV_NET else 0):
-        conv = tf.layers.Conv2D(filters, 8, 2,
+        conv = tf.layers.Conv2D(filters, 8, 2, activation=tf.tanh,
             _scope=tf.contrib.framework.get_name_scope() + '/conv%i' % l)
         x = [conv.apply(i) for i in x]
         print(x[0].shape)
     x = [tf.layers.flatten(i) for i in x]
     print(x[0].shape)
 
-    # Add layers before LSTM
     if not CONV_NET:
-        with tf.name_scope('pre_lstm'): x = make_dense_layers(x, None)
+        x = make_dense_layers(x, None)
     return x
+
+def make_lstm_layer(x):
+    cell = rnn.BasicLSTMCell(LSTM_NODES)
+    scope = tf.contrib.framework.get_name_scope()
+    stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(x[:1]), dtype=tf.float32, scope=scope)
+    x = tf.unstack(stacked) + [x[1]]
+    with tf.name_scope(str(FLAGS.async)):
+        lstm_saved_state = tf.contrib.rnn.LSTMStateTuple(
+            *[tf.Variable(s, trainable=False) for s in cell.zero_state(1, DTYPE)])
+        sess.run(tf.variables_initializer(lstm_saved_state))
+        stacked, final_state = tf.nn.dynamic_rnn(cell, tf.stack(x[-1:]), initial_state=lstm_saved_state, scope=scope)
+        x = [x[0]] + tf.unstack(stacked)
+        lstm_save_ops = [lstm_saved_state[i].assign(final_state[i]) for i in range(2)]
+    return x, lstm_save_ops
 
 def make_next_state_pair(x):
     x = [x[0][:-1], x[0][1:], x[1]]
@@ -220,23 +234,14 @@ def make_acrl():
     p = Struct()
     with tf.name_scope('shared'):
         shared_layer = make_conv_net(input_states)
+        shared_layer = make_dense_layers(shared_layer, None)
         if LSTM_LAYER:
-            cell = rnn.BasicLSTMCell(LSTM_NODES)
-            scope = tf.contrib.framework.get_name_scope()
-            stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(shared_layer[:1]), dtype=tf.float32, scope=scope)
-            shared_layer[:1] = tf.unstack(stacked)
-            with tf.name_scope(str(FLAGS.async)):
-                p.lstm_saved_state = tf.contrib.rnn.LSTMStateTuple(
-                    *[tf.Variable(s, trainable=False) for s in cell.zero_state(1, DTYPE)])
-                sess.run(tf.variables_initializer(p.lstm_saved_state))
-                stacked, final_state = tf.nn.dynamic_rnn(cell, tf.stack(shared_layer[-1:]), initial_state=p.lstm_saved_state, scope=scope)
-                shared_layer[-1:] = tf.unstack(stacked)
-                p.lstm_save_ops = [p.lstm_saved_state[i].assign(final_state[i]) for i in range(2)]
+            shared_layer, p.lstm_save_ops = make_lstm_layer(shared_layer)
         shared_layer = make_next_state_pair(shared_layer)
         shared_weights = scope_vars()
 
     with tf.name_scope('policy'):
-        policy = make_dense_layers(shared_layer, ACTION_DIM)
+        policy = make_dense_layers(shared_layer, ACTION_DIM, 0)
         policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else tf.tanh(i) for i in policy]
         p.policy = policy[-1]
         all_policy.append(p)
@@ -252,35 +257,20 @@ def make_acrl():
     else:
         with tf.name_scope('non_shared'):
             value_layer = make_conv_net(input_states)
+            value_layer = make_dense_layers(value_layer, None)
             if LSTM_LAYER:
-                cell = rnn.BasicLSTMCell(LSTM_NODES)
-                scope = tf.contrib.framework.get_name_scope()
-                stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[:1]), dtype=tf.float32, scope=scope)
-                value_layer[:1] = tf.unstack(stacked)
-                with tf.name_scope(str(FLAGS.async)):
-                    # Not used currently
-                    stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(value_layer[-1:]), dtype=tf.float32, scope=scope)
-                    value_layer[-1:] = tf.unstack(stacked)
+                value_layer, _ = make_lstm_layer(value_layer)
             value_layer = make_next_state_pair(value_layer)
             shared_weights = scope_vars()
 
     with tf.name_scope('value'):
         value_layer =   [value_layer[0], value_layer[0],  value_layer[1]]
         value_actions = [policy[0],      er.batch_action, policy[1]]
-        # Include actions as input to dense layers
-        if 0:
-            with tf.name_scope('value_actions'):
-                value_layer = [i*j for i,j in zip(value_layer,
-                    make_dense_layers(value_actions, None))]
-        else:
-            value_layer = [tf.concat([value_layer[i], value_actions[i]], 1) for i in range(3)]
-
-        value_layer = make_dense_layers(value_layer, 1+ACTION_DIM)
-        avg_value = [i[:,0] for i in value_layer]
-        adv_direction = [i[:,1:] for i in value_layer]
-
-        [state_value, q_value, next_state_value] = [(tf.reduce_sum(
-            adv_direction[i]*value_actions[i], 1) if 1 else 0) + avg_value[i] for i in range(3)]
+        with tf.name_scope('value_actions'):
+            # Multiply final state layer by actions layer
+            value_layer = [i*j for i,j in zip(value_layer, make_dense_layers(value_actions, None))]
+        value_layer = [i[:,0] for i in make_dense_layers(value_layer, 1, 0)]
+        [state_value, q_value, next_state_value] = value_layer
 
     policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
     is_on_policy = tf.reduce_sum(tf.abs(er.batch_action-policy_action), 1) < 0.1
