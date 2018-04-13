@@ -4,15 +4,18 @@ import sys, os, multiprocessing, time
 from utils import *
 from pprint import pprint
 
+# python rltf.py --batch_async 18 --batch_keep 6 --record 0
+# for i in {1..3}; do python rltf.py --async $i --batch_per_async 6 & sleep 1; done
+
 flags = tf.app.flags
-# for i in {1..10}; do python rltf.py --async $i --batch_per_async 1 & sleep 1; done
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
 flags.DEFINE_integer('batch_async', 10, 'Batches to wait for from async agents')
 flags.DEFINE_integer('batch_per_async', 1, 'Batches recorded per async agent')
 flags.DEFINE_integer('batch_keep', 5, 'Batches recorded from user actions')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
+flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved raw frames')
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
-flags.DEFINE_boolean('er_all', False, 'Keep all batches in ER memory')
+flags.DEFINE_boolean('er_all', True, 'Keep all batches in ER memory')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 FLAGS = flags.FLAGS
 
@@ -22,13 +25,13 @@ if not FLAGS.async:
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 STATE_FRAMES = 2    # Frames an action is repeated for, combined into a state
-ADJACENT_STATES = 2 # Combined adjacent states, fed to value/policy function
+ADJACENT_STATES = 4 # Combined adjacent states, fed to value/policy function
 
 GAMMA = 0.99
-HIDDEN_LAYERS = 3
-HIDDEN_NODES = 128
-LSTM_NODES = 128
-LSTM_LAYER = True
+HIDDEN_LAYERS = 1
+HIDDEN_NODES = 512
+LSTM_NODES = 256
+LSTM_LAYER = False
 SHARED_LAYERS = False
 
 SAVE_SUMMARIES = False
@@ -70,7 +73,7 @@ STATE_DIM[-1] *= STATE_FRAMES
 FIRST_BATCH = -FLAGS.batch_keep
 LAST_BATCH = FLAGS.batch_async
 ER_BATCH_SIZE = 100
-ER_BATCHES = FLAGS.batch_keep + FLAGS.batch_async if FLAGS.er_all else 1
+ER_BATCHES = FLAGS.batch_keep + FLAGS.batch_async if (FLAGS.er_all and not FLAGS.async) else 1
 
 training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None)
 epoch = Struct(count=0)
@@ -81,18 +84,19 @@ def batch_paths(batch_num, path=None):
         path = ENV_NAME + '_' + str(STATE_FRAMES)
     os.system('mkdir -p batches')
     path = 'batches/' + path + '_%i_%s.mmap'
-    return [path % (batch_num, 'states'),
-            path % (batch_num, 'actions'),
-            path % (batch_num, 'rewards')]
+    return {key: path % (batch_num, key) for key in ['rawframes', 'states', 'actions', 'rewards']}
 
 REWARDS_GLOBAL = REWARDS_ALL = 1
-def mmap_batch(paths, mode, only_actions=False):
-    batch = Struct(actions=np.memmap(paths[1], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_DIM)))
+def mmap_batch(paths, mode, only_actions=False, rawframes=True):
+    batch = Struct(actions=np.memmap(paths['actions'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_DIM)))
     if only_actions:
         return batch.actions
-    batch.states = np.memmap(paths[0], DTYPE.name, mode, shape=(ER_BATCH_SIZE,) + tuple(STATE_DIM))
-    batch.rewards = np.memmap(paths[2], DTYPE.name, mode, shape=(ER_BATCH_SIZE, REWARDS_GLOBAL))
+    batch.states = np.memmap(paths['states'], DTYPE.name, mode, shape=(ER_BATCH_SIZE,) + tuple(STATE_DIM))
+    batch.rewards = np.memmap(paths['rewards'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, REWARDS_GLOBAL))
     batch.arrays = [batch.states, batch.actions, batch.rewards]
+    if rawframes:
+        batch.rawframes = np.memmap(paths['rawframes'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, STATE_FRAMES) + tuple(FRAME_DIM))
+        batch.arrays.append(batch.rawframes)
     return batch
 
 ph = Struct(learning_rate=tf.placeholder(tf.float32, ()),
@@ -103,14 +107,14 @@ ph = Struct(learning_rate=tf.placeholder(tf.float32, ()),
     reward=tf.placeholder(tf.float32, [None, REWARDS_GLOBAL]),
     frame=tf.placeholder(tf.float32, [None, STATE_FRAMES] + FRAME_DIM))
 opt_td = tf.train.AdamOptimizer(ph.learning_rate, epsilon=0.1)
-opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10, epsilon=0.1)
+opt_policy = tf.train.AdamOptimizer(ph.learning_rate/20, epsilon=0.1)
 
 if FLAGS.async:
     FIRST_BATCH = (FLAGS.async-1)*FLAGS.batch_per_async
 else:
     def init_vars(): sess.run(tf.global_variables_initializer())
 
-    if FLAGS.record or FLAGS.replay:
+    if FLAGS.record or FLAGS.replay or FLAGS.recreate_states:
         # Record new arrays
         app.policy_index = -1
     else:
@@ -132,7 +136,7 @@ with tf.name_scope('experience_replay'):
     er.adjacent_states = []
     for i in range(ADJACENT_STATES):
         er.adjacent_states.append(states)
-        states = tf.concat([tf.expand_dims(tf.zeros(STATE_DIM), 0), er.batch_states[:-1]], 0)
+        states = tf.concat([tf.expand_dims(tf.zeros(STATE_DIM), 0), states[:-1]], 0)
     er.adjacent_states = tf.concat(er.adjacent_states, -1)
 
 if CONV_NET:
@@ -141,7 +145,7 @@ if CONV_NET:
         frame_to_state = tf.image.resize_images(frame_to_state, RESIZE, tf.image.ResizeMethod.AREA)
     if FRAME_LCN:
         frame_to_state = local_contrast_norm(frame_to_state, GAUSS_W)
-        frame_to_state = tf.reduce_sum(frame_to_state, axis=-1)
+        frame_to_state = tf.reduce_max(frame_to_state, axis=-1)
     else:
         frame_to_state = tf.reduce_mean(frame_to_state/255., axis=-1) # Convert to grayscale
     frame_to_state = tf.reshape(frame_to_state, [-1, STATE_FRAMES] + STATE_DIM[:-1])
@@ -184,7 +188,7 @@ gradient_override.counter = 0
 all_policy = []
 stats = Struct(reward_sum=[], td_error=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
-def make_dense_layers(x, outputs, hidden_layers=HIDDEN_LAYERS, activation=tf.tanh):#tf.nn.leaky_relu):
+def make_dense_layers(x, outputs, hidden_layers=HIDDEN_LAYERS, activation=tf.tanh):
     for l in range(hidden_layers):
         dense = tf.layers.Dense(HIDDEN_NODES, activation,
             _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % l)
@@ -196,10 +200,16 @@ def make_dense_layers(x, outputs, hidden_layers=HIDDEN_LAYERS, activation=tf.tan
     return x
 
 def make_conv_net(x):
-    filters = 32
-    CONV_LAYERS = 3
-    for l in range(CONV_LAYERS if CONV_NET else 0):
-        conv = tf.layers.Conv2D(filters, 8, 2, activation=tf.tanh,
+    LAYERS = [
+        # DQN & A3C
+        (32, 8, 4),
+        (64, 4, 2),
+        (64, 3, 1)]
+
+    print(x[0].shape)
+    for l in range(len(LAYERS) if CONV_NET else 0):
+        filters, width, stride = LAYERS[l]
+        conv = tf.layers.Conv2D(filters, width, stride, activation=tf.nn.relu,
             _scope=tf.contrib.framework.get_name_scope() + '/conv%i' % l)
         x = [conv.apply(i) for i in x]
         print(x[0].shape)
@@ -273,7 +283,7 @@ def make_acrl():
         [state_value, q_value, next_state_value] = value_layer
 
     policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
-    is_on_policy = tf.reduce_sum(tf.abs(er.batch_action-policy_action), 1) < 0.1
+    is_on_policy = tf.reduce_sum(tf.abs(er.batch_action-policy_action), 1) < 0.05
     def multi_step(max_recurse, i=0):
         z = tf.zeros(i)
         next = tf.concat([next_state_value[i:], z], 0)
@@ -371,8 +381,30 @@ def setup_key_actions():
 
 action = Struct(to_take=None, policy=None, keyboard=setup_key_actions())
 def step_to_frames():
-    obs = state.last_obs
+    def onehot_vector(action_index):
+        return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
+
+    a = action.keyboard[:ACTION_DIM]
+    if ACTION_DISCRETE:
+        a = onehot_vector(a[0]+1.)
+
+    if state.count > 0:
+        if app.policy_index != -1:
+            a = action.policy
+            if app.sample_actions:
+                if POLICY_SOFTMAX:
+                    # Sample from softmax probabilities
+                    a = onehot_vector(np.random.choice(range(ACTION_DIM), p=a))
+                else:
+                    rand = 0.2
+                    a += rand*(2*np.random.random(ACTION_DIM)-1.)
+
+            if ACTION_DISCRETE:
+                a = np.where(a == np.max(a), 1., 0.)
+
+    action.to_take = a
     env_action = np.argmax(action.to_take) if ACTION_DISCRETE else action.to_take
+    obs = state.last_obs
     reward_sum = 0.
     state.frames[1:] = state.frames[:-1]
     for frame in range(STATE_FRAMES):
@@ -391,7 +423,7 @@ def step_to_frames():
             # Mountain car env doesnt give any +reward
             reward = 1. if state.done else 0.
         elif ENV_NAME == 'CarRacing-v0':
-            if state.last_pos_reward > 100:
+            if state.last_pos_reward > 20:
                 state.done = True # Reset track if spinning
                 reward = -100
         state.last_pos_reward = 0 if reward>0. or state.done else state.last_pos_reward+1
@@ -403,49 +435,32 @@ ops_single_step = [
     frame_to_state[0],
     all_policy[0].policy[0],# Policy from uploaded state,
 ] + ([op for p in all_policy for op in p.lstm_save_ops] if LSTM_LAYER else [])
-def step_state_upload():
-    def action_vector(action_index):
-        return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
-
-    a = action.keyboard[:ACTION_DIM]
-    if ACTION_DISCRETE:
-        # Convert a[0] values to one-hot vector
-        a = action_vector(a[0]+1.)
-
-    if state.count > 0:
-        if app.policy_index != -1:
-            a = action.policy
-            if app.sample_actions:
-                if POLICY_SOFTMAX:
-                    # Sample from softmax probabilities
-                    a = action_vector(np.random.choice(range(ACTION_DIM), p=a))
-                else:
-                    rand = 0.2
-                    a += rand*(2*np.random.random(ACTION_DIM)-1.)
-
+def append_to_batch():
     save_paths = batch_paths(training.current_batch)
-    if not FLAGS.async and FLAGS.replay:
-        a = mmap_batch(save_paths, 'r', only_actions=True)[state.count]
+    if not FLAGS.async and FLAGS.recreate_states:
+        if not state.count:
+            training.saved_batch = mmap_batch(save_paths, 'r')
+        batch = training.saved_batch
+        state.frames[0] = batch.rawframes[state.count]
+        save_reward = batch.rewards[state.count]
+        save_action = batch.actions[state.count]
+    else:
+        save_reward = step_to_frames()
+        save_action = action.to_take
 
-    action.to_take = a
-    save_rewards = step_to_frames()
-    if 0:#not FLAGS.async:
-        print(dict(state_count=state.count, state='<image>' if CONV_NET else state.frames,
-            action_taken=action.to_take, reward=save_rewards))
-    if ACTION_DISCRETE:
-        a = np.where(a == np.max(action.to_take), 1., 0.)
     ret = sess.run(ops_single_step, feed_dict={ph.frame: state.frames})
-    created_state = ret[0][0] # Save only most recent state into batch
+    save_state = ret[0]
     action.policy = ret[1]
 
     temp_paths = batch_paths(FLAGS.async, 'temp')
     if not training.temp_batch:
         training.temp_batch = mmap_batch(temp_paths, 'w+')
     batch = training.temp_batch
-    batch.states[state.count] = created_state
-    # imshow([created_state[:,:,i] for i in range(STATE_FRAMES)])
-    batch.rewards[state.count] = save_rewards
-    batch.actions[state.count] = a
+    batch.rawframes[state.count] = state.frames[0]
+    batch.states[state.count] = save_state
+    batch.rewards[state.count] = save_reward
+    batch.actions[state.count] = save_action
+    # imshow([save_state[:,:,i] for i in range(STATE_FRAMES)])
 
     state.count += 1
     if state.count == ER_BATCH_SIZE:
@@ -455,9 +470,10 @@ def step_state_upload():
             training.temp_batch = None
 
             # Rename async batch files into server's ER batches.
-            for dst in save_paths:
+            for k in save_paths.keys():
+                src = temp_paths[k]
+                dst = save_paths[k]
                 os.system('rm -f ' + dst)
-            for src,dst in zip(temp_paths, save_paths):
                 os.system('mv ' + src + ' ' + dst)
 
         training.batches_recorded += 1
@@ -491,23 +507,24 @@ def train_accum_batch():
     batch_idx = 0 if ER_BATCHES==1 else FLAGS.batch_keep+training.current_batch
     while True:
         try:
-            mtime = os.path.getmtime(paths[0])
+            mtime = os.path.getmtime(paths['states'])
             if ER_BATCHES == 1 or mtime != batch_mtime:
-                b = mmap_batch(paths, 'r')
+                b = mmap_batch(paths, 'r', rawframes=False)
                 feed_dict = {
                     ph.states: b.states,
                     ph.action: b.actions[1:],
                     ph.reward: b.rewards[1:],
                     ph.batch_idx: batch_idx}
                 sess.run(ops_batch_upload, feed_dict=feed_dict)
-                # imshow([er.adjacent_states[10][:,:,i].eval(feed_dict) for i in range(ADJACENT_STATES*STATE_FRAMES)])
                 training.batches_mtime[training.current_batch] = mtime
             break
         except:
             print('Waiting for batch %i...' % training.current_batch)
             time.sleep(0.1)
 
-    r = sess.run(accum_ops, feed_dict={ph.enable_tdc: True, ph.batch_idx: batch_idx})
+    feed_dict = {ph.enable_tdc: True, ph.batch_idx: batch_idx}
+    # imshow([er.adjacent_states[20][:,:,i].eval(feed_dict) for i in range(ADJACENT_STATES*STATE_FRAMES)])
+    r = sess.run(accum_ops, feed_dict)
     sys.stdout.write('Batch %i/(%i+%i)  ' % (training.current_batch, FLAGS.batch_keep, FLAGS.batch_async))
     if app.policy_index != -1:
         for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
@@ -535,7 +552,7 @@ def train_apply_gradients():
 def rl_loop():
     while not app.quit:
         if FLAGS.async or not training.enable or training.batches_recorded < FLAGS.batch_keep:
-            step_state_upload()
+            append_to_batch()
             continue
 
         if training.current_batch < LAST_BATCH:
