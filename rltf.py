@@ -32,7 +32,6 @@ HIDDEN_LAYERS = 1
 HIDDEN_NODES = 512
 LSTM_NODES = 256
 LSTM_LAYER = False
-SHARED_LAYERS = False
 
 SAVE_SUMMARIES = False
 
@@ -153,13 +152,11 @@ if CONV_NET:
 else:
     frame_to_state = tf.reshape(ph.frame, [-1] + STATE_DIM)
 
-accum_ops = []
-apply_accum_ops = []
-zero_accum_ops = []
+ops = Struct(accum=[], apply_accum=[], zero_accum=[])
 def accum_value(value):
     accum = tf.Variable(tf.zeros_like(value),trainable=False)
-    accum_ops.append(accum.assign_add(value))
-    zero_accum_ops.append(accum.assign(tf.zeros_like(value)))
+    ops.accum.append(accum.assign_add(value))
+    ops.zero_accum.append(accum.assign(tf.zeros_like(value)))
     return accum
 def accum_gradient(grads, opt):
     global_norm = None
@@ -168,7 +165,7 @@ def accum_gradient(grads, opt):
     # Clip gradients by global norm to prevent destabilizing policy
     grads,global_norm = tf.clip_by_global_norm(grads, 50.)
     grads = zip(grads, vars)
-    apply_accum_ops.append(opt.apply_gradients(grads))
+    ops.apply_accum.append(opt.apply_gradients(grads))
     return global_norm
 
 # compute_gradients() sums up gradients for all instances, whereas TDC requires a
@@ -188,21 +185,22 @@ gradient_override.counter = 0
 all_policy = []
 stats = Struct(reward_sum=[], td_error=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
-def make_dense_layers(x, outputs, hidden_layers=HIDDEN_LAYERS, activation=tf.tanh):
+def make_dense_hidden(x, hidden_layers=HIDDEN_LAYERS, activation=tf.tanh):
     for l in range(hidden_layers):
         dense = tf.layers.Dense(HIDDEN_NODES, activation,
-            _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % l)
+            _scope=tf.contrib.framework.get_name_scope() + '/hidden%i' % l)
         x = [dense.apply(i) for i in x]
-    if outputs:
-        dense = tf.layers.Dense(outputs, None,
-            _scope=tf.contrib.framework.get_name_scope() + '/fully%i' % hidden_layers)
-        x = [dense.apply(i) for i in x]
+    return x
+def make_dense_output(x, outputs):
+    dense = tf.layers.Dense(outputs, None,
+        _scope=tf.contrib.framework.get_name_scope() + '/output')
+    x = [dense.apply(i) for i in x]
     return x
 
 def make_conv_net(x):
     LAYERS = [
         # DQN & A3C
-        (32, 8, 4),
+        (64, 8, 4),#(32, 8, 4),
         (64, 4, 2),
         (64, 3, 1)]
 
@@ -216,8 +214,7 @@ def make_conv_net(x):
     x = [tf.layers.flatten(i) for i in x]
     print(x[0].shape)
 
-    if not CONV_NET:
-        x = make_dense_layers(x, None)
+    x = make_dense_hidden(x)
     return x
 
 def make_lstm_layer(x):
@@ -242,16 +239,14 @@ def make_acrl():
     input_states = [er.adjacent_states,
         tf.expand_dims(tf.concat([frame_to_state[i] for i in range(ADJACENT_STATES)], -1), 0)]
     p = Struct()
-    with tf.name_scope('shared'):
-        shared_layer = make_conv_net(input_states)
-        shared_layer = make_dense_layers(shared_layer, None)
-        if LSTM_LAYER:
-            shared_layer, p.lstm_save_ops = make_lstm_layer(shared_layer)
-        shared_layer = make_next_state_pair(shared_layer)
-        shared_weights = scope_vars()
 
     with tf.name_scope('policy'):
-        policy = make_dense_layers(shared_layer, ACTION_DIM, 0)
+        policy_layer = make_conv_net(input_states)
+        if LSTM_LAYER:
+            policy_layer, p.lstm_save_ops = make_lstm_layer(policy_layer)
+        policy_layer = make_next_state_pair(policy_layer)
+
+        policy = make_dense_output(policy_layer, ACTION_DIM)
         policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else tf.tanh(i) for i in policy]
         p.policy = policy[-1]
         all_policy.append(p)
@@ -262,24 +257,18 @@ def make_acrl():
     if FLAGS.async:
         return
 
-    if SHARED_LAYERS:
-        value_layer = shared_layer
-    else:
-        with tf.name_scope('non_shared'):
-            value_layer = make_conv_net(input_states)
-            value_layer = make_dense_layers(value_layer, None)
-            if LSTM_LAYER:
-                value_layer, _ = make_lstm_layer(value_layer)
-            value_layer = make_next_state_pair(value_layer)
-            shared_weights = scope_vars()
-
     with tf.name_scope('value'):
+        value_layer = make_conv_net(input_states)
+        if LSTM_LAYER:
+            value_layer, _ = make_lstm_layer(value_layer)
+        value_layer = make_next_state_pair(value_layer)
+
         value_layer =   [value_layer[0], value_layer[0],  value_layer[1]]
         value_actions = [policy[0],      er.batch_action, policy[1]]
         with tf.name_scope('value_actions'):
             # Multiply final state layer by actions layer
-            value_layer = [i*j for i,j in zip(value_layer, make_dense_layers(value_actions, None))]
-        value_layer = [i[:,0] for i in make_dense_layers(value_layer, 1, 0)]
+            value_layer = [i*j for i,j in zip(value_layer, make_dense_hidden(value_actions))]
+        value_layer = [i[:,0] for i in make_dense_output(value_layer, 1)]
         [state_value, q_value, next_state_value] = value_layer
 
     policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
@@ -307,7 +296,7 @@ def make_acrl():
         adv = tf.tile(tf.expand_dims(adv, 1), [1, ACTION_DIM])
 
     repl = gradient_override(log_prob, adv)
-    grad = opt_policy.compute_gradients(repl, scope_vars('policy')+scope_vars('shared'))
+    grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     p.global_norm = accum_gradient(grad, opt_policy)
 
     stats.max_advantage.append(tf.reduce_max(adv))
@@ -316,7 +305,7 @@ def make_acrl():
     stats.td_error.append(tf.reduce_sum(td_error**2))
 
     # TD error with gradient correction (TDC)
-    weights = scope_vars('value')+shared_weights
+    weights = scope_vars('value')
     repl = gradient_override(q_value, td_error)
     grad_s = opt_td.compute_gradients(repl, weights)
     repl = gradient_override(next_state_value, -GAMMA*td_error)
@@ -493,13 +482,14 @@ if not FLAGS.async:
         er.batch_reward.assign(ph.reward)
     ]
 
+    for s in sorted(stats.__dict__.keys()):
+        ops.accum.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
+    ops.train = [accum_td_error, tf.concat([[p.global_norm] for p in all_policy], 0)] + ops.apply_accum
+
     if SAVE_SUMMARIES:
         merged = tf.summary.merge_all()
-        apply_accum_ops += [merged]
+        ops.train += [merged]
         train_writer = tf.summary.FileWriter('/tmp/train', sess.graph)
-
-    for s in sorted(stats.__dict__.keys()):
-        accum_ops.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
 
 def train_accum_batch():
     batch_mtime = training.batches_mtime.get(training.current_batch)
@@ -524,7 +514,7 @@ def train_accum_batch():
 
     feed_dict = {ph.enable_tdc: True, ph.batch_idx: batch_idx}
     # imshow([er.adjacent_states[20][:,:,i].eval(feed_dict) for i in range(ADJACENT_STATES*STATE_FRAMES)])
-    r = sess.run(accum_ops, feed_dict)
+    r = sess.run(ops.accum, feed_dict)
     sys.stdout.write('Batch %i/(%i+%i)  ' % (training.current_batch, FLAGS.batch_keep, FLAGS.batch_async))
     if app.policy_index != -1:
         for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
@@ -532,11 +522,9 @@ def train_accum_batch():
         print('')
 
 def train_apply_gradients():
-    r = sess.run([accum_td_error,
-                  tf.concat([[p.global_norm] for p in all_policy], 0)] + apply_accum_ops,
-        feed_dict={ph.learning_rate: FLAGS.learning_rate})
+    r = sess.run(ops.train, feed_dict={ph.learning_rate: FLAGS.learning_rate})
     epoch.count += 1
-    sess.run(zero_accum_ops)
+    sess.run(ops.zero_accum)
     os.system('clear')
     pprint(dict(
         policy_index=app.policy_index,
