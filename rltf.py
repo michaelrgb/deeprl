@@ -185,7 +185,7 @@ gradient_override.counter = 0
 all_policy = []
 stats = Struct(reward_sum=[], td_error=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
 
-def make_dense_hidden(x, hidden_layers=HIDDEN_LAYERS, activation=tf.tanh):
+def make_dense_hidden(x, hidden_layers=HIDDEN_LAYERS, activation=tf.nn.relu):
     for l in range(hidden_layers):
         dense = tf.layers.Dense(HIDDEN_NODES, activation,
             _scope=tf.contrib.framework.get_name_scope() + '/hidden%i' % l)
@@ -214,7 +214,7 @@ def make_conv_net(x):
     x = [tf.layers.flatten(i) for i in x]
     print(x[0].shape)
 
-    x = make_dense_hidden(x)
+    if not CONV_NET: x = make_dense_hidden(x)
     return x
 
 def make_lstm_layer(x):
@@ -242,8 +242,8 @@ def make_acrl():
 
     with tf.name_scope('policy'):
         policy_layer = make_conv_net(input_states)
-        if LSTM_LAYER:
-            policy_layer, p.lstm_save_ops = make_lstm_layer(policy_layer)
+        policy_layer = make_dense_hidden(policy_layer)
+        if LSTM_LAYER: policy_layer, p.lstm_save_ops = make_lstm_layer(policy_layer)
         policy_layer = make_next_state_pair(policy_layer)
 
         policy = make_dense_output(policy_layer, ACTION_DIM)
@@ -259,15 +259,16 @@ def make_acrl():
 
     with tf.name_scope('value'):
         value_layer = make_conv_net(input_states)
-        if LSTM_LAYER:
-            value_layer, _ = make_lstm_layer(value_layer)
+        #if LSTM_LAYER: value_layer, _ = make_lstm_layer(value_layer)
         value_layer = make_next_state_pair(value_layer)
 
         value_layer =   [value_layer[0], value_layer[0],  value_layer[1]]
         value_actions = [policy[0],      er.batch_action, policy[1]]
-        with tf.name_scope('value_actions'):
-            # Multiply final state layer by actions layer
-            value_layer = [i*j for i,j in zip(value_layer, make_dense_hidden(value_actions))]
+
+        # Concat actions with flattened conv state before fully-connected layer
+        value_layer = [tf.concat([i, j], 1) for i,j in zip(value_layer, value_actions)]
+        value_layer = make_dense_hidden(value_layer)
+
         value_layer = [i[:,0] for i in make_dense_output(value_layer, 1)]
         [state_value, q_value, next_state_value] = value_layer
 
