@@ -4,8 +4,8 @@ import sys, os, multiprocessing, time
 from utils import *
 from pprint import pprint
 
-# python rltf.py --batch_async 18 --batch_keep 6 --record 0
-# for i in {1..3}; do python rltf.py --async $i --batch_per_async 6 & sleep 1; done
+# python rltf.py --batch_keep 6 --batch_async 20 --record 0
+# for i in {1..4}; do python rltf.py --async $i --batch_per_async 5 & sleep 1; done
 
 flags = tf.app.flags
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
@@ -33,8 +33,7 @@ HIDDEN_NODES = 512
 LSTM_NODES = 256
 LSTM_LAYER = False
 
-SAVE_SUMMARIES = False
-
+EXTRA_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
 if not ENV_NAME:
     raise Exception('Missing ENV environment variable')
@@ -43,6 +42,13 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing = gym.envs.box2d.car_racing
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
+    # Test accuracy of value function on some extra action combinations.
+    EXTRA_ACTIONS = [
+        [-1, 0, 0],
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1],
+    ] if 1 else []
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple # [512, 288]
 elif 'Bullet' in ENV_NAME:
@@ -238,39 +244,42 @@ def make_next_state_pair(x):
 def make_acrl():
     input_states = [er.adjacent_states,
         tf.expand_dims(tf.concat([frame_to_state[i] for i in range(ADJACENT_STATES)], -1), 0)]
+
     p = Struct()
-
     with tf.name_scope('policy'):
-        policy_layer = make_conv_net(input_states)
-        policy_layer = make_dense_hidden(policy_layer)
-        if LSTM_LAYER: policy_layer, p.lstm_save_ops = make_lstm_layer(policy_layer)
-        policy_layer = make_next_state_pair(policy_layer)
+        policy_net = make_conv_net(input_states)
+        policy_net = make_dense_hidden(policy_net)
+        if LSTM_LAYER: policy_net, p.lstm_save_ops = make_lstm_layer(policy_net)
+        policy_net = make_dense_output(policy_net, ACTION_DIM)
 
-        policy = make_dense_output(policy_layer, ACTION_DIM)
+        policy = make_next_state_pair(policy_net)
         policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else tf.tanh(i) for i in policy]
-        p.policy = policy[-1]
+        p.ph_policy = policy[2]
         all_policy.append(p)
         stats._policy_minmax.append(tf.concat([
             [tf.reduce_min(policy[0], axis=0)],
             [tf.reduce_max(policy[0], axis=0)]], axis=0))
 
-    if FLAGS.async:
-        return
-
     with tf.name_scope('value'):
-        value_layer = make_conv_net(input_states)
-        #if LSTM_LAYER: value_layer, _ = make_lstm_layer(value_layer)
-        value_layer = make_next_state_pair(value_layer)
+        q_net = make_conv_net(input_states)
+        #if LSTM_LAYER: q_net, _ = make_lstm_layer(q_net)
+        q_net = make_next_state_pair(q_net)
 
-        value_layer =   [value_layer[0], value_layer[0],  value_layer[1]]
-        value_actions = [policy[0],      er.batch_action, policy[1]]
+        z = tf.zeros((ER_BATCH_SIZE-1, ACTION_DIM)) # on-policy
+        # On-policy action for state given by ph.frame, followed by extra actions
+        ph_actions = tf.concat([z[:1,]] + [tf.expand_dims(tf.constant(a, dtype=DTYPE), 0) - p.ph_policy for a in EXTRA_ACTIONS], 0)
+        q_net[2] = tf.tile(q_net[2], [ph_actions.shape[0], 1])
 
         # Concat actions with flattened conv state before fully-connected layer
-        value_layer = [tf.concat([i, j], 1) for i,j in zip(value_layer, value_actions)]
-        value_layer = make_dense_hidden(value_layer)
+        state_actions = [
+            (q_net[0], z),
+            (q_net[0], er.batch_action - policy[0]),
+            (q_net[1], z),
+            (q_net[2], ph_actions)]
+        q_net = [tf.concat([s, a], 1) for s,a in state_actions]
+        q_net = [i[:, 0] for i in make_dense_output(make_dense_hidden(q_net), 1)]
 
-        value_layer = [i[:,0] for i in make_dense_output(value_layer, 1)]
-        [state_value, q_value, next_state_value] = value_layer
+        [state_value, q_value, next_state_value, p.ph_policy_value] = q_net
 
     policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
     is_on_policy = tf.reduce_sum(tf.abs(er.batch_action-policy_action), 1) < 0.05
@@ -373,6 +382,9 @@ action = Struct(to_take=None, policy=None, keyboard=setup_key_actions())
 def step_to_frames():
     def onehot_vector(action_index):
         return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
+    def softmax(x):
+        e_x = np.exp(x - x.max())
+        return e_x / e_x.sum()
 
     a = action.keyboard[:ACTION_DIM]
     if ACTION_DISCRETE:
@@ -380,20 +392,22 @@ def step_to_frames():
 
     if state.count > 0:
         if app.policy_index != -1:
-            a = action.policy
+            prob = action.policy if ACTION_DISCRETE else softmax(action.policy_value*2)
+            a = np.argmax(prob)
             if app.sample_actions:
-                if POLICY_SOFTMAX:
-                    # Sample from softmax probabilities
-                    a = onehot_vector(np.random.choice(range(ACTION_DIM), p=a))
-                else:
-                    rand = 0.2
-                    a += rand*(2*np.random.random(ACTION_DIM)-1.)
+                # Sample from softmax probabilities
+                a = np.random.choice(range(len(prob)), p=prob)
+                if FLAGS.async == 1: print(a)
+            else:
+                if not ACTION_DISCRETE: a = 0
+            a = onehot_vector(a) if ACTION_DISCRETE else ([action.policy]+EXTRA_ACTIONS)[a]
 
-            if ACTION_DISCRETE:
-                a = np.where(a == np.max(a), 1., 0.)
-
-    action.to_take = a
-    env_action = np.argmax(action.to_take) if ACTION_DISCRETE else action.to_take
+    env_action = a
+    if ACTION_DISCRETE:
+        env_action = np.argmax(env_action)
+        action.to_save = onehot_vector(env_action)
+    else:
+        action.to_save = env_action
     obs = state.last_obs
     reward_sum = 0.
     state.frames[1:] = state.frames[:-1]
@@ -423,7 +437,8 @@ def step_to_frames():
 
 ops_single_step = [
     frame_to_state[0],
-    all_policy[0].policy[0],# Policy from uploaded state,
+    all_policy[0].ph_policy[0],# Policy from uploaded state,
+    all_policy[0].ph_policy_value,
 ] + ([op for p in all_policy for op in p.lstm_save_ops] if LSTM_LAYER else [])
 def append_to_batch():
     save_paths = batch_paths(training.current_batch)
@@ -436,11 +451,12 @@ def append_to_batch():
         save_action = batch.actions[state.count]
     else:
         save_reward = step_to_frames()
-        save_action = action.to_take
+        save_action = action.to_save
 
     ret = sess.run(ops_single_step, feed_dict={ph.frame: state.frames})
     save_state = ret[0]
     action.policy = ret[1]
+    action.policy_value = ret[2]
 
     temp_paths = batch_paths(FLAGS.async, 'temp')
     if not training.temp_batch:
@@ -487,6 +503,7 @@ if not FLAGS.async:
         ops.accum.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
     ops.train = [accum_td_error, tf.concat([[p.global_norm] for p in all_policy], 0)] + ops.apply_accum
 
+    SAVE_SUMMARIES = 0
     if SAVE_SUMMARIES:
         merged = tf.summary.merge_all()
         ops.train += [merged]
