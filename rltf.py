@@ -1,6 +1,6 @@
 import tensorflow as tf, numpy as np
 from tensorflow.contrib import rnn
-import sys, os, multiprocessing, time
+import sys, os, multiprocessing, time, math
 from utils import *
 from pprint import pprint
 
@@ -47,7 +47,7 @@ if ENV_NAME == 'CarRacing-v0':
         [-1, 0, 0],
         [1, 0, 0],
         [0, 1, 0],
-        [0, 0, 1],
+        [0, 0, 0.5],
     ] if 1 else []
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple # [512, 288]
@@ -78,11 +78,12 @@ STATE_DIM[-1] *= STATE_FRAMES
 FIRST_BATCH = -FLAGS.batch_keep
 LAST_BATCH = FLAGS.batch_async
 ER_BATCH_SIZE = 100
+ER_BATCH_STEPS = ER_BATCH_SIZE-1
 ER_BATCHES = FLAGS.batch_keep + FLAGS.batch_async if (FLAGS.er_all and not FLAGS.async) else 1
 
 training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None)
 epoch = Struct(count=0)
-app = Struct(policy_index=0, sample_actions=False, quit=False)
+app = Struct(policy_index=0, quit=False, sample_actions=FLAGS.async > 1)
 
 def batch_paths(batch_num, path=None):
     if not path:
@@ -129,8 +130,8 @@ training.current_batch = FIRST_BATCH
 with tf.name_scope('experience_replay'):
     er = Struct(
         states= tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE] + STATE_DIM), False, name='states'),
-        actions=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE-1, ACTION_DIM]), False, name='actions'),
-        rewards=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_SIZE-1, REWARDS_GLOBAL]), False, name='rewards'))
+        actions=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_STEPS, ACTION_DIM]), False, name='actions'),
+        rewards=tf.Variable(tf.zeros([ER_BATCHES, ER_BATCH_STEPS, REWARDS_GLOBAL]), False, name='rewards'))
     er.batch_states = er.states[ph.batch_idx]
     er.batch_action = er.actions[ph.batch_idx]
     er.batch_reward = er.rewards[ph.batch_idx]
@@ -189,11 +190,11 @@ def gradient_override(expr, custom_grad):
 gradient_override.counter = 0
 
 all_policy = []
-stats = Struct(reward_sum=[], td_error=[], on_policy_count=[], max_advantage=[], _policy_minmax=[])
+stats = Struct(reward_sum=[], td_error=[], on_policy_count=[], mean_advantage=[], _policy_minmax=[])
 
-def make_dense_hidden(x, hidden_layers=HIDDEN_LAYERS, activation=tf.nn.relu):
-    for l in range(hidden_layers):
-        dense = tf.layers.Dense(HIDDEN_NODES, activation,
+def make_dense_hidden(x):
+    for l in range(HIDDEN_LAYERS):
+        dense = tf.layers.Dense(HIDDEN_NODES, activation=tf.nn.relu,
             _scope=tf.contrib.framework.get_name_scope() + '/hidden%i' % l)
         x = [dense.apply(i) for i in x]
     return x
@@ -260,56 +261,68 @@ def make_acrl():
             [tf.reduce_min(policy[0], axis=0)],
             [tf.reduce_max(policy[0], axis=0)]], axis=0))
 
+    batch_off_policy = er.batch_action - policy[0]
+    log_prob = -batch_off_policy**2
+    importance_sampling = tf.exp(tf.reduce_sum(log_prob, -1))
+
     with tf.name_scope('value'):
-        q_net = make_conv_net(input_states)
-        #if LSTM_LAYER: q_net, _ = make_lstm_layer(q_net)
-        q_net = make_next_state_pair(q_net)
+        net = make_conv_net(input_states)
+        #if LSTM_LAYER: net, _ = make_lstm_layer(net)
+        net = make_next_state_pair(net)
 
-        z = tf.zeros((ER_BATCH_SIZE-1, ACTION_DIM)) # on-policy
-        # On-policy action for state given by ph.frame, followed by extra actions
+        # On-policy action for state given by ph.frame, followed by extra actions if any
+        z = tf.zeros((ER_BATCH_STEPS, ACTION_DIM)) # on-policy
         ph_actions = tf.concat([z[:1,]] + [tf.expand_dims(tf.constant(a, dtype=DTYPE), 0) - p.ph_policy for a in EXTRA_ACTIONS], 0)
-        q_net[2] = tf.tile(q_net[2], [ph_actions.shape[0], 1])
+        net[2] = tf.tile(net[2], [ph_actions.shape[0], 1])
 
-        # Concat actions with flattened conv state before fully-connected layer
-        state_actions = [
-            (q_net[0], z),
-            (q_net[0], er.batch_action - policy[0]),
-            (q_net[1], z),
-            (q_net[2], ph_actions)]
-        q_net = [tf.concat([s, a], 1) for s,a in state_actions]
-        q_net = [i[:, 0] for i in make_dense_output(make_dense_hidden(q_net), 1)]
+        net, actions = zip(*[
+            (net[0], z),
+            (net[0], batch_off_policy),
+            (net[1], z),
+            (net[2], ph_actions)
+        ])
+
+        q_net = [i[:,0] for i in make_dense_output(make_dense_hidden(net), 1)]
+        for dim in range(ACTION_DIM):
+            with tf.name_scope('advantage%i' % dim):
+                if 1:
+                    net_adv = make_dense_output(make_dense_hidden(net), 1)
+                    q_net = [q_net[i] + net_adv[i][:,0] * actions[i][:,dim] for i in range(len(net))]
+                else:
+                    net_adv = make_dense_output(make_dense_hidden(net), 2)
+                    q_net = [q_net[i] + net_adv[i][:,0] * tf.maximum(0., actions[i][:,dim]) for i in range(len(net))]
+                    q_net = [q_net[i] + net_adv[i][:,1] * tf.minimum(0., actions[i][:,dim]) for i in range(len(net))]
 
         [state_value, q_value, next_state_value, p.ph_policy_value] = q_net
 
-    policy_action = tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM) if ACTION_DISCRETE else policy[0]
-    is_on_policy = tf.reduce_sum(tf.abs(er.batch_action-policy_action), 1) < 0.05
-    def multi_step(max_recurse, i=0):
+    def multi_step(recurse, i=0):# recurse==0 is 1-step TD
         z = tf.zeros(i)
         next = tf.concat([next_state_value[i:], z], 0)
         return tf.concat([all_rewards[r][i:], z], 0) + GAMMA*(tf.where(
-            tf.concat([is_on_policy[i+1:], tf.zeros(i+1, dtype=tf.bool)], 0),
-            multi_step(max_recurse, i+1),
-            next) if i < max_recurse else next)
-    target_value = multi_step(0)# 0 is 1-step TD
-    td_error = target_value - q_value
+            tf.range(i, ER_BATCH_STEPS+i) < ER_BATCH_STEPS-1,
+            multi_step(recurse, i+1),
+            next) if i < recurse else next)
+    step_n = multi_step(20)
+    step_1 = multi_step(0)
 
+    target_value = tf.maximum(step_n, step_1)
+    td_error = target_value - q_value
     adv = target_value - state_value
     adv = tf.maximum(0., adv)
     if POLICY_SOFTMAX:
-        prob = tf.reduce_sum(policy[0]*er.batch_action, 1)
+        prob = tf.reduce_sum(policy[0]*er.batch_action, -1)
         log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
         adv = tf.where(prob < 1e-2, tf.maximum(0., adv),
               tf.where(prob > 1-1e-2, tf.minimum(0., adv), adv))
     else:
-        off_policy = policy[0]-er.batch_action
-        log_prob = -(off_policy)**2
         adv = tf.tile(tf.expand_dims(adv, 1), [1, ACTION_DIM])
 
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     p.global_norm = accum_gradient(grad, opt_policy)
 
-    stats.max_advantage.append(tf.reduce_max(adv))
+    is_on_policy = tf.reduce_sum(tf.abs(batch_off_policy), 1) < 0.1
+    stats.mean_advantage.append(tf.reduce_mean(tf.abs(adv)))
     stats.on_policy_count.append(tf.reduce_sum(tf.cast(is_on_policy, tf.int32)))
     stats.reward_sum.append(tf.reduce_sum(all_rewards[r]))
     stats.td_error.append(tf.reduce_sum(td_error**2))
@@ -388,26 +401,28 @@ def step_to_frames():
 
     a = action.keyboard[:ACTION_DIM]
     if ACTION_DISCRETE:
-        a = onehot_vector(a[0]+1.)
+        a = a[0]+1.
 
     if state.count > 0:
         if app.policy_index != -1:
-            prob = action.policy if ACTION_DISCRETE else softmax(action.policy_value*2)
-            a = np.argmax(prob)
-            if app.sample_actions:
-                # Sample from softmax probabilities
-                a = np.random.choice(range(len(prob)), p=prob)
-                if FLAGS.async == 1: print(a)
+            a = action.policy[:]
+            if ACTION_DISCRETE:
+                if app.sample_actions:
+                    # Sample from softmax probabilities
+                    a = np.random.choice(range(len(prob)), p=a)
+                else:
+                    a = np.argmax(a)
             else:
-                if not ACTION_DISCRETE: a = 0
-            a = onehot_vector(a) if ACTION_DISCRETE else ([action.policy]+EXTRA_ACTIONS)[a]
+                if app.sample_actions:
+                    #for i in range(ACTION_DIM): a[int(time.time()/math.pi) % ACTION_DIM] += math.cos(time.time())
+                    if not np.random.randint(3): a[np.random.randint(ACTION_DIM)] += 2.*np.random.rand()-1.
 
     env_action = a
     if ACTION_DISCRETE:
-        env_action = np.argmax(env_action)
         action.to_save = onehot_vector(env_action)
     else:
         action.to_save = env_action
+    #if FLAGS.async == 1: print(action.to_save)
     obs = state.last_obs
     reward_sum = 0.
     state.frames[1:] = state.frames[:-1]
@@ -429,7 +444,7 @@ def step_to_frames():
         elif ENV_NAME == 'CarRacing-v0':
             if state.last_pos_reward > 20:
                 state.done = True # Reset track if spinning
-                reward = -100
+                reward = -1000
         state.last_pos_reward = 0 if reward>0. or state.done else state.last_pos_reward+1
         reward_sum += reward
     state.last_obs = obs
@@ -490,18 +505,21 @@ def append_to_batch():
         state.count = 0
 
 if not FLAGS.async:
-    accum_td_error = accum_value(tf.concat([stats.td_error], 0))
-    init_vars()
-
     ops_batch_upload = [
         er.batch_states.assign(ph.states),
         er.batch_action.assign(ph.action),
         er.batch_reward.assign(ph.reward)
     ]
 
+    ops.train = [
+        accum_value(tf.concat([stats.td_error], 0)),
+        accum_value(tf.concat([stats.reward_sum], 0)),
+        tf.concat([[p.global_norm] for p in all_policy], 0)
+    ] + ops.apply_accum
+    init_vars()
+
     for s in sorted(stats.__dict__.keys()):
         ops.accum.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
-    ops.train = [accum_td_error, tf.concat([[p.global_norm] for p in all_policy], 0)] + ops.apply_accum
 
     SAVE_SUMMARIES = 0
     if SAVE_SUMMARIES:
@@ -548,7 +566,8 @@ def train_apply_gradients():
         policy_index=app.policy_index,
         epoch_count=epoch.count,
         epoch_td_error=          r[0][app.policy_index],
-        epoch_policy_global_norm=r[1][app.policy_index],
+        epoch_reward_sum=        r[1][app.policy_index],
+        epoch_policy_global_norm=r[2][app.policy_index],
         learning_rate='%.6f' % FLAGS.learning_rate))
 
     if SAVE_SUMMARIES:
