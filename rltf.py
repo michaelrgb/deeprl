@@ -16,6 +16,7 @@ flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved raw frames')
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
 flags.DEFINE_boolean('er_all', True, 'Keep all batches in ER memory')
+flags.DEFINE_boolean('summary', True, 'Save summaries for Tensorboard')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 FLAGS = flags.FLAGS
 
@@ -113,7 +114,7 @@ ph = Struct(learning_rate=tf.placeholder(tf.float32, ()),
     reward=tf.placeholder(tf.float32, [None, REWARDS_GLOBAL]),
     frame=tf.placeholder(tf.float32, [None, STATE_FRAMES] + FRAME_DIM))
 opt_td = tf.train.AdamOptimizer(ph.learning_rate, epsilon=0.1)
-opt_policy = tf.train.AdamOptimizer(ph.learning_rate/20, epsilon=0.1)
+opt_policy = tf.train.AdamOptimizer(ph.learning_rate, epsilon=0.1)
 
 if FLAGS.async:
     FIRST_BATCH = (FLAGS.async-1)*FLAGS.batch_per_async
@@ -220,8 +221,6 @@ def make_conv_net(x):
         print(x[0].shape)
     x = [tf.layers.flatten(i) for i in x]
     print(x[0].shape)
-
-    if not CONV_NET: x = make_dense_hidden(x)
     return x
 
 def make_lstm_layer(x):
@@ -248,13 +247,13 @@ def make_acrl():
 
     p = Struct()
     with tf.name_scope('policy'):
-        policy_net = make_conv_net(input_states)
-        policy_net = make_dense_hidden(policy_net)
-        if LSTM_LAYER: policy_net, p.lstm_save_ops = make_lstm_layer(policy_net)
-        policy_net = make_dense_output(policy_net, ACTION_DIM)
+        net = make_dense_hidden(make_conv_net(input_states))
+        if LSTM_LAYER: net, p.lstm_save_ops = make_lstm_layer(net)
+        net = make_next_state_pair(net)
+        net = make_dense_output(net, ACTION_DIM)
+        policy_weights = scope_vars()
 
-        policy = make_next_state_pair(policy_net)
-        policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else tf.tanh(i) for i in policy]
+        policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else tf.tanh(i) for i in net]
         p.ph_policy = policy[2]
         all_policy.append(p)
         stats._policy_minmax.append(tf.concat([
@@ -262,38 +261,44 @@ def make_acrl():
             [tf.reduce_max(policy[0], axis=0)]], axis=0))
 
     batch_off_policy = er.batch_action - policy[0]
-    log_prob = -batch_off_policy**2
-    importance_sampling = tf.exp(tf.reduce_sum(log_prob, -1))
+    if POLICY_SOFTMAX:
+        prob = tf.reduce_sum(policy[0]*er.batch_action, -1)
+        log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
+    else:
+        log_prob = tf.reduce_sum(-batch_off_policy**2, -1)
 
     with tf.name_scope('value'):
-        net = make_conv_net(input_states)
+        net = make_dense_hidden(make_conv_net(input_states))
         #if LSTM_LAYER: net, _ = make_lstm_layer(net)
+        net = make_dense_output(net, 1)
         net = make_next_state_pair(net)
 
-        # On-policy action for state given by ph.frame, followed by extra actions if any
-        z = tf.zeros((ER_BATCH_STEPS, ACTION_DIM)) # on-policy
-        ph_actions = tf.concat([z[:1,]] + [tf.expand_dims(tf.constant(a, dtype=DTYPE), 0) - p.ph_policy for a in EXTRA_ACTIONS], 0)
-        net[2] = tf.tile(net[2], [ph_actions.shape[0], 1])
+        base_value = [i[:,0] for i in net]
+        [state_value, next_state_value, p.ph_policy_value] = base_value
 
-        net, actions = zip(*[
-            (net[0], z),
-            (net[0], batch_off_policy),
-            (net[1], z),
-            (net[2], ph_actions)
-        ])
+    # Manually backpropagate policy for features of log_prob,
+    # as tf.gradients() for every batch instance is slow.
+    dlp_da = -2 * batch_off_policy
+    features = [
+        dlp_da, # dlp_db
+        tf.expand_dims(policy_weights[-2], 0) *\
+            tf.expand_dims(dlp_da, 1) # dlp_dw
+    ]
+    if 0:
+        gradients = [tf.stack(i) for i in zip(*[tf.gradients(
+            log_prob[t], policy_weights) for t in range(ER_BATCH_STEPS)])]
+        features = [tf.expand_dims(feat, -1) for feat in gradients]
 
-        q_net = [i[:,0] for i in make_dense_output(make_dense_hidden(net), 1)]
-        for dim in range(ACTION_DIM):
-            with tf.name_scope('advantage%i' % dim):
-                if 1:
-                    net_adv = make_dense_output(make_dense_hidden(net), 1)
-                    q_net = [q_net[i] + net_adv[i][:,0] * actions[i][:,dim] for i in range(len(net))]
-                else:
-                    net_adv = make_dense_output(make_dense_hidden(net), 2)
-                    q_net = [q_net[i] + net_adv[i][:,0] * tf.maximum(0., actions[i][:,dim]) for i in range(len(net))]
-                    q_net = [q_net[i] + net_adv[i][:,1] * tf.minimum(0., actions[i][:,dim]) for i in range(len(net))]
-
-        [state_value, q_value, next_state_value, p.ph_policy_value] = q_net
+    with tf.name_scope('advantage'):
+        q_adv = 0.
+        for feat in features:
+            shape = feat.shape[1:].as_list()
+            w = weight_variable(shape)
+            prod = feat * tf.expand_dims(w, 0)
+            for i in range(len(shape)-1):
+                prod = tf.reduce_sum(prod, 1)
+            q_adv += tf.reduce_sum(prod * batch_off_policy, -1)
+        q_value = state_value + q_adv
 
     def multi_step(recurse, i=0):# recurse==0 is 1-step TD
         z = tf.zeros(i)
@@ -304,19 +309,14 @@ def make_acrl():
             next) if i < recurse else next)
     step_n = multi_step(20)
     step_1 = multi_step(0)
+    td_error = tf.maximum(step_n, step_1) - q_value
 
-    target_value = tf.maximum(step_n, step_1)
-    td_error = target_value - q_value
-    adv = target_value - state_value
-    adv = tf.maximum(0., adv)
+    adv = q_adv
     if POLICY_SOFTMAX:
-        prob = tf.reduce_sum(policy[0]*er.batch_action, -1)
-        log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
         adv = tf.where(prob < 1e-2, tf.maximum(0., adv),
               tf.where(prob > 1-1e-2, tf.minimum(0., adv), adv))
-    else:
-        adv = tf.tile(tf.expand_dims(adv, 1), [1, ACTION_DIM])
 
+    adv = tf.maximum(0., adv)
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     p.global_norm = accum_gradient(grad, opt_policy)
@@ -401,7 +401,7 @@ def step_to_frames():
 
     a = action.keyboard[:ACTION_DIM]
     if ACTION_DISCRETE:
-        a = a[0]+1.
+        a = int(a[0]+1.)
 
     if state.count > 0:
         if app.policy_index != -1:
@@ -409,7 +409,8 @@ def step_to_frames():
             if ACTION_DISCRETE:
                 if app.sample_actions:
                     # Sample from softmax probabilities
-                    a = np.random.choice(range(len(prob)), p=a)
+                    prob = softmax(a)
+                    a = np.random.choice(range(len(prob)), p=prob)
                 else:
                     a = np.argmax(a)
             else:
@@ -521,11 +522,10 @@ if not FLAGS.async:
     for s in sorted(stats.__dict__.keys()):
         ops.accum.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
 
-    SAVE_SUMMARIES = 0
-    if SAVE_SUMMARIES:
+    if FLAGS.summary:
         merged = tf.summary.merge_all()
-        ops.train += [merged]
-        train_writer = tf.summary.FileWriter('/tmp/train', sess.graph)
+        #ops.train += [merged]
+        train_writer = tf.summary.FileWriter('/tmp/tf', sess.graph)
 
 def train_accum_batch():
     batch_mtime = training.batches_mtime.get(training.current_batch)
@@ -570,7 +570,7 @@ def train_apply_gradients():
         epoch_policy_global_norm=r[2][app.policy_index],
         learning_rate='%.6f' % FLAGS.learning_rate))
 
-    if SAVE_SUMMARIES:
+    if 0:#FLAGS.summary:
         summary = r[-1]
         train_writer.add_summary(summary, epoch.count)
 
