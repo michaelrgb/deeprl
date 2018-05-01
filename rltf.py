@@ -84,7 +84,7 @@ ER_BATCHES = FLAGS.batch_keep + FLAGS.batch_async if (FLAGS.er_all and not FLAGS
 
 training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None)
 epoch = Struct(count=0)
-app = Struct(policy_index=0, quit=False, sample_actions=FLAGS.async > 1)
+app = Struct(policy_index=0, quit=False, sample_actions=False)#FLAGS.async > 1)
 
 def batch_paths(batch_num, path=None):
     if not path:
@@ -114,7 +114,7 @@ ph = Struct(learning_rate=tf.placeholder(tf.float32, ()),
     reward=tf.placeholder(tf.float32, [None, REWARDS_GLOBAL]),
     frame=tf.placeholder(tf.float32, [None, STATE_FRAMES] + FRAME_DIM))
 opt_td = tf.train.AdamOptimizer(ph.learning_rate, epsilon=0.1)
-opt_policy = tf.train.AdamOptimizer(ph.learning_rate, epsilon=0.1)
+opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10, epsilon=0.1)
 
 if FLAGS.async:
     FIRST_BATCH = (FLAGS.async-1)*FLAGS.batch_per_async
@@ -191,7 +191,7 @@ def gradient_override(expr, custom_grad):
 gradient_override.counter = 0
 
 all_policy = []
-stats = Struct(reward_sum=[], td_error=[], on_policy_count=[], mean_advantage=[], _policy_minmax=[])
+stats = Struct(reward_sum=[], td_error=[], mean_advantage=[], _policy_minmax=[])
 
 def make_dense_hidden(x):
     for l in range(HIDDEN_LAYERS):
@@ -250,6 +250,7 @@ def make_acrl():
         net = make_dense_hidden(make_conv_net(input_states))
         if LSTM_LAYER: net, p.lstm_save_ops = make_lstm_layer(net)
         net = make_next_state_pair(net)
+        last_hidden = net
         net = make_dense_output(net, ACTION_DIM)
         policy_weights = scope_vars()
 
@@ -260,44 +261,38 @@ def make_acrl():
             [tf.reduce_min(policy[0], axis=0)],
             [tf.reduce_max(policy[0], axis=0)]], axis=0))
 
-    batch_off_policy = er.batch_action - policy[0]
+    off_policy = er.batch_action - policy[0]
     if POLICY_SOFTMAX:
         prob = tf.reduce_sum(policy[0]*er.batch_action, -1)
         log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
     else:
-        log_prob = tf.reduce_sum(-batch_off_policy**2, -1)
+        log_prob = tf.reduce_sum(-off_policy**2, -1)
+
+    # Manually backpropagate policy for features of log_prob,
+    # as tf.gradients() aggregates gradients across all instances.
+    dlp_da = off_policy*2
+    da_dw = last_hidden[0]
+    # dlp_dw = dlp_da * da_dw
+    policy_features = [tf.expand_dims(dlp_da, 1) * tf.expand_dims(da_dw, -1)]
+
+    if 0: policy_features = [tf.expand_dims(tf.stack(i), -1)
+        for i in zip(*[tf.gradients(t, policy_weights) for t in tf.unstack(log_prob)])]
 
     with tf.name_scope('value'):
         net = make_dense_hidden(make_conv_net(input_states))
         #if LSTM_LAYER: net, _ = make_lstm_layer(net)
         net = make_dense_output(net, 1)
         net = make_next_state_pair(net)
+        [state_value, next_state_value, p.ph_policy_value] = [i[:,0] for i in net]
 
-        base_value = [i[:,0] for i in net]
-        [state_value, next_state_value, p.ph_policy_value] = base_value
-
-    # Manually backpropagate policy for features of log_prob,
-    # as tf.gradients() for every batch instance is slow.
-    dlp_da = -2 * batch_off_policy
-    features = [
-        dlp_da, # dlp_db
-        tf.expand_dims(policy_weights[-2], 0) *\
-            tf.expand_dims(dlp_da, 1) # dlp_dw
-    ]
-    if 0:
-        gradients = [tf.stack(i) for i in zip(*[tf.gradients(
-            log_prob[t], policy_weights) for t in range(ER_BATCH_STEPS)])]
-        features = [tf.expand_dims(feat, -1) for feat in gradients]
-
-    with tf.name_scope('advantage'):
         q_adv = 0.
-        for feat in features:
+        for feat in policy_features:
             shape = feat.shape[1:].as_list()
             w = weight_variable(shape)
             prod = feat * tf.expand_dims(w, 0)
             for i in range(len(shape)-1):
                 prod = tf.reduce_sum(prod, 1)
-            q_adv += tf.reduce_sum(prod * batch_off_policy, -1)
+            q_adv += tf.reduce_sum(prod * off_policy, -1)
         q_value = state_value + q_adv
 
     def multi_step(recurse, i=0):# recurse==0 is 1-step TD
@@ -318,12 +313,10 @@ def make_acrl():
 
     adv = tf.maximum(0., adv)
     repl = gradient_override(log_prob, adv)
-    grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
+    grad = opt_policy.compute_gradients(repl, policy_weights)
     p.global_norm = accum_gradient(grad, opt_policy)
 
-    is_on_policy = tf.reduce_sum(tf.abs(batch_off_policy), 1) < 0.1
     stats.mean_advantage.append(tf.reduce_mean(tf.abs(adv)))
-    stats.on_policy_count.append(tf.reduce_sum(tf.cast(is_on_policy, tf.int32)))
     stats.reward_sum.append(tf.reduce_sum(all_rewards[r]))
     stats.td_error.append(tf.reduce_sum(td_error**2))
 
