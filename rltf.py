@@ -250,11 +250,11 @@ def make_acrl():
         net = make_dense_hidden(make_conv_net(input_states))
         if LSTM_LAYER: net, p.lstm_save_ops = make_lstm_layer(net)
         net = make_next_state_pair(net)
-        last_hidden = net
+        last_hidden = net[0]
         net = make_dense_output(net, ACTION_DIM)
         policy_weights = scope_vars()
 
-        policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else tf.tanh(i) for i in net]
+        policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else i for i in net]
         p.ph_policy = policy[2]
         all_policy.append(p)
         stats._policy_minmax.append(tf.concat([
@@ -270,8 +270,8 @@ def make_acrl():
 
     # Manually backpropagate policy for features of log_prob,
     # as tf.gradients() aggregates gradients across all instances.
-    dlp_da = off_policy*2
-    da_dw = last_hidden[0]
+    dlp_da = -off_policy*2
+    da_dw = last_hidden
     # dlp_dw = dlp_da * da_dw
     policy_features = [tf.expand_dims(dlp_da, 1) * tf.expand_dims(da_dw, -1)]
 
@@ -280,9 +280,9 @@ def make_acrl():
 
     with tf.name_scope('value'):
         net = make_dense_hidden(make_conv_net(input_states))
-        #if LSTM_LAYER: net, _ = make_lstm_layer(net)
-        net = make_dense_output(net, 1)
+        if LSTM_LAYER: net, _ = make_lstm_layer(net)
         net = make_next_state_pair(net)
+        net = make_dense_output(net, 1)
         [state_value, next_state_value, p.ph_policy_value] = [i[:,0] for i in net]
 
         q_adv = 0.
