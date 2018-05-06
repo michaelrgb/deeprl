@@ -263,20 +263,22 @@ def make_acrl():
 
     off_policy = er.batch_action - policy[0]
     if POLICY_SOFTMAX:
-        prob = tf.reduce_sum(policy[0]*er.batch_action, -1)
-        log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1-1e-20))
+        # off_policy = er.batch_action - tf.one_hot(tf.argmax(policy[0], 1), ACTION_DIM)
+        prob = tf.reduce_sum(er.batch_action*policy[0], -1)
+        log_prob = tf.log(tf.clip_by_value(prob, 1e-20, 1.))
+        dlp_da = er.batch_action / tf.expand_dims(tf.maximum(1e-2, prob) , -1)
     else:
         log_prob = tf.reduce_sum(-off_policy**2, -1)
+        dlp_da = -off_policy*2
 
     # Manually backpropagate policy for features of log_prob,
     # as tf.gradients() aggregates gradients across all instances.
-    dlp_da = -off_policy*2
     da_dw = last_hidden
-    # dlp_dw = dlp_da * da_dw
-    policy_features = [tf.expand_dims(dlp_da, 1) * tf.expand_dims(da_dw, -1)]
-
-    if 0: policy_features = [tf.expand_dims(tf.stack(i), -1)
-        for i in zip(*[tf.gradients(t, policy_weights) for t in tf.unstack(log_prob)])]
+    policy_features = [
+        # dlp_da, # dlp_bias
+        # dlp_weights = dlp_da * da_dw
+        tf.expand_dims(dlp_da, 1) * tf.expand_dims(da_dw, -1)
+    ]
 
     with tf.name_scope('value'):
         net = make_dense_hidden(make_conv_net(input_states))
@@ -285,14 +287,16 @@ def make_acrl():
         net = make_dense_output(net, 1)
         [state_value, next_state_value, p.ph_policy_value] = [i[:,0] for i in net]
 
-        q_adv = 0.
+        action_adv = 0.
         for feat in policy_features:
             shape = feat.shape[1:].as_list()
             w = weight_variable(shape)
             prod = feat * tf.expand_dims(w, 0)
             for i in range(len(shape)-1):
                 prod = tf.reduce_sum(prod, 1)
-            q_adv += tf.reduce_sum(prod * off_policy, -1)
+            action_adv += prod
+
+        q_adv = tf.reduce_sum(action_adv * off_policy, -1)
         q_value = state_value + q_adv
 
     def multi_step(recurse, i=0):# recurse==0 is 1-step TD
@@ -302,16 +306,11 @@ def make_acrl():
             tf.range(i, ER_BATCH_STEPS+i) < ER_BATCH_STEPS-1,
             multi_step(recurse, i+1),
             next) if i < recurse else next)
-    step_n = multi_step(20)
+    step_n = multi_step(40)
     step_1 = multi_step(0)
     td_error = tf.maximum(step_n, step_1) - q_value
 
-    adv = q_adv
-    if POLICY_SOFTMAX:
-        adv = tf.where(prob < 1e-2, tf.maximum(0., adv),
-              tf.where(prob > 1-1e-2, tf.minimum(0., adv), adv))
-
-    adv = tf.maximum(0., adv)
+    adv = tf.maximum(0., q_adv)
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, policy_weights)
     p.global_norm = accum_gradient(grad, opt_policy)
