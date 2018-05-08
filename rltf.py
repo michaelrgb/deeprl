@@ -17,6 +17,7 @@ flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved 
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
 flags.DEFINE_boolean('er_all', True, 'Keep all batches in ER memory')
 flags.DEFINE_boolean('summary', True, 'Save summaries for Tensorboard')
+flags.DEFINE_boolean('sample_actions', False, 'Sample actions, or use policy')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 FLAGS = flags.FLAGS
 
@@ -53,7 +54,7 @@ if ENV_NAME == 'CarRacing-v0':
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple # [512, 288]
 elif 'Bullet' in ENV_NAME:
-    import pybulletgym.envs
+    import pybullet_envs
 
 import gym
 env = gym.make(ENV_NAME)
@@ -84,7 +85,7 @@ ER_BATCHES = FLAGS.batch_keep + FLAGS.batch_async if (FLAGS.er_all and not FLAGS
 
 training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None)
 epoch = Struct(count=0)
-app = Struct(policy_index=0, quit=False, sample_actions=False)#FLAGS.async > 1)
+app = Struct(policy_index=0, quit=False)
 
 def batch_paths(batch_num, path=None):
     if not path:
@@ -190,9 +191,6 @@ def gradient_override(expr, custom_grad):
         return tf.identity(expr)
 gradient_override.counter = 0
 
-all_policy = []
-stats = Struct(reward_sum=[], td_error=[], mean_advantage=[], _policy_minmax=[])
-
 def make_dense_hidden(x):
     for l in range(HIDDEN_LAYERS):
         dense = tf.layers.Dense(HIDDEN_NODES, activation=tf.nn.relu,
@@ -241,22 +239,24 @@ def make_next_state_pair(x):
     x = [x[0][:-1], x[0][1:], x[1]]
     return x
 
+allac = []
+stats = Struct(reward_sum=[], td_error=[], mean_advantage=[], _policy_minmax=[])
 def make_acrl():
     input_states = [er.adjacent_states,
         tf.expand_dims(tf.concat([frame_to_state[i] for i in range(ADJACENT_STATES)], -1), 0)]
 
-    p = Struct()
+    ac = Struct(lstm_save_ops=[])
+    allac.append(ac)
     with tf.name_scope('policy'):
         net = make_dense_hidden(make_conv_net(input_states))
-        if LSTM_LAYER: net, p.lstm_save_ops = make_lstm_layer(net)
+        if LSTM_LAYER: net, ac.lstm_save_ops = make_lstm_layer(net)
         net = make_next_state_pair(net)
-        last_hidden = net[0]
+        da_dw = [net[0], net[2]] # Last hidden layer before linear action output
         net = make_dense_output(net, ACTION_DIM)
         policy_weights = scope_vars()
 
         policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else i for i in net]
-        p.ph_policy = policy[2]
-        all_policy.append(p)
+        ac.ph_policy = policy[2]
         stats._policy_minmax.append(tf.concat([
             [tf.reduce_min(policy[0], axis=0)],
             [tf.reduce_max(policy[0], axis=0)]], axis=0))
@@ -269,33 +269,31 @@ def make_acrl():
         dlp_da = er.batch_action / tf.expand_dims(tf.maximum(1e-2, prob) , -1)
     else:
         log_prob = tf.reduce_sum(-off_policy**2, -1)
-        dlp_da = -off_policy*2
+        dlp_da = -2*off_policy
+    dlp_da = [dlp_da, -2*tf.ones((1, ACTION_DIM))] # Non-softmax
 
     # Manually backpropagate policy for features of log_prob,
     # as tf.gradients() aggregates gradients across all instances.
-    da_dw = last_hidden
-    policy_features = [
-        # dlp_da, # dlp_bias
-        # dlp_weights = dlp_da * da_dw
-        tf.expand_dims(dlp_da, 1) * tf.expand_dims(da_dw, -1)
-    ]
-
     with tf.name_scope('value'):
+        action_adv = []
+        for i in range(len(da_dw)):
+            # dlp_dw = dlp_da * da_dw
+            feat = tf.expand_dims(dlp_da[i], 1) * tf.expand_dims(da_dw[i], -1)
+            if i == 0:
+                shape = feat.shape[1:].as_list()
+                w = weight_variable(shape)
+            prod = feat * tf.expand_dims(w, 0)
+            for i in range(len(shape)-1):
+                prod = tf.reduce_sum(prod, 1)
+            action_adv.append(prod)
+
         net = make_dense_hidden(make_conv_net(input_states))
         if LSTM_LAYER: net, _ = make_lstm_layer(net)
         net = make_next_state_pair(net)
         net = make_dense_output(net, 1)
-        [state_value, next_state_value, p.ph_policy_value] = [i[:,0] for i in net]
+        [state_value, next_state_value, ac.ph_policy_value] = [i[:,0] for i in net]
 
-        action_adv = 0.
-        for feat in policy_features:
-            shape = feat.shape[1:].as_list()
-            w = weight_variable(shape)
-            prod = feat * tf.expand_dims(w, 0)
-            for i in range(len(shape)-1):
-                prod = tf.reduce_sum(prod, 1)
-            action_adv += prod
-
+        [action_adv, ac.ph_action_adv] = action_adv
         q_adv = tf.reduce_sum(action_adv * off_policy, -1)
         q_value = state_value + q_adv
 
@@ -304,16 +302,15 @@ def make_acrl():
         next = tf.concat([next_state_value[i:], z], 0)
         return tf.concat([all_rewards[r][i:], z], 0) + GAMMA*(tf.where(
             tf.range(i, ER_BATCH_STEPS+i) < ER_BATCH_STEPS-1,
-            multi_step(recurse, i+1),
+            tf.maximum(next, multi_step(recurse, i+1)),
             next) if i < recurse else next)
     step_n = multi_step(40)
-    step_1 = multi_step(0)
-    td_error = tf.maximum(step_n, step_1) - q_value
+    td_error = step_n - q_value
 
     adv = tf.maximum(0., q_adv)
     repl = gradient_override(log_prob, adv)
     grad = opt_policy.compute_gradients(repl, policy_weights)
-    p.global_norm = accum_gradient(grad, opt_policy)
+    ac.global_norm = accum_gradient(grad, opt_policy)
 
     stats.mean_advantage.append(tf.reduce_mean(tf.abs(adv)))
     stats.reward_sum.append(tf.reduce_sum(all_rewards[r]))
@@ -357,7 +354,7 @@ def setup_key_actions():
         elif k >= ord('1') and k <= ord('9'):
             app.policy_index = min(REWARDS_ALL-1, int(k - ord('1')))
         elif k==ord('s'):
-            app.sample_actions ^= True
+            FLAGS.sample_actions ^= True
         elif k==ord('t'):
             training.enable ^= True
         elif k==ord('r'):
@@ -367,7 +364,7 @@ def setup_key_actions():
         print(dict(
             policy_index=app.policy_index,
             training_enable=training.enable,
-            sample_actions=app.sample_actions))
+            sample_actions=FLAGS.sample_actions))
 
     def key_release(k, mod):
         if k==key.LEFT  and a[0]==-1.0: a[0] = 0
@@ -399,16 +396,16 @@ def step_to_frames():
         if app.policy_index != -1:
             a = action.policy[:]
             if ACTION_DISCRETE:
-                if app.sample_actions:
+                if FLAGS.sample_actions:
                     # Sample from softmax probabilities
                     prob = softmax(a)
-                    a = np.random.choice(range(len(prob)), p=prob)
+                    a = np.random.choice(range(ACTION_DIM), p=prob)
                 else:
                     a = np.argmax(a)
             else:
-                if app.sample_actions:
-                    #for i in range(ACTION_DIM): a[int(time.time()/math.pi) % ACTION_DIM] += math.cos(time.time())
-                    if not np.random.randint(3): a[np.random.randint(ACTION_DIM)] += 2.*np.random.rand()-1.
+                if FLAGS.sample_actions:
+                    dim = np.random.choice(range(ACTION_DIM), p=softmax(action.action_adv))
+                    a[dim] += 0.1*np.random.rand() * (1. if action.action_adv[dim] > 0. else -1.)
 
     env_action = a
     if ACTION_DISCRETE:
@@ -443,11 +440,13 @@ def step_to_frames():
     state.last_obs = obs
     return [reward_sum]
 
-ops_single_step = [
-    frame_to_state[0],
-    all_policy[0].ph_policy[0],# Policy from uploaded state,
-    all_policy[0].ph_policy_value,
-] + ([op for p in all_policy for op in p.lstm_save_ops] if LSTM_LAYER else [])
+ops_single_step = [frame_to_state[0]] + [
+    i for sublist in [
+        [ac.ph_policy[0],# Policy from uploaded state,
+        ac.ph_policy_value,
+        ac.ph_action_adv[0],
+        ] + ac.lstm_save_ops for ac in allac]
+    for i in sublist]
 def append_to_batch():
     save_paths = batch_paths(training.current_batch)
     if not FLAGS.async and FLAGS.recreate_states:
@@ -465,6 +464,7 @@ def append_to_batch():
     save_state = ret[0]
     action.policy = ret[1]
     action.policy_value = ret[2]
+    action.action_adv = ret[3]
 
     temp_paths = batch_paths(FLAGS.async, 'temp')
     if not training.temp_batch:
@@ -507,7 +507,7 @@ if not FLAGS.async:
     ops.train = [
         accum_value(tf.concat([stats.td_error], 0)),
         accum_value(tf.concat([stats.reward_sum], 0)),
-        tf.concat([[p.global_norm] for p in all_policy], 0)
+        tf.concat([[ac.global_norm] for ac in allac], 0)
     ] + ops.apply_accum
     init_vars()
 
