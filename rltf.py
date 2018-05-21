@@ -29,10 +29,6 @@ sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 STATE_FRAMES = 2    # Frames an action is repeated for, combined into a state
 ADJACENT_STATES = 4 # Combined adjacent states, fed to value/policy function
 
-GAMMA = 0.99
-LSTM_NODES = 256
-LSTM_LAYER = False
-
 EXTRA_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
 if not ENV_NAME:
@@ -43,10 +39,13 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
     EXTRA_ACTIONS = [
+        [1,  0, 0],
         [-1, 0, 0],
-        [1, 0, 0],
-        [0, 1, 0],
-        [0, 0, 0.5],
+        [0,  0, 0],
+        [0,  1, 0],
+        [1,  1, 0],
+        [-1, 1, 0],
+        [0,  0, 0.8],
     ] if 1 else []
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple # [512, 288]
@@ -60,6 +59,11 @@ envu = env.unwrapped
 
 ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
 ACTION_DISCRETE = not env.action_space.shape
+def onehot_vector(action_index): return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
+if ACTION_DISCRETE:
+    ACTION_COMBIS = [onehot_vector(a) for a in range(ACTION_DIM)]
+else:
+    ACTION_COMBIS = EXTRA_ACTIONS
 POLICY_SOFTMAX = ACTION_DISCRETE
 FRAME_DIM = list(env.observation_space.shape)
 
@@ -237,6 +241,12 @@ def make_next_state_pair(x):
     x = [x[0][:-1], x[0][1:], x[1]]
     return x
 
+GAMMA = 0.99
+LSTM_NODES = 256
+LSTM_LAYER = False
+SHARED_LAYERS = True
+MAX_NEXT_VALUE = True
+
 allac = []
 stats = Struct(reward_sum=[], td_error=[], _policy_minmax=[])
 def make_acrl():
@@ -249,27 +259,57 @@ def make_acrl():
         net = make_dense_layers(make_conv_net(input_states))
         if LSTM_LAYER: net, ac.lstm_save_ops = make_lstm_layer(net)
         net = make_next_state_pair(net)
+        shared_net = net
+        shared_weights = scope_vars()
         net = make_dense_output(net, ACTION_DIM)
-        policy_weights = scope_vars()
 
-        policy = [tf.nn.softmax(i) if POLICY_SOFTMAX else tf.tanh(i) for i in net]
+        policy = [tf.nn.softmax(n) if POLICY_SOFTMAX else tf.tanh(n) for n in net]
         ac.policy = policy[0]
         ac.ph_policy = policy[2]
         stats._policy_minmax.append(tf.concat([
             [tf.reduce_min(policy[0], axis=0)],
             [tf.reduce_max(policy[0], axis=0)]], axis=0))
 
+    def maximize_value_pre(idx): # Maximize next-state value
+        if not MAX_NEXT_VALUE or not ACTION_COMBIS: return
+        a = tf.expand_dims(tf.constant(ACTION_COMBIS), 0)
+        a = tf.tile(a, [ER_BATCH_STEPS, 1, 1])
+        num_combis = len(ACTION_COMBIS)
+        if 1:
+            num_combis += 1 # Add the current policy action as well
+            policy_action = tf.expand_dims(actions[idx], 1)
+            a = tf.concat([a, policy_action], 1)
+        n = tf.expand_dims(net[idx], 1)
+        n = tf.tile(n, [1, num_combis, 1])
+
+        a = tf.reshape(a, [ER_BATCH_STEPS*num_combis, -1])
+        n = tf.reshape(n, [ER_BATCH_STEPS*num_combis, -1])
+        net[idx],actions[idx] = n,a
+
+    def maximize_value_post(idx):
+        if not MAX_NEXT_VALUE or not ACTION_COMBIS: return
+        n = net[idx]
+        n = tf.reshape(n, [ER_BATCH_STEPS, int(n.shape[0])/ER_BATCH_STEPS, -1])
+        n = tf.reduce_max(n, 1)
+        net[idx] = n
+
     with tf.name_scope('value'):
-        net = make_dense_layers(make_conv_net(input_states))
-        if LSTM_LAYER: net, _ = make_lstm_layer(net)
-        net = make_next_state_pair(net)
+        if SHARED_LAYERS:
+            net = shared_net
+        else:
+            net = make_dense_layers(make_conv_net(input_states))
+            if LSTM_LAYER: net, _ = make_lstm_layer(net)
+            net = make_next_state_pair(net)
         net = [net[0], net[0], net[1], net[2]]
         actions = [policy[0], er.batch_action, policy[1], policy[2]]
-        net = [tf.concat([i,a], 1) for i,a in zip(net,actions)]
 
+        maximize_value_pre(2)
+        net = [tf.concat([n,a], 1) for n,a in zip(net,actions)]
         net = make_dense_layers(net, scope='layer2', activation=tf.nn.leaky_relu)
-        net = [i[:,0] for i in make_dense_output(net, 1)]
-        [ac.state_value, ac.q_value, next_state_value, ac.ph_policy_value] = net
+        net = make_dense_output(net, 1)
+        maximize_value_post(2)
+
+        [ac.state_value, ac.q_value, next_state_value, ac.ph_policy_value] = [n[:,0] for n in net]
         ac.q_grad = tf.gradients(ac.state_value, ac.policy)[0]
         ac.ph_policy_value_grad = tf.gradients(ac.ph_policy_value, ac.ph_policy)[0]
 
@@ -282,18 +322,18 @@ def make_acrl():
             #multi_step(recurse, i+1),
             next) if i < recurse else next)
     ac.step_1 = multi_step(0)
-    ac.step_n = tf.maximum(ac.step_1, multi_step(40))
-    ac.td_error = (0.1*ac.step_1+0.9*ac.step_n) - ac.q_value
+    ac.step_n = multi_step(40)
+    ac.td_error = (0.9*ac.step_1+0.1*ac.step_n) - ac.q_value
 
     POLICY_CLAMP = 1.-2e-2
     q_grad = tf.where(ac.policy>POLICY_CLAMP, tf.minimum(0., ac.q_grad),
              tf.where(ac.policy<-POLICY_CLAMP, tf.maximum(0., ac.q_grad), ac.q_grad))
     repl = gradient_override(ac.policy, q_grad)
-    grad = opt_policy.compute_gradients(repl, policy_weights)
+    grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
     ac.global_norm = accum_gradient(grad, opt_policy)
 
     # TD error with gradient correction (TDC)
-    weights = scope_vars('value')
+    weights = scope_vars('value') + (shared_weights if SHARED_LAYERS else [])
     repl = gradient_override(ac.q_value, ac.td_error)
     grad_s = opt_td.compute_gradients(repl, weights)
     repl = gradient_override(next_state_value, -GAMMA*ac.td_error)
@@ -361,8 +401,6 @@ def setup_key_actions():
 
 action = Struct(to_take=None, policy=None, keyboard=setup_key_actions())
 def step_to_frames():
-    def onehot_vector(action_index):
-        return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
     def softmax(x):
         e_x = np.exp(x - x.max())
         return e_x / e_x.sum()
