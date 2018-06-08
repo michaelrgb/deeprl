@@ -204,14 +204,14 @@ def make_dense_layer(x, outputs, norm_idx=None, activation=tf.nn.relu):
 def make_lstm_layer(x):
     cell = rnn.BasicLSTMCell(LSTM_NODES)
     scope = tf.contrib.framework.get_name_scope()
-    stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(x[:1]), dtype=tf.float32, scope=scope)
-    x = tf.unstack(stacked) + [x[1]]
+    stacked, _ = tf.nn.dynamic_rnn(cell, tf.stack(x[:-1]), dtype=tf.float32, scope=scope)
+    x = tf.unstack(stacked) + x[-1:]
     with tf.name_scope(str(FLAGS.async)):
         lstm_saved_state = tf.contrib.rnn.LSTMStateTuple(
             *[tf.Variable(s, trainable=False) for s in cell.zero_state(1, DTYPE)])
         sess.run(tf.variables_initializer(lstm_saved_state))
         stacked, final_state = tf.nn.dynamic_rnn(cell, tf.stack(x[-1:]), initial_state=lstm_saved_state, scope=scope)
-        x = [x[0]] + tf.unstack(stacked)
+        x = x[:-1] + tf.unstack(stacked)
         lstm_save_ops = [lstm_saved_state[i].assign(final_state[i]) for i in range(2)]
     return x, lstm_save_ops
 
@@ -221,28 +221,29 @@ LSTM_NODES, LSTM_LAYER = 256, False
 opt_td = tf.train.AdamOptimizer(ph.learning_rate)
 opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10)
 
-def make_shared(norm_idx):
-    lstm_save_ops = []
-    net = make_dense_layer(make_conv_net(net_state_input, norm_idx), HIDDEN_1, norm_idx)
-    if LSTM_LAYER: net, lstm_save_ops = make_lstm_layer(net)
-    return net, lstm_save_ops
-
 allac = []
 stats = Struct(reward_sum=[], td_error=[], _policy_minmax=[])
 def make_acrl():
     ac = Struct()
     allac.append(ac)
-    with tf.name_scope('policy'):
-        norm_idx = 0
-        shared_net, ac.lstm_save_ops = make_shared(norm_idx)
-        net = make_dense_layer(shared_net, HIDDEN_2, norm_idx)
-        policy = make_dense_layer(net, ACTION_DIM, norm_idx,
-            activation=tf.nn.softmax if POLICY_SOFTMAX else tf.tanh)
+    def make_shared(norm_idx, save_ops=False):
+        net = make_dense_layer(make_conv_net(net_state_input, norm_idx), HIDDEN_1, norm_idx)
+        net, lstm_save_ops = make_lstm_layer(net) if LSTM_LAYER else net, []
+        if save_ops: ac.lstm_save_ops = lstm_save_ops
+        return net
 
-        [ac.policy, _, ac.ph_policy] = policy
+    def make_policy(norm_idx):
+        net = make_shared(norm_idx, norm_idx==0)
+        net = make_dense_layer(net, HIDDEN_2, norm_idx)
+        return make_dense_layer(net, ACTION_DIM, norm_idx,
+            activation=tf.nn.softmax if POLICY_SOFTMAX else tf.tanh)
+    with tf.name_scope('policy'):
+        [ac.policy, _, ac.ph_policy] = make_policy(0)
         stats._policy_minmax.append(tf.concat([
             [tf.reduce_min(ac.policy, axis=0)],
             [tf.reduce_max(ac.policy, axis=0)]], axis=0))
+    with tf.name_scope('_policy'):
+        [_, next_state_policy, _] = make_policy(-1)
 
     def multi_actions_pre(idx, batch_size=FLAGS.minibatch, include_policy=True):
         if not FIXED_ACTIONS: return
@@ -262,7 +263,8 @@ def make_acrl():
         return action_combis
     def multi_actions_inner(norm_idx):
         n = make_dense_layer(net, HIDDEN_2, norm_idx)
-        a = make_dense_layer(actions, HIDDEN_2)
+        a = [tf.concat([a, 1-tf.abs(a)], 1) for a in actions]
+        a = make_dense_layer(a, HIDDEN_2, activation=None)
         n = [n*a for n,a in zip(n, a)]
         return make_dense_layer(n, 1, activation=None)
     def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
@@ -273,25 +275,22 @@ def make_acrl():
 
     with tf.name_scope('value'):
         norm_idx = 0
-        net,_ = make_shared(norm_idx)
+        net = make_shared(norm_idx)
         net = [net[0], net[0], net[2]]
-        actions = [policy[0], ph.actions, policy[2]]
+        actions = [ac.policy, ph.actions, ac.ph_policy]
         multi_actions_pre(2, 1)
         value_net = multi_actions_inner(norm_idx)
-    with tf.name_scope('target'):
+    with tf.name_scope('_value'):
         norm_idx = -1 # No UPDATE_OPS for target network
-        net,_ = make_shared(norm_idx)
-        net, actions = [net[1]], [policy[1]]
-        multi_actions_pre(0)
+        net = make_shared(norm_idx)
+        net, actions = [net[1]], [next_state_policy]
         target_net = multi_actions_inner(norm_idx)
 
     [ac.state_value, ac.q_value, next_state_value, ac.ph_policy_value] = [n[:,0] for n in [
-        value_net[0], value_net[1],
-        multi_actions_post(target_net[0], reduce_max=True), # Maximize next-state value
+        value_net[0], value_net[1], target_net[0],
         multi_actions_post(value_net[2], 1)]] # Q for all actions in agent's current state
 
     ac.q_grad = tf.gradients(ac.state_value, ac.policy)[0]
-    ac.ph_policy_value_grad = tf.gradients(ac.ph_policy_value, ac.ph_policy)[0]
 
     POLICY_CLAMP = 1.-2e-2
     q_grad = tf.where(ac.policy>POLICY_CLAMP, tf.minimum(0., ac.q_grad),
@@ -308,8 +307,10 @@ def make_acrl():
     ac.global_norm_qvalue = accum_gradient(grad, opt_td)
     copy_vars = zip(
         # Include moving_mean/variance, which are not TRAINABLE_VARIABLES
-        scope_vars('target', tf.GraphKeys.GLOBAL_VARIABLES),
-        scope_vars('value', tf.GraphKeys.GLOBAL_VARIABLES))
+        scope_vars('_value', tf.GraphKeys.GLOBAL_VARIABLES),
+        scope_vars('value', tf.GraphKeys.GLOBAL_VARIABLES)) + zip(
+        scope_vars('_policy', tf.GraphKeys.GLOBAL_VARIABLES),
+        scope_vars('policy', tf.GraphKeys.GLOBAL_VARIABLES))
     for t,w in copy_vars:
         ops.per_epoch.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
 
@@ -374,28 +375,26 @@ def step_to_frames():
     def softmax(x):
         e_x = np.exp(x - x.max())
         return e_x / e_x.sum()
+    def choose_action(value): # Choose from Q-values or softmax policy
+        return np.random.choice(value.shape[0], p=softmax(value)) if FLAGS.sample_actions else np.argmax(value)
 
-    a = action.keyboard[:ACTION_DIM]
-    if ACTION_DISCRETE: a = int(a[0]+1.)
+    a = action.keyboard[:ACTION_DIM].copy()
+    if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1.))
 
-    if state.count > 0:
-        if app.policy_index != -1:
-            a = action.policy[:]
-            if ACTION_DISCRETE:
-                if FLAGS.sample_actions:
-                    # Sample from softmax probabilities
-                    prob = softmax(a)
-                    a = np.random.choice(range(ACTION_DIM), p=prob)
-                else:
-                    a = np.argmax(a)
-            else:
-                if FLAGS.sample_actions:
-                    dim = np.random.choice(range(ACTION_DIM), p=softmax(action.policy_value_grad))
-                    a[dim] += 0.1*np.random.rand() * (1. if action.policy_value_grad[dim] > 0. else -1.)
+    if state.count > 0 and app.policy_index != -1:
+        a = action.policy.copy()
+        if 0:#not ACTION_DISCRETE:
+            idx = choose_action(action.policy_value) if FLAGS.sample_actions else 0
+            a = ([action.policy] + FIXED_ACTIONS)[idx]
+    if FLAGS.sample_actions:
+        a += np.random.rand(ACTION_DIM)-0.5
 
-    if ACTION_DISCRETE: action.to_save = onehot_vector(a)
-    else: action.to_save = a
-    if app.show_action: print(action.to_save)
+    env_action = a
+    if ACTION_DISCRETE:
+        env_action = np.argmax(a)
+        a = onehot_vector(env_action)
+    action.to_save = a
+    if app.show_action: print(list(action.to_save), list(action.policy))#, list(action.policy_value))
 
     obs = state.last_obs
     reward_sum = 0.
@@ -413,14 +412,14 @@ def step_to_frames():
         #imshow([obs, test_lcn(obs, sess)[0]])
         state.frames[0, frame] = obs
 
-        obs, reward, state.done, info = env.step(a)
+        obs, reward, state.done, info = env.step(env_action)
         if ENV_NAME == 'MountainCar-v0':
             # Mountain car env doesnt give any +reward
             reward = 1. if state.done else 0.
         elif ENV_NAME == 'CarRacing-v0':
-            if state.last_reset > 100 and state.last_pos_reward > 20:
+            if state.last_reset > 100 and state.last_pos_reward > 40:
                 state.done = True # Reset track if spinning
-                reward = -1000
+                reward = -100
         state.last_pos_reward = 0 if reward>0. or state.done else state.last_pos_reward+1
         reward_sum += reward
     state.last_obs = obs
@@ -429,8 +428,7 @@ def step_to_frames():
 ops_single_step = [frame_to_state[0]] + [
     i for sublist in [
         [ac.ph_policy[0],# Policy from uploaded state,
-        ac.ph_policy_value,
-        ac.ph_policy_value_grad[0],
+        ac.ph_policy_value[0],
         ] + ac.lstm_save_ops for ac in allac]
     for i in sublist]
 def append_to_batch():
@@ -450,7 +448,6 @@ def append_to_batch():
     save_state = ret[0]
     action.policy = ret[1]
     action.policy_value = ret[2]
-    action.policy_value_grad = ret[3]
 
     temp_paths = batch_paths(FLAGS.async, 'temp')
     if not training.temp_batch:
@@ -565,7 +562,7 @@ def train_accum_minibatch():
 
 def train_apply_gradients():
     r = sess.run(ops.per_epoch, feed_dict={ph.learning_rate: FLAGS.learning_rate})
-    w = scope_vars('ac_0/target/dense', tf.GraphKeys.GLOBAL_VARIABLES)[3]; print(w, w.eval()[:10])
+    #w = scope_vars('ac_0/_value/dense', tf.GraphKeys.GLOBAL_VARIABLES)[3]; print(w, w.eval()[:10])
     app.epoch_count += 1
     sess.run(ops.zero_accum)
     pprint(dict(
