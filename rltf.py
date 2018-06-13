@@ -16,10 +16,11 @@ flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved raw frames')
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
 flags.DEFINE_boolean('summary', True, 'Save summaries for Tensorboard')
-flags.DEFINE_boolean('sample_actions', False, 'Sample actions, or use policy')
+flags.DEFINE_boolean('sample_action', False, 'Sample actions, or use policy')
+flags.DEFINE_boolean('quantize', False, 'Quantize actions to list')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
-flags.DEFINE_integer('minibatch', 200, 'Minibatch size')
+flags.DEFINE_integer('minibatch', 100, 'Minibatch size')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -28,9 +29,9 @@ if not FLAGS.async:
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 STATE_FRAMES = 3    # Frames an action is repeated for, combined into a state
-ADJACENT_STATES = 2 # Combined adjacent states, fed to value/policy function
+ADJACENT_STATES = 1 # Combined adjacent states, fed to value/policy function
 
-EXTRA_ACTIONS = []
+QUANT_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
 if not ENV_NAME:
     raise Exception('Missing ENV environment variable')
@@ -39,14 +40,16 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing = gym.envs.box2d.car_racing
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
-    EXTRA_ACTIONS = [
-        [1,  0, 0],
-        [-1, 0, 0],
-        [0,  0, 0],
-        [0,  1, 0],
-        [1,  1, 0],
-        [-1, 1, 0],
-        [0,  0, 0.8],
+    QUANT_ACTIONS = [
+        [1, 0, 0],
+        [0.1, 0, 0],
+        [-1,0, 0],
+        [-0.1, 0, 0],
+        [0, 1, 0],
+        [0, 0.1, 0],
+        [0, 0, 0],
+        [0, 0, 0.8],
+        [0, 0, 0.2],
     ] if 1 else []
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple # [512, 288]
@@ -61,8 +64,8 @@ envu = env.unwrapped
 ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
 ACTION_DISCRETE = not env.action_space.shape
 def onehot_vector(action_index): return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
-if ACTION_DISCRETE: FIXED_ACTIONS = [onehot_vector(a) for a in range(ACTION_DIM)]
-else: FIXED_ACTIONS = EXTRA_ACTIONS
+if ACTION_DISCRETE: EVAL_ACTIONS = [onehot_vector(a) for a in range(ACTION_DIM)]
+else: EVAL_ACTIONS = QUANT_ACTIONS
 POLICY_SOFTMAX = ACTION_DISCRETE
 FRAME_DIM = list(env.observation_space.shape)
 
@@ -71,7 +74,7 @@ STATE_DIM = FRAME_DIM[:]
 if CONV_NET:
     if STATE_DIM[-1] == 3:
         STATE_DIM[-1] = 1
-    FRAME_LCN = False
+    FRAME_LCN = True
     RESIZE = [84, 84] # DQN
     if RESIZE:
         STATE_DIM[:2] = RESIZE
@@ -127,7 +130,7 @@ net_state_input = [ph.states, ph.next_states,
     tf.expand_dims(tf.concat([frame_to_state[i] for i in range(ADJACENT_STATES)], -1), 0)]
 
 training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None)
-app = Struct(policy_index=0, quit=False, epoch_count=0, show_action=False)
+app = Struct(policy_index=0, quit=False, epoch_count=0, print_action=False, show_state_image=False)
 if FLAGS.async:
     FIRST_BATCH = (FLAGS.async-1)*FLAGS.batch_per_async
 else:
@@ -150,7 +153,7 @@ def accum_gradient(grads, opt):
     grads, vars = zip(*grads)
     grads = [accum_value(g) for g in grads]
     # Clip gradients by global norm to prevent destabilizing policy
-    grads,global_norm = tf.clip_by_global_norm(grads, 50.)
+    grads,global_norm = tf.clip_by_global_norm(grads, 10.)
     grads = zip(grads, vars)
     ops.per_epoch.append(opt.apply_gradients(grads))
     return global_norm
@@ -242,14 +245,12 @@ def make_acrl():
         stats._policy_minmax.append(tf.concat([
             [tf.reduce_min(ac.policy, axis=0)],
             [tf.reduce_max(ac.policy, axis=0)]], axis=0))
-    with tf.name_scope('_policy'):
-        [_, next_state_policy, _] = make_policy(-1)
 
     def multi_actions_pre(idx, batch_size=FLAGS.minibatch, include_policy=True):
-        if not FIXED_ACTIONS: return
-        a = tf.expand_dims(tf.constant(FIXED_ACTIONS, tf.float32), 0)
+        if not EVAL_ACTIONS: return
+        a = tf.expand_dims(tf.constant(EVAL_ACTIONS, tf.float32), 0)
         a = tf.tile(a, [batch_size, 1, 1])
-        num_actions = len(FIXED_ACTIONS)
+        num_actions = len(EVAL_ACTIONS)
         if include_policy:
             num_actions += 1
             policy_action = tf.expand_dims(actions[idx], 1)
@@ -263,14 +264,14 @@ def make_acrl():
         return action_combis
     def multi_actions_inner(norm_idx):
         n = make_dense_layer(net, HIDDEN_2, norm_idx)
-        a = [tf.concat([a, 1-tf.abs(a)], 1) for a in actions]
-        a = make_dense_layer(a, HIDDEN_2, activation=None)
+        gauss = lambda x, mean: tf.exp((-(x-mean)**2)*20)
+        a = make_dense_layer(actions, HIDDEN_2, activation=None)
         n = [n*a for n,a in zip(n, a)]
-        return make_dense_layer(n, 1, activation=None)
+        return [n[:,0] for n in make_dense_layer(n, 1, activation=None)]
     def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
-        if not FIXED_ACTIONS: return n
-        n = tf.reshape(n, [batch_size, int(n.shape[0])/batch_size, -1])
-        n = tf.reduce_max(n, 1) if reduce_max else tf.transpose(n, [0, 2, 1])
+        if not EVAL_ACTIONS: return n
+        n = tf.reshape(n, [batch_size, int(n.shape[0])/batch_size])
+        n = tf.reduce_max(n, 1) if reduce_max else n
         return n
 
     with tf.name_scope('value'):
@@ -279,19 +280,22 @@ def make_acrl():
         net = [net[0], net[0], net[2]]
         actions = [ac.policy, ph.actions, ac.ph_policy]
         multi_actions_pre(2, 1)
-        value_net = multi_actions_inner(norm_idx)
+        [ac.state_value, ac.q_value, ph_policy_value] = multi_actions_inner(norm_idx)
+        # Q for all actions in agent's current state
+        ac.ph_policy_value = multi_actions_post(ph_policy_value, 1)
+
+    if FLAGS.async:
+        return
+
+    with tf.name_scope('_policy'):
+        [_, next_state_policy, _] = make_policy(-1)
     with tf.name_scope('_value'):
         norm_idx = -1 # No UPDATE_OPS for target network
         net = make_shared(norm_idx)
         net, actions = [net[1]], [next_state_policy]
-        target_net = multi_actions_inner(norm_idx)
-
-    [ac.state_value, ac.q_value, next_state_value, ac.ph_policy_value] = [n[:,0] for n in [
-        value_net[0], value_net[1], target_net[0],
-        multi_actions_post(value_net[2], 1)]] # Q for all actions in agent's current state
+        [next_state_value] = multi_actions_inner(norm_idx)
 
     ac.q_grad = tf.gradients(ac.state_value, ac.policy)[0]
-
     POLICY_CLAMP = 1.-2e-2
     q_grad = tf.where(ac.policy>POLICY_CLAMP, tf.minimum(0., ac.q_grad),
              tf.where(ac.policy<-POLICY_CLAMP, tf.maximum(0., ac.q_grad), ac.q_grad))
@@ -330,6 +334,15 @@ def setup_key_actions():
     from pyglet.window import key
     a = np.array([0.]*max(3, ACTION_DIM))
 
+    def settings_caption():
+        d = dict(async=FLAGS.async,
+            policy_index=app.policy_index,
+            options=(['sample'] if FLAGS.sample_action else []) +
+                (['quantize'] if FLAGS.quantize else []) +
+                (['print'] if app.print_action else []))
+        print(d)
+        window.set_caption(str(d))
+
     def key_press(k, mod):
         if k==0xff0d: restart = True
         if k==key.LEFT:  a[0] = -1.0
@@ -338,23 +351,22 @@ def setup_key_actions():
         if k==key.DOWN:  a[2] = +0.8   # set 1.0 for wheels to block to zero rotation
         if k==ord('e'):
             app.policy_index = -1
-            print('KEYBOARD POLICY')
         elif k >= ord('1') and k <= ord('9'):
             app.policy_index = min(REWARDS_ALL-1, int(k - ord('1')))
         elif k==ord('a'):
-            app.show_action ^= True
+            app.print_action ^= True
         elif k==ord('s'):
-            FLAGS.sample_actions ^= True
+            FLAGS.sample_action ^= True
+        elif k==ord('q'):
+            FLAGS.quantize ^= True
+        elif k==ord('i'):
+            app.show_state_image = True
         elif k==ord('t'):
             training.enable ^= True
         elif k==ord('r'):
             state.next_reset = True
-        else:
-            return
-        print(dict(
-            policy_index=app.policy_index,
-            training_enable=training.enable,
-            sample_actions=FLAGS.sample_actions))
+        else: return
+        settings_caption()
 
     def key_release(k, mod):
         if k==key.LEFT  and a[0]==-1.0: a[0] = 0
@@ -368,15 +380,16 @@ def setup_key_actions():
     window.on_key_press = key_press
     window.on_key_release = key_release
     window.on_close = lambda: setattr(app, 'quit', True)
+    settings_caption()
     return a
 
-action = Struct(to_take=None, policy=None, keyboard=setup_key_actions())
+action = Struct(to_take=None, policy=[], keyboard=setup_key_actions())
 def step_to_frames():
     def softmax(x):
         e_x = np.exp(x - x.max())
         return e_x / e_x.sum()
     def choose_action(value): # Choose from Q-values or softmax policy
-        return np.random.choice(value.shape[0], p=softmax(value)) if FLAGS.sample_actions else np.argmax(value)
+        return np.random.choice(value.shape[0], p=softmax(value)) if FLAGS.sample_action else np.argmax(value)
 
     a = action.keyboard[:ACTION_DIM].copy()
     if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1.))
@@ -384,21 +397,27 @@ def step_to_frames():
     if state.count > 0 and app.policy_index != -1:
         a = action.policy.copy()
         if 0:#not ACTION_DISCRETE:
-            idx = choose_action(action.policy_value) if FLAGS.sample_actions else 0
-            a = ([action.policy] + FIXED_ACTIONS)[idx]
-    if FLAGS.sample_actions:
-        a += np.random.rand(ACTION_DIM)-0.5
+            idx = choose_action(action.policy_value) if FLAGS.sample_action else 0
+            a = ([action.policy] + EVAL_ACTIONS)[idx]
+    if FLAGS.sample_action:
+        np.random.seed(0)
+        offset = np.array([math.sin(2*math.pi*(r + 8./(1+state.count))) for r in np.random.rand(ACTION_DIM)])
+        a = np.clip(a+offset, -1, 1.)
+
+    if FLAGS.quantize and QUANT_ACTIONS:
+        idx = np.argmin(((np.array(QUANT_ACTIONS) - a)**2).sum(1))
+        a = QUANT_ACTIONS[idx]
 
     env_action = a
     if ACTION_DISCRETE:
         env_action = np.argmax(a)
         a = onehot_vector(env_action)
     action.to_save = a
-    if app.show_action: print(list(action.to_save), list(action.policy))#, list(action.policy_value))
+    if app.print_action: print(list(action.to_save), list(action.policy))#, list(action.policy_value))
 
     obs = state.last_obs
     reward_sum = 0.
-    state.frames[1:] = state.frames[:-1]
+    state.frames[:-1] = state.frames[1:]
     for frame in range(STATE_FRAMES):
         state.done |= state.next_reset
         state.last_reset += 1
@@ -410,7 +429,7 @@ def step_to_frames():
             obs = env.reset()
         env.render()
         #imshow([obs, test_lcn(obs, sess)[0]])
-        state.frames[0, frame] = obs
+        state.frames[-1, frame] = obs
 
         obs, reward, state.done, info = env.step(env_action)
         if ENV_NAME == 'MountainCar-v0':
@@ -425,7 +444,7 @@ def step_to_frames():
     state.last_obs = obs
     return [reward_sum]
 
-ops_single_step = [frame_to_state[0]] + [
+ops_single_step = [frame_to_state] + [
     i for sublist in [
         [ac.ph_policy[0],# Policy from uploaded state,
         ac.ph_policy_value[0],
@@ -437,7 +456,7 @@ def append_to_batch():
         if not state.count:
             training.saved_batch = mmap_batch(save_paths, 'r')
         batch = training.saved_batch
-        state.frames[0] = batch.rawframes[state.count]
+        state.frames[-1] = batch.rawframes[state.count]
         save_reward = batch.rewards[state.count]
         save_action = batch.actions[state.count]
     else:
@@ -448,16 +467,20 @@ def append_to_batch():
     save_state = ret[0]
     action.policy = ret[1]
     action.policy_value = ret[2]
+    if app.show_state_image:
+        app.show_state_image = False
+        concat = np.concatenate([save_state[i] for i in range(ADJACENT_STATES)], -1)
+        proc = multiprocessing.Process(target=imshow, args=([concat[:,:,i] for i in range(ADJACENT_STATES*STATE_FRAMES)],))
+        proc.start()
 
     temp_paths = batch_paths(FLAGS.async, 'temp')
     if not training.temp_batch:
         training.temp_batch = mmap_batch(temp_paths, 'w+')
     batch = training.temp_batch
-    batch.rawframes[state.count] = state.frames[0]
-    batch.states[state.count] = save_state
+    batch.rawframes[state.count] = state.frames[-1]
+    batch.states[state.count] = save_state[-1]
     batch.rewards[state.count] = save_reward
     batch.actions[state.count] = save_action
-    # imshow([save_state[:,:,i] for i in range(STATE_FRAMES)])
 
     state.count += 1
     if state.count == ER_BATCH_SIZE:
@@ -502,14 +525,12 @@ def proc_minibatch(results):
 
     SRC_BATCHES = min(10, FLAGS.batch_keep+FLAGS.batch_async)
     src_batches = {}
-    z_state = np.zeros([ADJACENT_STATES-1] + STATE_DIM)
     while len(src_batches) < SRC_BATCHES:
         try:
             idx = -np.random.choice(FLAGS.batch_keep+1) if np.random.choice(2) \
                 else np.random.choice(FLAGS.batch_async)
             if idx in src_batches: continue
             b = mmap_batch(batch_paths(idx), 'r', rawframes=False)
-            b.states = np.concatenate([z_state, b.states])
             src_batches[idx] = b
         except Exception as e:
             print(e)
@@ -523,12 +544,15 @@ def proc_minibatch(results):
     count = 0
     while count < FLAGS.minibatch:
         b = src_batches.values()[np.random.choice(len(src_batches))]
-        s = np.random.choice(ER_BATCH_STEPS)
+        s = ADJACENT_STATES-1 + np.random.choice(ER_BATCH_STEPS-(ADJACENT_STATES-1))
 
-        # Combine adjacent states for more context
+        def get_state(offset):
+            # Combine adjacent states for more context
+            state = b.states[s-ADJACENT_STATES+1+offset : s+1+offset]
+            return np.concatenate([state[i] for i in range(ADJACENT_STATES)], -1)
         c = count
-        mb.states[c] = b.states[s:s+ADJACENT_STATES].reshape(STATE_DIM_ADJ)
-        mb.next_states[c] = b.states[s+1:s+1+ADJACENT_STATES].reshape(STATE_DIM_ADJ)
+        mb.states[c] = get_state(0)
+        mb.next_states[c] = get_state(1)
         mb.actions[c] = b.actions[s+1]
         mb.rewards[c] = b.rewards[s+1]
         count += 1
@@ -538,13 +562,16 @@ manager = multiprocessing.Manager()
 minibatch_list = manager.list()
 proclist = []
 def train_accum_minibatch():
-    PROCESSES = 6
-    while len(proclist) < PROCESSES:
-        proc = multiprocessing.Process(target=proc_minibatch, args=(minibatch_list,))
-        proc.start()
-        proclist.insert(0, proc)
-    proc = proclist.pop()
-    proc.join()
+    if 1:
+        PROCESSES = 6
+        while len(proclist) < PROCESSES:
+            proc = multiprocessing.Process(target=proc_minibatch, args=(minibatch_list,))
+            proc.start()
+            proclist.insert(0, proc)
+        proc = proclist.pop()
+        proc.join()
+    else:
+        proc_minibatch(minibatch_list)
     mb = minibatch_list.pop()
 
     # Upload & train minibatch
@@ -553,7 +580,7 @@ def train_accum_minibatch():
         ph.next_states: mb.next_states,
         ph.actions: mb.actions,
         ph.rewards: mb.rewards}
-    # imshow([mb.states[0][:,:,i].eval(feed_dict) for i in range(ADJACENT_STATES*STATE_FRAMES)])
+    # imshow([mb.states[0][:,:,i] for i in range(ADJACENT_STATES*STATE_FRAMES)])
     r = sess.run(ops.per_batch, feed_dict)
     if app.policy_index != -1:
         for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
@@ -571,7 +598,8 @@ def train_apply_gradients():
         epoch_td_error=    r[0][app.policy_index],
         global_norm_qvalue=r[1][app.policy_index],
         global_norm_policy=r[2][app.policy_index],
-        learning_rate='%.6f' % FLAGS.learning_rate))
+        learning_rate='%.6f' % FLAGS.learning_rate,
+        batches=dict(keep=FLAGS.batch_keep,async=FLAGS.batch_async)))
     os.system('clear') # Scroll up to see status
 
     if 0:#FLAGS.summary:

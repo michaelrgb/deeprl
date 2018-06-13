@@ -35,7 +35,6 @@ def clamp_weights(grads, clamp):
 def imshow(imlist):
     import matplotlib.pyplot as plt
     kwargs = {'interpolation': 'nearest'}
-    plt.close()
     if type(imlist) == np.ndarray and len(imlist.shape) == 4:
         imlist = [imlist[i] for i in range(imlist.shape[0])]
     else:
@@ -54,7 +53,7 @@ def imshow(imlist):
         ax = axarr[i] if len(imlist) > 1 else axarr
         im = ax.imshow(nparray, **kwargs)
         f.colorbar(im, ax=ax)
-    f.show()
+    plt.show() # Wait until close
 
 def gaussian_filter(kernel_size):
     x = np.zeros((kernel_size, kernel_size, 1, 1), dtype=DTYPE.name)
@@ -71,7 +70,7 @@ def gaussian_filter(kernel_size):
     weights = x / np.sum(x)
     return tf.constant(weights, DTYPE)
 
-def local_contrast_norm(x, gaussian_weights):
+def local_contrast_norm(x, gaussian_weights, scale01=False):
     # Move the input channels into the batches
     shape = tf.shape(x)
     x = tf.transpose(x, [0, 3, 1, 2])
@@ -91,9 +90,10 @@ def local_contrast_norm(x, gaussian_weights):
     local_stddev = tf.maximum(local_stddev, threshold)
     x = mean_subtracted / local_stddev
 
-    # Rescale to [0 1]
-    x = tf.maximum(x, 0.)
-    x /= tf.maximum(tf.reduce_max(x, axis=[1, 2], keep_dims=True), threshold)
+    if scale01:
+        # Rescale to [0 1]
+        x = tf.maximum(x, 0.)
+        x /= tf.maximum(tf.reduce_max(x, axis=[1, 2], keep_dims=True), threshold)
 
     # Restore the input channels
     x = tf.reshape(x, [shape[0], shape[3], shape[1], shape[2]])
