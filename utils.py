@@ -6,14 +6,16 @@ def wrapList(value):
 class Struct:
     def __init__(self, **entries): self.__dict__.update(entries)
 
-def variable_summaries(var):
-    tf.summary.scalar('min', tf.reduce_min(var))
-    tf.summary.scalar('max', tf.reduce_max(var))
-    mean = tf.reduce_mean(var)
-    tf.summary.scalar('mean', mean)
-    stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
-    tf.summary.scalar('stddev', stddev)
-    tf.summary.histogram('histogram', var)
+def variable_summaries(var, scope=None):
+    if not scope: scope = var.name.split('/')[-1].split(':')[0]
+    with tf.name_scope(scope):
+        tf.summary.scalar('min', tf.reduce_min(var))
+        tf.summary.scalar('max', tf.reduce_max(var))
+        mean = tf.reduce_mean(var)
+        tf.summary.scalar('mean', mean)
+        stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+        tf.summary.scalar('stddev', stddev)
+        tf.summary.histogram('histogram', var)
 
 def conv2d(x, W, stride=1, padding='VALID'):
     return tf.nn.conv2d(x, W, strides=[1, stride, stride, 1], padding=padding)
@@ -29,8 +31,11 @@ def scope_vars(scope_name='', key=tf.GraphKeys.TRAINABLE_VARIABLES): # '' for cu
     current = tf.contrib.framework.get_name_scope()
     if current: scope_name = current + '/' + scope_name
     return tf.get_collection(key, scope=scope_name)
-def clamp_weights(grads, clamp):
-    return [(tf.where(w > clamp, tf.abs(g), tf.where(w < -clamp, -tf.abs(g), g)), w) for g,w in grads]
+def grads_clamp(grads, max_value):
+    grads = wrapList(grads)
+    return [(tf.where(w > max_value, tf.abs(g), tf.where(w < -max_value, -tf.abs(g), g)), w) for g,w in grads]
+def grads_index(grads, name_substr):
+    return [i for i in range(len(grads)) if name_substr in grads[i][1].name]
 
 def imshow(imlist):
     import matplotlib.pyplot as plt

@@ -15,12 +15,12 @@ flags.DEFINE_integer('batch_per_async', 10, 'Batches recorded per async agent')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved raw frames')
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
-flags.DEFINE_boolean('summary', True, 'Save summaries for Tensorboard')
+flags.DEFINE_string('summary', '/tmp/tf', 'Summaries path for Tensorboard')
 flags.DEFINE_boolean('sample_action', False, 'Sample actions, or use policy')
 flags.DEFINE_boolean('quantize', True, 'Quantize actions to list')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
-flags.DEFINE_integer('minibatch', 60, 'Minibatch size')
+flags.DEFINE_integer('minibatch', 16, 'Minibatch size')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -45,7 +45,7 @@ if ENV_NAME == 'CarRacing-v0':
         [-1,0, 0],
         [-0.1, 0, 0],
         [0, 1, 0],
-        [0, 0.1, 0],
+        [0, 0.5, 0],
         [0, 0, 0],
         [0, 0, 1],
         [0, 0, 0.8],
@@ -60,11 +60,12 @@ env = gym.make(ENV_NAME)
 env._max_episode_steps = None # Disable step limit
 envu = env.unwrapped
 
-ACTION_DIM = (env.action_space.shape or [env.action_space.n])[0]
+ACTION_DIMS = (env.action_space.shape or [env.action_space.n])[0]
 ACTION_DISCRETE = not env.action_space.shape
-def onehot_vector(action_index): return [1. if action_index == i else 0. for i in range(ACTION_DIM)]
-if ACTION_DISCRETE: EVAL_ACTIONS = [onehot_vector(a) for a in range(ACTION_DIM)]
-else: EVAL_ACTIONS = QUANT_ACTIONS
+def onehot_vector(action_index): return [1. if action_index == i else 0. for i in range(ACTION_DIMS)]
+if ACTION_DISCRETE: MULTI_ACTIONS = [onehot_vector(a) for a in range(ACTION_DIMS)]
+else: MULTI_ACTIONS = QUANT_ACTIONS
+MULTI_ACTIONS = tf.expand_dims(tf.constant(MULTI_ACTIONS, DTYPE), 0)
 POLICY_SOFTMAX = ACTION_DISCRETE
 FRAME_DIM = list(env.observation_space.shape)
 
@@ -74,7 +75,7 @@ if CONV_NET:
     if STATE_DIM[-1] == 3:
         STATE_DIM[-1] = 1
     FRAME_LCN = True
-    RESIZE = [96, 96]
+    RESIZE = [64, 64]
     if RESIZE:
         STATE_DIM[:2] = RESIZE
 STATE_DIM[-1] *= STATE_FRAMES
@@ -93,7 +94,7 @@ def batch_paths(batch_num, path=None):
 
 REWARDS_GLOBAL = REWARDS_ALL = 1
 def mmap_batch(paths, mode, only_actions=False, states=True, rawframes=True):
-    batch = Struct(actions=np.memmap(paths['actions'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_DIM)))
+    batch = Struct(actions=np.memmap(paths['actions'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_DIMS)))
     if only_actions:
         return batch.actions
     batch.rewards = np.memmap(paths['rewards'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, REWARDS_GLOBAL))
@@ -109,7 +110,7 @@ def mmap_batch(paths, mode, only_actions=False, states=True, rawframes=True):
 ph = Struct(learning_rate=tf.placeholder(DTYPE, ()),
     states=tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM),
     next_states=tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM),
-    actions=tf.placeholder(DTYPE, [FLAGS.minibatch, ACTION_DIM]),
+    actions=tf.placeholder(DTYPE, [FLAGS.minibatch, ACTION_DIMS]),
     rewards=tf.placeholder(DTYPE, [FLAGS.minibatch, REWARDS_GLOBAL]),
     frame=tf.placeholder(DTYPE, [1, STATE_FRAMES] + FRAME_DIM))
 
@@ -148,11 +149,11 @@ def accum_value(value):
     return accum
 def accum_gradient(grads, opt):
     global_norm = None
-    grads, vars = zip(*grads)
+    grads, weights = zip(*grads)
     grads = [accum_value(g) for g in grads]
     # Clip gradients by global norm to prevent destabilizing policy
     grads,global_norm = tf.clip_by_global_norm(grads, 10.)
-    grads = zip(grads, vars)
+    grads = zip(grads, weights)
     ops.per_epoch.append(opt.apply_gradients(grads))
     return global_norm
 
@@ -170,8 +171,10 @@ gradient_override.counter = 0
 
 def layer_batch_norm(x):
     _scope = tf.contrib.framework.get_name_scope()
-    norm = tf.layers.BatchNormalization(_scope=_scope)
-    return [norm.apply(x[i], training=i==layer_batch_norm.training_idx) for i in range(len(x))]
+    norm = tf.layers.BatchNormalization(_scope=_scope, center=False, scale=False)
+    x = [norm.apply(x[i], training=i==layer_batch_norm.training_idx) for i in range(len(x))]
+    for w in norm.weights: variable_summaries(w)
+    return x
 
 def make_conv_net(x):
     LAYERS = [
@@ -183,30 +186,29 @@ def make_conv_net(x):
     for l in range(len(LAYERS) if CONV_NET else 0):
         filters, width, stride = LAYERS[l]
         with tf.name_scope('conv'):
-            _scope = tf.contrib.framework.get_name_scope()
             x = layer_batch_norm(x)
-            conv = tf.layers.Conv2D(filters, width, stride, activation=tf.nn.relu, _scope=_scope)
+            _scope = tf.contrib.framework.get_name_scope()
+            conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, activation=tf.nn.relu, _scope=_scope)
             x = [conv.apply(n) for n in x]
+            for w in conv.weights: variable_summaries(w)
         print(x[0].shape)
     x = [tf.layers.flatten(n) for n in x]
     print(x[0].shape)
     return x
 
-def layer_dense(x, outputs, activation=tf.nn.relu, norm=True):
-    with tf.name_scope('dense'):
-        _scope = tf.contrib.framework.get_name_scope()
-        if norm:
-            x = layer_batch_norm(x)
-        if outputs:
-            dense = tf.layers.Dense(outputs, activation, _scope=_scope)
-            x = [dense.apply(n) for n in x]
-        return x
+def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False):
+    if norm: x = layer_batch_norm(x)
+    _scope = tf.contrib.framework.get_name_scope()
+    dense = tf.layers.Dense(outputs, use_bias=use_bias, activation=activation, _scope=_scope)
+    x = [dense.apply(n) for n in x]
+    for w in dense.weights: variable_summaries(w)
+    return x
 
 def layer_lstm(x):
     cell = rnn.LSTMCell(LSTM_NODES, use_peepholes=True, activation=tf.nn.sigmoid)
+    x = layer_batch_norm(x)
     with tf.name_scope('lstm'):
         scope = tf.contrib.framework.get_name_scope()
-        x = layer_batch_norm(x)
         with tf.name_scope(str(FLAGS.async)):
             lstm_state_c = []
             lstm_state_h = []
@@ -233,11 +235,13 @@ def layer_lstm(x):
             [ops.post_minibatch, ops.post_step][i] += [vars[c].assign(final_state[c]) for c in range(2)]
             if not i:
                 ops.new_batches += [vars[c].assign(tf.zeros_like(vars[c])) for c in range(2)]
+
+        for w in cell.weights: variable_summaries(w)
     return x
 
 GAMMA = 0.99
-HIDDEN_1, HIDDEN_2 = 400, 300
-LSTM_NODES = HIDDEN_2
+HIDDEN1, HIDDEN2 = (200,200) if CONV_NET else (400,300)
+LSTM_NODES = HIDDEN2
 opt_td = tf.train.AdamOptimizer(ph.learning_rate)
 opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10)
 
@@ -247,19 +251,27 @@ def make_acrl():
     ac = Struct()
     allac.append(ac)
     def make_shared(x):
-        return layer_dense(make_conv_net(x), HIDDEN_1)
+        x = make_conv_net(x)
+        with tf.name_scope('hidden1'):
+            x = layer_dense(x, HIDDEN1)
+        with tf.name_scope('hidden2'):
+            x = layer_lstm(x) if 1 else layer_dense(x, HIDDEN2)
+        return x
 
     layer_batch_norm.training_idx = 0
     def make_policy(x):
         x = make_shared(x)
-        x = layer_lstm(x) if 1 else layer_dense(x, HIDDEN_2)
-        if POLICY_SOFTMAX:
-            policy = layer_dense(x, ACTION_DIM, tf.nn.softmax)
-        elif 0:
-            policy = layer_dense(x, ACTION_DIM, tf.tanh)
-        else:
-            policy = layer_dense(x, ACTION_DIM*2, tf.nn.sigmoid)
-            policy = [n[:,:ACTION_DIM]-n[:,ACTION_DIM:] for n in policy]
+        with tf.name_scope('output'):
+            softmax_dims = ACTION_DIMS if POLICY_SOFTMAX else 0#len(QUANT_ACTIONS)
+            if softmax_dims:
+                policy = layer_dense(x, softmax_dims, tf.nn.softmax)
+                if QUANT_ACTIONS: policy = [tf.reduce_sum(tf.expand_dims(n, -1)*MULTI_ACTIONS, 1) for n in policy]
+            else:
+                policy = layer_dense(x, ACTION_DIMS, None)
+                if ENV_NAME == 'CarRacing-v0':
+                    policy = [tf.concat([tf.tanh(n[:,:1]), tf.nn.sigmoid(n[:,1:])], 1) for n in policy]
+                else:
+                    policy = [tf.tanh(n) for n in policy]
         return policy
     with tf.name_scope('policy'):
         [ac.policy, ac.ph_policy] = make_policy([ph.states, frame_to_state])
@@ -268,10 +280,9 @@ def make_acrl():
             [tf.reduce_max(ac.policy, axis=0)]], axis=0))
 
     def multi_actions_pre(idx, batch_size=FLAGS.minibatch, include_policy=True):
-        if not EVAL_ACTIONS: return
-        a = tf.expand_dims(tf.constant(EVAL_ACTIONS, DTYPE), 0)
-        a = tf.tile(a, [batch_size, 1, 1])
-        num_actions = len(EVAL_ACTIONS)
+        num_actions = int(MULTI_ACTIONS.shape[1])
+        if not num_actions: return
+        a = tf.tile(MULTI_ACTIONS, [batch_size, 1, 1])
         if include_policy:
             num_actions += 1
             policy_action = tf.expand_dims(actions[idx], 1)
@@ -284,27 +295,37 @@ def make_acrl():
         net[idx],actions[idx] = n,a
         return action_combis
     def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
-        if not EVAL_ACTIONS: return n
+        num_actions = int(MULTI_ACTIONS.shape[1])
+        if not num_actions: return
         n = tf.reshape(n, [batch_size, int(n.shape[0])/batch_size])
         n = tf.reduce_max(n, 1) if reduce_max else n
         return n
 
-    def make_value_pre(x):
-        x = make_shared([ph.states, frame_to_state])
-        x = layer_dense(x, HIDDEN_2)
-        x = layer_lstm(x) if 1 else layer_dense(x, HIDDEN_2)
-        return x
-    def make_value_post(x, actions):
-        a = layer_dense(actions, x[0].shape[1], None, norm=False)
-        x = [n*a for n,a in zip(x, a)]
-        return [n[:,0] for n in layer_dense(x, 1, None, norm=False)]
+    def make_value_output(hidden, actions):
+        kwds = dict(activation=None, norm=False)
+        with tf.name_scope('output'):
+            with tf.name_scope('actions'):
+                a = [tf.concat([
+                    (1-tf.abs(a))**2,
+                    tf.where(a>0., a**2, tf.zeros_like(a)),
+                    tf.where(a<0., a**2, tf.zeros_like(a))
+                    ], 1) for a in actions]
+                a1 = layer_dense(a, HIDDEN2, **kwds)
+            with tf.name_scope('actions'):
+                a2 = layer_dense(a, HIDDEN2, **kwds)
+            with tf.name_scope('combined'):
+                combined = [n*a1*a2 for n,a1,a2 in zip(hidden, a1, a2)]
+                combined = layer_dense(combined, 1, **kwds)
+            with tf.name_scope('bias'):
+                bias = layer_dense(hidden, 1, **kwds)
+            return [c[:,0]+b[:,0] for c,b in zip(combined, bias)]
 
     with tf.name_scope('value'):
-        net = make_value_pre([ph.states, frame_to_state])
+        net = make_shared([ph.states, frame_to_state])
         net = [net[0], net[0], net[1]]
         actions = [ac.policy, ph.actions, ac.ph_policy]
         multi_actions_pre(2, 1)
-        [ac.state_value, ac.q_value, ph_policy_value] = make_value_post(net, actions)
+        [ac.state_value, ac.q_value, ph_policy_value] = make_value_output(net, actions)
         # Q for all actions in agent's current state
         ac.ph_policy_value = multi_actions_post(ph_policy_value, 1)
 
@@ -315,20 +336,21 @@ def make_acrl():
     with tf.name_scope('_policy'):
         next_state_policy = make_policy([ph.next_states])
     with tf.name_scope('_value'):
-        net = make_value_pre([ph.next_states])
-        [next_state_value] = make_value_post(net, next_state_policy)
+        net = make_shared([ph.next_states])
+        [next_state_value] = make_value_output(net, next_state_policy)
 
     ac.q_grad = tf.gradients(ac.state_value, ac.policy)[0]
     repl = gradient_override(ac.policy, ac.q_grad)
-    grad = opt_policy.compute_gradients(repl, scope_vars('policy'))
-    ac.global_norm_policy = accum_gradient(grad, opt_policy)
+    grads = opt_policy.compute_gradients(repl, scope_vars('policy'))
+    ac.global_norm_policy = accum_gradient(grads, opt_policy)
 
     ac.step_1 = ph.rewards[:,r] + GAMMA*next_state_value
     ac.td_error = ac.step_1 - ac.q_value
 
     repl = gradient_override(ac.q_value, ac.td_error)
-    grad = opt_td.compute_gradients(repl, scope_vars('value'))
-    ac.global_norm_qvalue = accum_gradient(grad, opt_td)
+    grads = opt_td.compute_gradients(repl, scope_vars('value'))
+    ac.global_norm_qvalue = accum_gradient(grads, opt_td)
+
     copy_vars = zip(
         # Include moving_mean/variance, which are not TRAINABLE_VARIABLES
         scope_vars('_value', tf.GraphKeys.GLOBAL_VARIABLES),
@@ -342,7 +364,7 @@ def make_acrl():
     stats.td_error.append(tf.reduce_sum(ac.td_error**2))
 
 for r in range(REWARDS_ALL):
-    with tf.name_scope('ac_%i' %r): make_acrl()
+    with tf.name_scope('ac'): make_acrl()
 
 state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
                count=0, last_obs=None, last_pos_reward=0,
@@ -352,7 +374,7 @@ envu.isRender = True # pybullet-gym
 env.reset(); env.render()# Gym needs at least 1 reset&render before valid observation
 def setup_key_actions():
     from pyglet.window import key
-    a = np.array([0.]*max(3, ACTION_DIM))
+    a = np.array([0.]*max(3, ACTION_DIMS))
 
     def settings_caption():
         d = dict(async=FLAGS.async,
@@ -411,17 +433,17 @@ def step_to_frames():
     def choose_action(value): # Choose from Q-values or softmax policy
         return np.random.choice(value.shape[0], p=softmax(value)) if FLAGS.sample_action else np.argmax(value)
 
-    a = action.keyboard[:ACTION_DIM].copy()
+    a = action.keyboard[:ACTION_DIMS].copy()
     if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1.))
 
     if state.count > 0 and app.policy_index != -1:
         a = action.policy.copy()
         if 0:#not ACTION_DISCRETE:
             idx = choose_action(action.policy_value) if FLAGS.sample_action else 0
-            a = ([action.policy] + EVAL_ACTIONS)[idx]
+            a = ([action.policy] + MULTI_ACTIONS)[idx]
     if FLAGS.sample_action:
         np.random.seed(0)
-        offset = np.array([math.sin(2*math.pi*(r + 8./(1+state.count))) for r in np.random.rand(ACTION_DIM)])
+        offset = np.array([math.sin(2*math.pi*(r + 8./(1+state.count))) for r in np.random.rand(ACTION_DIMS)])
         a = np.clip(a+offset, -1, 1.)
 
     if FLAGS.quantize and QUANT_ACTIONS:
@@ -456,7 +478,7 @@ def step_to_frames():
             # Mountain car env doesnt give any +reward
             reward = 1. if state.done else 0.
         elif ENV_NAME == 'CarRacing-v0':
-            if state.last_reset > 100 and state.last_pos_reward > 40:
+            if state.last_reset > 100 and state.last_pos_reward > 50:
                 state.done = True # Reset track if spinning
                 reward = -100
         state.last_pos_reward = 0 if reward>0. or state.done else state.last_pos_reward+1
@@ -525,8 +547,10 @@ def append_to_batch():
         state.count = 0
 
 if not FLAGS.async:
+    epoch_td_error = accum_value(tf.concat([stats.td_error], 0))
+    #variable_summaries(epoch_td_error, 'td_error')
     ops.per_epoch = [
-        accum_value(tf.concat([stats.td_error], 0)),
+        epoch_td_error,
         tf.concat([[ac.global_norm_qvalue] for ac in allac], 0),
         tf.concat([[ac.global_norm_policy] for ac in allac], 0),
     ] + ops.per_epoch
@@ -539,9 +563,9 @@ if not FLAGS.async:
         ops.per_minibatch.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
 
     if FLAGS.summary:
+        train_writer = tf.summary.FileWriter(FLAGS.summary, sess.graph)
         merged = tf.summary.merge_all()
-        #ops.per_epoch += [merged]
-        train_writer = tf.summary.FileWriter('/tmp/tf', sess.graph)
+        ops.per_epoch.append(merged)
 
 manager = multiprocessing.Manager()
 batch_sets = manager.list()
@@ -563,7 +587,7 @@ proclist = []
 mb = Struct(
     states = np.zeros([FLAGS.minibatch] + STATE_DIM),
     next_states = np.zeros([FLAGS.minibatch] + STATE_DIM),
-    actions=np.zeros([FLAGS.minibatch, ACTION_DIM]),
+    actions=np.zeros([FLAGS.minibatch, ACTION_DIMS]),
     rewards=np.zeros([FLAGS.minibatch, REWARDS_GLOBAL]))
 def make_minibatch(): # Each minibatch is random subset of batch trajectories
     if make_minibatch.current_step == 0:
@@ -610,7 +634,6 @@ def train_accum_minibatch():
 
 def train_apply_gradients():
     r = sess.run(ops.per_epoch, feed_dict={ph.learning_rate: FLAGS.learning_rate})
-    #w = scope_vars('ac_0/_value/dense', tf.GraphKeys.GLOBAL_VARIABLES)[3]; print(w, w.eval()[:10])
     app.epoch_count += 1
     sess.run(ops.post_epoch)
     pprint(dict(
@@ -619,11 +642,11 @@ def train_apply_gradients():
         epoch_td_error=    r[0][app.policy_index],
         global_norm_qvalue=r[1][app.policy_index],
         global_norm_policy=r[2][app.policy_index],
-        learning_rate='%.6f' % FLAGS.learning_rate,
+        rates=dict(learning_rate=FLAGS.learning_rate, tau=FLAGS.tau),
         batches=dict(keep=FLAGS.batch_keep,async=FLAGS.batch_async,minibatch=FLAGS.minibatch)))
     os.system('clear') # Scroll up to see status
 
-    if 0:#FLAGS.summary:
+    if FLAGS.summary and not app.epoch_count%100:
         summary = r[-1]
         train_writer.add_summary(summary, app.epoch_count)
 
