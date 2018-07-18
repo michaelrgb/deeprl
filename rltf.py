@@ -20,7 +20,8 @@ flags.DEFINE_boolean('sample_action', False, 'Sample actions, or use policy')
 flags.DEFINE_boolean('quantize', True, 'Quantize actions to list')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
-flags.DEFINE_integer('minibatch', 16, 'Minibatch size')
+flags.DEFINE_float('gamma', 0.99, 'Discount rate')
+flags.DEFINE_integer('minibatch', 40, 'Minibatch size')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -75,7 +76,7 @@ if CONV_NET:
     if STATE_DIM[-1] == 3:
         STATE_DIM[-1] = 1
     FRAME_LCN = True
-    RESIZE = [64, 64]
+    RESIZE = [96, 96]
     if RESIZE:
         STATE_DIM[:2] = RESIZE
 STATE_DIM[-1] *= STATE_FRAMES
@@ -171,17 +172,16 @@ gradient_override.counter = 0
 
 def layer_batch_norm(x):
     _scope = tf.contrib.framework.get_name_scope()
-    norm = tf.layers.BatchNormalization(_scope=_scope, center=False, scale=False)
+    norm = tf.layers.BatchNormalization(_scope=_scope, scale=True, center=False)
     x = [norm.apply(x[i], training=i==layer_batch_norm.training_idx) for i in range(len(x))]
     for w in norm.weights: variable_summaries(w)
     return x
 
 def make_conv_net(x):
     LAYERS = [
-        # DQN & A3C
         (32, 8, 4),
-        (64, 4, 2),
-        (64, 3, 1)]
+        (32, 4, 2),
+        (32, 3, 1)]
     print(x[0].shape)
     for l in range(len(LAYERS) if CONV_NET else 0):
         filters, width, stride = LAYERS[l]
@@ -204,42 +204,39 @@ def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False):
     for w in dense.weights: variable_summaries(w)
     return x
 
-def layer_lstm(x):
-    cell = rnn.LSTMCell(LSTM_NODES, use_peepholes=True, activation=tf.nn.sigmoid)
+def layer_lstm(x, ac):
+    cell = rnn.LSTMCell(LSTM_NODES, use_peepholes=True)
     x = layer_batch_norm(x)
     with tf.name_scope('lstm'):
         scope = tf.contrib.framework.get_name_scope()
-        with tf.name_scope(str(FLAGS.async)):
-            lstm_state_c = []
-            lstm_state_h = []
-            for n in x:
-                batch_size = n.shape[0]
-                vars = [tf.Variable(s, trainable=False, collections=[None]) for s in cell.zero_state(batch_size, DTYPE)]
-                sess.run(tf.variables_initializer(vars))
-                lstm_state_c.append(vars[0])
-                lstm_state_h.append(vars[1])
-
-        if 1: lstm_state_c_norm, lstm_state_h_norm = lstm_state_c, lstm_state_h
-        else:
-            with tf.name_scope('c_norm'):
-                lstm_state_c_norm = layer_batch_norm(lstm_state_c)
-            lstm_state_h_norm = [tf.identity(n) for n in lstm_state_h] # float32_ref -> float32
-
         for i in range(len(x)):
-            lstm_tuple = tf.contrib.rnn.LSTMStateTuple(lstm_state_c_norm[i], lstm_state_h_norm[i])
+            create_initial_state = i==0
+            is_async = create_initial_state and not layer_lstm.is_target_network
+            if create_initial_state:
+                with tf.name_scope(str(FLAGS.async)):
+                    batch_size = x[i].shape[0]
+                    vars = [tf.Variable(s, trainable=False, collections=[None]) for s in cell.zero_state(batch_size, DTYPE)]
+                    sess.run(tf.variables_initializer(vars))
+                    initial_state = tf.contrib.rnn.LSTMStateTuple(*vars)
+            elif layer_lstm.is_target_network:
+                initial_state = final_state
+            else:
+                initial_state = ac.target_initial_state[scope]
+
             x[i] = tf.expand_dims(x[i], 1) # [batch_size, max_time (i.e. 1), ...],
-            output, final_state = tf.nn.dynamic_rnn(cell, x[i], initial_state=lstm_tuple, scope=scope)
+            output, final_state = tf.nn.dynamic_rnn(cell, x[i], initial_state=initial_state, scope=scope)
             x[i] = output[:,0,:]
 
-            vars = [lstm_state_c[i], lstm_state_h[i]]
-            [ops.post_minibatch, ops.post_step][i] += [vars[c].assign(final_state[c]) for c in range(2)]
-            if not i:
-                ops.new_batches += [vars[c].assign(tf.zeros_like(vars[c])) for c in range(2)]
+            if create_initial_state:
+                [ops.post_minibatch, ops.post_step][is_async] += [initial_state[c].assign(final_state[c]) for c in range(2)]
+                if not is_async:
+                    ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
+                    # Save the final_state to be used by the other network
+                    ac.target_initial_state[scope.replace('/_', '/')] = final_state
 
         for w in cell.weights: variable_summaries(w)
     return x
 
-GAMMA = 0.99
 HIDDEN1, HIDDEN2 = (200,200) if CONV_NET else (400,300)
 LSTM_NODES = HIDDEN2
 opt_td = tf.train.AdamOptimizer(ph.learning_rate)
@@ -248,17 +245,16 @@ opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10)
 allac = []
 stats = Struct(reward_sum=[], td_error=[], _policy_minmax=[])
 def make_acrl():
-    ac = Struct()
+    ac = Struct(target_initial_state={})
     allac.append(ac)
     def make_shared(x):
         x = make_conv_net(x)
         with tf.name_scope('hidden1'):
             x = layer_dense(x, HIDDEN1)
         with tf.name_scope('hidden2'):
-            x = layer_lstm(x) if 1 else layer_dense(x, HIDDEN2)
+            x = layer_lstm(x, ac) if 1 else layer_dense(x, HIDDEN2)
         return x
 
-    layer_batch_norm.training_idx = 0
     def make_policy(x):
         x = make_shared(x)
         with tf.name_scope('output'):
@@ -266,6 +262,9 @@ def make_acrl():
             if softmax_dims:
                 policy = layer_dense(x, softmax_dims, tf.nn.softmax)
                 if QUANT_ACTIONS: policy = [tf.reduce_sum(tf.expand_dims(n, -1)*MULTI_ACTIONS, 1) for n in policy]
+            elif 1:
+                policy = layer_dense(x, 2*ACTION_DIMS, tf.nn.sigmoid)
+                policy = [n[:,:ACTION_DIMS]-n[:,ACTION_DIMS:] for n in policy]
             else:
                 policy = layer_dense(x, ACTION_DIMS, None)
                 if ENV_NAME == 'CarRacing-v0':
@@ -273,11 +272,6 @@ def make_acrl():
                 else:
                     policy = [tf.tanh(n) for n in policy]
         return policy
-    with tf.name_scope('policy'):
-        [ac.policy, ac.ph_policy] = make_policy([ph.states, frame_to_state])
-        stats._policy_minmax.append(tf.concat([
-            [tf.reduce_min(ac.policy, axis=0)],
-            [tf.reduce_max(ac.policy, axis=0)]], axis=0))
 
     def multi_actions_pre(idx, batch_size=FLAGS.minibatch, include_policy=True):
         num_actions = int(MULTI_ACTIONS.shape[1])
@@ -302,49 +296,67 @@ def make_acrl():
         return n
 
     def make_value_output(hidden, actions):
-        kwds = dict(activation=None, norm=False)
         with tf.name_scope('output'):
-            with tf.name_scope('actions'):
-                a = [tf.concat([
-                    (1-tf.abs(a))**2,
-                    tf.where(a>0., a**2, tf.zeros_like(a)),
-                    tf.where(a<0., a**2, tf.zeros_like(a))
-                    ], 1) for a in actions]
-                a1 = layer_dense(a, HIDDEN2, **kwds)
-            with tf.name_scope('actions'):
-                a2 = layer_dense(a, HIDDEN2, **kwds)
+            if not ACTION_DISCRETE:
+                actions = [tf.expand_dims(a, -1) for a in actions]
+                actions = [tf.concat([a, -a, 1.-tf.abs(a)], -1) for a in actions]
+                TEMP = 1.
+                actions = [tf.nn.softmax(TEMP*a) for a in actions]
+                actions = [tf.reshape(a, [-1, ACTION_DIMS*3]) for a in actions]
+            combined = layer_batch_norm(hidden)
+            for i in range(3):
+                with tf.name_scope('actions'):
+                    a1 = layer_dense(actions, HIDDEN2, None, norm=False)
+                    combined = [n*a for n,a in zip(combined, a1)]
             with tf.name_scope('combined'):
-                combined = [n*a1*a2 for n,a1,a2 in zip(hidden, a1, a2)]
-                combined = layer_dense(combined, 1, **kwds)
-            with tf.name_scope('bias'):
-                bias = layer_dense(hidden, 1, **kwds)
-            return [c[:,0]+b[:,0] for c,b in zip(combined, bias)]
+                #combined = [tf.nn.relu(n) for n in combined]
+                combined = layer_dense(combined, 1, None, norm=False)
+                return [c[:,0] for c in combined]
+
+    layer_batch_norm.training_idx = -1 # No UPDATE_OPS for target network
+    layer_lstm.is_target_network = True
+    if not FLAGS.async:
+        state_inputs = [ph.states, ph.next_states]
+        with tf.name_scope('_policy'):
+            target_policy = make_policy(state_inputs)
+        with tf.name_scope('_value'):
+            net = make_shared(state_inputs)
+            [_, next_state_value] = make_value_output(net, target_policy)
+    layer_lstm.is_target_network = False
+
+    layer_batch_norm.training_idx = 1
+    state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states])
+    with tf.name_scope('policy'):
+        x = make_policy(state_inputs)
+        if FLAGS.async: [ac.ph_policy] = x
+        else: [ac.ph_policy, ac.policy] = x
 
     with tf.name_scope('value'):
-        net = make_shared([ph.states, frame_to_state])
-        net = [net[0], net[0], net[1]]
-        actions = [ac.policy, ph.actions, ac.ph_policy]
-        multi_actions_pre(2, 1)
-        [ac.state_value, ac.q_value, ph_policy_value] = make_value_output(net, actions)
+        net = make_shared(state_inputs)
+        if FLAGS.async:
+            actions = [ac.ph_policy]
+        else:
+            net = [net[0], net[1], net[1]]
+            actions = [ac.ph_policy, ac.policy, ph.actions]
+        multi_actions_pre(0, 1)
+
+        net = make_value_output(net, actions)
+        if FLAGS.async:
+            [ph_policy_value] = net
+        else:
+            [ph_policy_value, ac.state_value, ac.q_value] = net
         # Q for all actions in agent's current state
         ac.ph_policy_value = multi_actions_post(ph_policy_value, 1)
 
     if FLAGS.async:
         return
 
-    layer_batch_norm.training_idx = -1 # No UPDATE_OPS for target network
-    with tf.name_scope('_policy'):
-        next_state_policy = make_policy([ph.next_states])
-    with tf.name_scope('_value'):
-        net = make_shared([ph.next_states])
-        [next_state_value] = make_value_output(net, next_state_policy)
-
     ac.q_grad = tf.gradients(ac.state_value, ac.policy)[0]
     repl = gradient_override(ac.policy, ac.q_grad)
     grads = opt_policy.compute_gradients(repl, scope_vars('policy'))
     ac.global_norm_policy = accum_gradient(grads, opt_policy)
 
-    ac.step_1 = ph.rewards[:,r] + GAMMA*next_state_value
+    ac.step_1 = ph.rewards[:,r] + FLAGS.gamma*next_state_value
     ac.td_error = ac.step_1 - ac.q_value
 
     repl = gradient_override(ac.q_value, ac.td_error)
@@ -362,6 +374,9 @@ def make_acrl():
 
     stats.reward_sum.append(tf.reduce_sum(ph.rewards[:,r]))
     stats.td_error.append(tf.reduce_sum(ac.td_error**2))
+    stats._policy_minmax.append(tf.concat([
+        [tf.reduce_min(ac.policy, axis=0)],
+        [tf.reduce_max(ac.policy, axis=0)]], axis=0))
 
 for r in range(REWARDS_ALL):
     with tf.name_scope('ac'): make_acrl()
