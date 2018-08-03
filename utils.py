@@ -77,7 +77,7 @@ def gaussian_filter(kernel_size):
 
 def local_contrast_norm(x, gaussian_weights, scale01=False):
     # Move the input channels into the batches
-    shape = tf.shape(x)
+    shape = x.shape.as_list()
     x = tf.transpose(x, [0, 3, 1, 2])
     x = tf.reshape(x, [shape[0]*shape[3], shape[1], shape[2], 1])
 
@@ -86,7 +86,7 @@ def local_contrast_norm(x, gaussian_weights, scale01=False):
     mean_subtracted = x - mean
 
     # Calculate local standard deviation
-    local_stddev = tf.sqrt(conv2d(mean_subtracted**2, gaussian_weights, padding='SAME'))
+    local_stddev = tf.sqrt(tf.maximum(0., conv2d(mean_subtracted**2, gaussian_weights, padding='SAME')))
 
     # Lower gives more noise in areas of low contrast, i.e. non-edges
     threshold = 1e-1

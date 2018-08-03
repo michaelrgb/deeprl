@@ -9,19 +9,21 @@ from pprint import pprint
 
 flags = tf.app.flags
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
-flags.DEFINE_integer('batch_keep', 5, 'Batches recorded from user actions')
-flags.DEFINE_integer('batch_async', 10, 'Batches to wait for from async agents')
+flags.DEFINE_integer('batch_keep', 6, 'Batches recorded from user actions')
+flags.DEFINE_integer('batch_async', 100, 'Batches to wait for from async agents')
 flags.DEFINE_integer('batch_per_async', 10, 'Batches recorded per async agent')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved raw frames')
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
 flags.DEFINE_string('summary', '/tmp/tf', 'Summaries path for Tensorboard')
-flags.DEFINE_boolean('sample_action', False, 'Sample actions, or use policy')
-flags.DEFINE_boolean('quantize', True, 'Quantize actions to list')
+flags.DEFINE_string('env_seed', '', 'Seed number for new environment')
+flags.DEFINE_boolean('quantize', False, 'Quantize actions to list')
+flags.DEFINE_float('sample_action', 0., 'Sample actions, or use policy')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
 flags.DEFINE_float('gamma', 0.99, 'Discount rate')
-flags.DEFINE_integer('minibatch', 40, 'Minibatch size')
+flags.DEFINE_float('decay', 0.01, 'Q-network L2 weight decay')
+flags.DEFINE_integer('minibatch', 20, 'Minibatch size')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -73,10 +75,13 @@ FRAME_DIM = list(env.observation_space.shape)
 CONV_NET = len(FRAME_DIM) == 3
 STATE_DIM = FRAME_DIM[:]
 if CONV_NET:
-    if STATE_DIM[-1] == 3:
+    FRAME_LCN = False
+    GRAYSCALE = True
+    if GRAYSCALE and STATE_DIM[-1] == 3:
         STATE_DIM[-1] = 1
-    FRAME_LCN = True
-    RESIZE = [96, 96]
+    CHANNELS = STATE_DIM[-1]
+
+    RESIZE = [84, 84]
     if RESIZE:
         STATE_DIM[:2] = RESIZE
 STATE_DIM[-1] *= STATE_FRAMES
@@ -123,9 +128,10 @@ if CONV_NET:
         frame_to_state = local_contrast_norm(frame_to_state, GAUSS_W)
         frame_to_state = tf.reduce_max(frame_to_state, axis=-1)
     else:
-        frame_to_state = tf.reduce_mean(frame_to_state/255., axis=-1) # Convert to grayscale
-    frame_to_state = tf.reshape(frame_to_state, [1, STATE_FRAMES] + STATE_DIM[:-1])
-    frame_to_state = tf.transpose(frame_to_state, [0, 2, 3, 1]) # Move STATE_FRAMES into channels
+        if GRAYSCALE: frame_to_state = tf.reduce_mean(frame_to_state, axis=-1, keep_dims=True)
+        frame_to_state = frame_to_state/255.
+    frame_to_state = tf.transpose(frame_to_state, [1, 2, 0, 3])# Move STATE_FRAMES into channels
+    frame_to_state = tf.reshape(frame_to_state, [1] + STATE_DIM)
 else:
     frame_to_state = tf.reshape(ph.frame, [1] + STATE_DIM)
 
@@ -172,18 +178,21 @@ gradient_override.counter = 0
 
 def layer_batch_norm(x):
     _scope = tf.contrib.framework.get_name_scope()
-    norm = tf.layers.BatchNormalization(_scope=_scope, scale=True, center=False)
+    norm = tf.layers.BatchNormalization(_scope=_scope, scale=False, center=False)
     x = [norm.apply(x[i], training=i==layer_batch_norm.training_idx) for i in range(len(x))]
     for w in norm.weights: variable_summaries(w)
     return x
 
 def make_conv_net(x):
+    print(x[0].shape)
+    if not CONV_NET:
+        return x
+
     LAYERS = [
         (32, 8, 4),
         (32, 4, 2),
         (32, 3, 1)]
-    print(x[0].shape)
-    for l in range(len(LAYERS) if CONV_NET else 0):
+    for l in range(len(LAYERS)):
         filters, width, stride = LAYERS[l]
         with tf.name_scope('conv'):
             x = layer_batch_norm(x)
@@ -196,10 +205,10 @@ def make_conv_net(x):
     print(x[0].shape)
     return x
 
-def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False):
+def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False, trainable=True):
     if norm: x = layer_batch_norm(x)
     _scope = tf.contrib.framework.get_name_scope()
-    dense = tf.layers.Dense(outputs, use_bias=use_bias, activation=activation, _scope=_scope)
+    dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable, _scope=_scope)
     x = [dense.apply(n) for n in x]
     for w in dense.weights: variable_summaries(w)
     return x
@@ -237,7 +246,7 @@ def layer_lstm(x, ac):
         for w in cell.weights: variable_summaries(w)
     return x
 
-HIDDEN1, HIDDEN2 = (200,200) if CONV_NET else (400,300)
+HIDDEN1, HIDDEN2 = (500,500)
 LSTM_NODES = HIDDEN2
 opt_td = tf.train.AdamOptimizer(ph.learning_rate)
 opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10)
@@ -247,47 +256,44 @@ stats = Struct(reward_sum=[], td_error=[], _policy_minmax=[])
 def make_acrl():
     ac = Struct(target_initial_state={})
     allac.append(ac)
-    def make_shared(x):
+    def make_shared(x, use_lstm=False):
         x = make_conv_net(x)
         with tf.name_scope('hidden1'):
             x = layer_dense(x, HIDDEN1)
         with tf.name_scope('hidden2'):
-            x = layer_lstm(x, ac) if 1 else layer_dense(x, HIDDEN2)
+            x = layer_lstm(x, ac) if use_lstm else layer_dense(x, HIDDEN2)
         return x
 
     def make_policy(x):
         x = make_shared(x)
         with tf.name_scope('output'):
-            softmax_dims = ACTION_DIMS if POLICY_SOFTMAX else 0#len(QUANT_ACTIONS)
-            if softmax_dims:
-                policy = layer_dense(x, softmax_dims, tf.nn.softmax)
-                if QUANT_ACTIONS: policy = [tf.reduce_sum(tf.expand_dims(n, -1)*MULTI_ACTIONS, 1) for n in policy]
-            elif 1:
-                policy = layer_dense(x, 2*ACTION_DIMS, tf.nn.sigmoid)
-                policy = [n[:,:ACTION_DIMS]-n[:,ACTION_DIMS:] for n in policy]
+            if POLICY_SOFTMAX:
+                policy = layer_dense(x, ACTION_DIMS, tf.nn.softmax)
+            elif ENV_NAME == 'CarRacing-v0':
+                policy = layer_dense(x, ACTION_DIMS*2+1, None)
+                policy = [tf.stack([
+                    tf.nn.sigmoid(n[:,0])*(0.2+tf.nn.sigmoid(n[:,1])*0.8)*tf.tanh(n[:,6]),
+                    tf.nn.sigmoid(n[:,2])*(0.2+tf.nn.sigmoid(n[:,3])*0.8),
+                    tf.nn.sigmoid(n[:,4])*(0.2+tf.nn.sigmoid(n[:,5])*0.3),
+                    ], 1) for n in policy]
             else:
-                policy = layer_dense(x, ACTION_DIMS, None)
-                if ENV_NAME == 'CarRacing-v0':
-                    policy = [tf.concat([tf.tanh(n[:,:1]), tf.nn.sigmoid(n[:,1:])], 1) for n in policy]
-                else:
-                    policy = [tf.tanh(n) for n in policy]
+                policy = layer_dense(x, ACTION_DIMS, tf.tanh)
         return policy
 
-    def multi_actions_pre(idx, batch_size=FLAGS.minibatch, include_policy=True):
+    def multi_actions_pre(net, actions, batch_size=FLAGS.minibatch, include_policy=True):
         num_actions = int(MULTI_ACTIONS.shape[1])
         if not num_actions: return
         a = tf.tile(MULTI_ACTIONS, [batch_size, 1, 1])
         if include_policy:
             num_actions += 1
-            policy_action = tf.expand_dims(actions[idx], 1)
+            policy_action = tf.expand_dims(actions, 1)
             a = tf.concat([policy_action, a], 1)
         action_combis = a
-        n = tf.expand_dims(net[idx], 1)
+        n = tf.expand_dims(net, 1)
         n = tf.tile(n, [1, num_actions, 1])
         n = tf.reshape(n, [batch_size*num_actions, -1])
         a = tf.reshape(a, [batch_size*num_actions, -1])
-        net[idx],actions[idx] = n,a
-        return action_combis
+        return n, a
     def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
         num_actions = int(MULTI_ACTIONS.shape[1])
         if not num_actions: return
@@ -298,18 +304,21 @@ def make_acrl():
     def make_value_output(hidden, actions):
         with tf.name_scope('output'):
             if not ACTION_DISCRETE:
-                actions = [tf.expand_dims(a, -1) for a in actions]
-                actions = [tf.concat([a, -a, 1.-tf.abs(a)], -1) for a in actions]
-                TEMP = 1.
-                actions = [tf.nn.softmax(TEMP*a) for a in actions]
-                actions = [tf.reshape(a, [-1, ACTION_DIMS*3]) for a in actions]
-            combined = layer_batch_norm(hidden)
-            for i in range(3):
-                with tf.name_scope('actions'):
-                    a1 = layer_dense(actions, HIDDEN2, None, norm=False)
-                    combined = [n*a for n,a in zip(combined, a1)]
+                actions = [tf.nn.relu(tf.concat([
+                    2.*(a-0.75), -2.*(a+0.75),
+                    2.*(a-0.5),  -2.*(a+0.5),
+                    2.*(a-0.25), -2.*(a+0.25),
+                    2.*(a),      -2.*(a),
+                    2.*(a+0.25), -2.*(a-0.25),
+                    2.*(a+0.5),  -2.*(a-0.5),
+                    2.*(a+0.75), -2.*(a-0.75),
+                    2.*(a+1.),   -2.*(a-1.),
+                    ], -1)) for a in actions]
+                actions = [tf.where(a>1., tf.zeros_like(a), a) for a in actions]
+            with tf.name_scope('actions'):
+                a1 = layer_dense(actions, HIDDEN2, norm=False)
             with tf.name_scope('combined'):
-                #combined = [tf.nn.relu(n) for n in combined]
+                combined = [n*a for n,a in zip(hidden, a1)]
                 combined = layer_dense(combined, 1, None, norm=False)
                 return [c[:,0] for c in combined]
 
@@ -321,7 +330,9 @@ def make_acrl():
             target_policy = make_policy(state_inputs)
         with tf.name_scope('_value'):
             net = make_shared(state_inputs)
+            #net[1], target_policy[1] = multi_actions_pre(net[1], target_policy[1])
             [_, next_state_value] = make_value_output(net, target_policy)
+            #next_state_value = multi_actions_post(next_state_value, reduce_max=True)
     layer_lstm.is_target_network = False
 
     layer_batch_norm.training_idx = 1
@@ -338,7 +349,7 @@ def make_acrl():
         else:
             net = [net[0], net[1], net[1]]
             actions = [ac.ph_policy, ac.policy, ph.actions]
-        multi_actions_pre(0, 1)
+        net[0], actions[0] = multi_actions_pre(net[0], actions[0], 1)
 
         net = make_value_output(net, actions)
         if FLAGS.async:
@@ -361,6 +372,9 @@ def make_acrl():
 
     repl = gradient_override(ac.q_value, ac.td_error)
     grads = opt_td.compute_gradients(repl, scope_vars('value'))
+    for i in [-1]: # Q-network weight decay
+        g,w = grads[i]
+        grads[i] = (g + FLAGS.decay*w, w)
     ac.global_norm_qvalue = accum_gradient(grads, opt_td)
 
     copy_vars = zip(
@@ -394,7 +408,7 @@ def setup_key_actions():
     def settings_caption():
         d = dict(async=FLAGS.async,
             policy_index=app.policy_index,
-            options=(['sample'] if FLAGS.sample_action else []) +
+            options=(['sample '+str(FLAGS.sample_action)] if FLAGS.sample_action else []) +
                 (['quantize'] if FLAGS.quantize else []) +
                 (['print'] if app.print_action else []))
         print(d)
@@ -413,7 +427,7 @@ def setup_key_actions():
         elif k==ord('a'):
             app.print_action ^= True
         elif k==ord('s'):
-            FLAGS.sample_action ^= True
+            FLAGS.sample_action = 0.
         elif k==ord('q'):
             FLAGS.quantize ^= True
         elif k==ord('i'):
@@ -458,7 +472,7 @@ def step_to_frames():
             a = ([action.policy] + MULTI_ACTIONS)[idx]
     if FLAGS.sample_action:
         np.random.seed(0)
-        offset = np.array([math.sin(2*math.pi*(r + 8./(1+state.count))) for r in np.random.rand(ACTION_DIMS)])
+        offset = np.array([FLAGS.sample_action*math.sin(2*math.pi*(r + 8./(1+state.count))) for r in np.random.rand(ACTION_DIMS)])
         a = np.clip(a+offset, -1, 1.)
 
     if FLAGS.quantize and QUANT_ACTIONS:
@@ -482,7 +496,8 @@ def step_to_frames():
             state.next_reset = False
             state.last_reset = 0
             # New episode
-            env.seed(0) # Same track everytime
+            if FLAGS.env_seed:
+                env.seed(int(FLAGS.env_seed))
             obs = env.reset()
         env.render()
         #imshow([obs, test_lcn(obs, sess)[0]])
@@ -493,7 +508,7 @@ def step_to_frames():
             # Mountain car env doesnt give any +reward
             reward = 1. if state.done else 0.
         elif ENV_NAME == 'CarRacing-v0':
-            if state.last_reset > 100 and state.last_pos_reward > 50:
+            if state.last_reset > 100 and state.last_pos_reward > 60:
                 state.done = True # Reset track if spinning
                 reward = -100
         state.last_pos_reward = 0 if reward>0. or state.done else state.last_pos_reward+1
@@ -528,7 +543,8 @@ def append_to_batch():
     action.policy_value = ret[2]
     if app.show_state_image:
         app.show_state_image = False
-        proc = multiprocessing.Process(target=imshow, args=([save_state[0,:,:,i] for i in range(STATE_FRAMES)],))
+        proc = multiprocessing.Process(target=imshow,
+            args=([save_state[0,:,:,CHANNELS*i:CHANNELS*(i+1)] for i in range(STATE_FRAMES)],))
         proc.start()
 
     temp_paths = batch_paths(FLAGS.async, 'temp')
@@ -571,7 +587,9 @@ if not FLAGS.async:
     ] + ops.per_epoch
     init_vars()
 
-    ops.per_minibatch += tf.get_collection(tf.GraphKeys.UPDATE_OPS) # batch_norm
+    updates = tf.get_collection(tf.GraphKeys.UPDATE_OPS) # batch_norm
+    #updates.pop(-2) # Skip output layer mean_update
+    ops.per_minibatch += updates
     with tf.get_default_graph().control_dependencies(ops.per_minibatch):
         ops.per_minibatch.append(tf.group(*ops.post_minibatch))
     for s in sorted(stats.__dict__.keys()):
@@ -657,7 +675,7 @@ def train_apply_gradients():
         epoch_td_error=    r[0][app.policy_index],
         global_norm_qvalue=r[1][app.policy_index],
         global_norm_policy=r[2][app.policy_index],
-        rates=dict(learning_rate=FLAGS.learning_rate, tau=FLAGS.tau),
+        rates=dict(learning_rate=FLAGS.learning_rate, tau=FLAGS.tau, decay=FLAGS.decay, gamma=FLAGS.gamma),
         batches=dict(keep=FLAGS.batch_keep,async=FLAGS.batch_async,minibatch=FLAGS.minibatch)))
     os.system('clear') # Scroll up to see status
 
