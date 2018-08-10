@@ -24,6 +24,7 @@ flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
 flags.DEFINE_float('gamma', 0.99, 'Discount rate')
 flags.DEFINE_float('decay', 0.01, 'Q-network L2 weight decay')
 flags.DEFINE_integer('minibatch', 20, 'Minibatch size')
+flags.DEFINE_boolean('tdc', True, 'TDC instead of target networks')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -249,7 +250,8 @@ def layer_lstm(x, ac):
 HIDDEN1, HIDDEN2 = (500,500)
 LSTM_NODES = HIDDEN2
 opt_td = tf.train.AdamOptimizer(ph.learning_rate)
-opt_policy = tf.train.AdamOptimizer(ph.learning_rate/10)
+opt_error = tf.train.AdamOptimizer(0.1)
+opt_policy = tf.train.AdamOptimizer(ph.learning_rate/20)
 
 allac = []
 stats = Struct(reward_sum=[], td_error=[], _policy_minmax=[])
@@ -304,58 +306,52 @@ def make_acrl():
     def make_value_output(hidden, actions):
         with tf.name_scope('output'):
             if not ACTION_DISCRETE:
-                actions = [tf.nn.relu(tf.concat([
-                    2.*(a-0.75), -2.*(a+0.75),
-                    2.*(a-0.5),  -2.*(a+0.5),
-                    2.*(a-0.25), -2.*(a+0.25),
-                    2.*(a),      -2.*(a),
-                    2.*(a+0.25), -2.*(a-0.25),
-                    2.*(a+0.5),  -2.*(a-0.5),
-                    2.*(a+0.75), -2.*(a-0.75),
-                    2.*(a+1.),   -2.*(a-1.),
-                    ], -1)) for a in actions]
-                actions = [tf.where(a>1., tf.zeros_like(a), a) for a in actions]
+                TILES = 10
+                actions = [tf.nn.relu(tf.concat(
+                    [TILES*a + f for f in range(TILES, -TILES, -1)]
+                    , -1)) for a in actions]
+                actions = [tf.where(a>1., tf.ones_like(a), a) for a in actions]
             with tf.name_scope('actions'):
                 a1 = layer_dense(actions, HIDDEN2, norm=False)
             with tf.name_scope('combined'):
                 combined = [n*a for n,a in zip(hidden, a1)]
-                combined = layer_dense(combined, 1, None, norm=False)
-                return [c[:,0] for c in combined]
+                output = layer_dense(combined, 1, None, norm=False)
+                return [n[:,0] for n in output], combined
 
     layer_batch_norm.training_idx = -1 # No UPDATE_OPS for target network
     layer_lstm.is_target_network = True
-    if not FLAGS.async:
+    if not FLAGS.tdc and not FLAGS.async:
         state_inputs = [ph.states, ph.next_states]
         with tf.name_scope('_policy'):
             target_policy = make_policy(state_inputs)
         with tf.name_scope('_value'):
             net = make_shared(state_inputs)
             #net[1], target_policy[1] = multi_actions_pre(net[1], target_policy[1])
-            [_, next_state_value] = make_value_output(net, target_policy)
-            #next_state_value = multi_actions_post(next_state_value, reduce_max=True)
+            [_, target_value], _ = make_value_output(net, target_policy)
+            #target_value = multi_actions_post(target_value, reduce_max=True)
     layer_lstm.is_target_network = False
 
     layer_batch_norm.training_idx = 1
-    state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states])
+    state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states, ph.next_states])
     with tf.name_scope('policy'):
         x = make_policy(state_inputs)
         if FLAGS.async: [ac.ph_policy] = x
-        else: [ac.ph_policy, ac.policy] = x
+        else: [ac.ph_policy, ac.policy, ac.policy_next] = x
 
     with tf.name_scope('value'):
         net = make_shared(state_inputs)
         if FLAGS.async:
             actions = [ac.ph_policy]
         else:
-            net = [net[0], net[1], net[1]]
-            actions = [ac.ph_policy, ac.policy, ph.actions]
+            net = [net[0], net[1], net[1], net[2]]
+            actions = [ac.ph_policy, ph.actions, ac.policy, ac.policy_next]
         net[0], actions[0] = multi_actions_pre(net[0], actions[0], 1)
 
-        net = make_value_output(net, actions)
+        net, combined = make_value_output(net, actions)
         if FLAGS.async:
             [ph_policy_value] = net
         else:
-            [ph_policy_value, ac.state_value, ac.q_value] = net
+            [ph_policy_value, ac.q_value, ac.state_value, next_state_value] = net
         # Q for all actions in agent's current state
         ac.ph_policy_value = multi_actions_post(ph_policy_value, 1)
 
@@ -367,24 +363,39 @@ def make_acrl():
     grads = opt_policy.compute_gradients(repl, scope_vars('policy'))
     ac.global_norm_policy = accum_gradient(grads, opt_policy)
 
-    ac.step_1 = ph.rewards[:,r] + FLAGS.gamma*next_state_value
+    if FLAGS.tdc: target_value = next_state_value # No target network
+    ac.step_1 = ph.rewards[:,r] + FLAGS.gamma*target_value
     ac.td_error = ac.step_1 - ac.q_value
 
     repl = gradient_override(ac.q_value, ac.td_error)
-    grads = opt_td.compute_gradients(repl, scope_vars('value'))
-    for i in [-1]: # Q-network weight decay
-        g,w = grads[i]
-        grads[i] = (g + FLAGS.decay*w, w)
-    ac.global_norm_qvalue = accum_gradient(grads, opt_td)
+    value_weights = scope_vars('value')
+    grad_s = opt_td.compute_gradients(repl, value_weights)
 
-    copy_vars = zip(
-        # Include moving_mean/variance, which are not TRAINABLE_VARIABLES
-        scope_vars('_value', tf.GraphKeys.GLOBAL_VARIABLES),
-        scope_vars('value', tf.GraphKeys.GLOBAL_VARIABLES)) + zip(
-        scope_vars('_policy', tf.GraphKeys.GLOBAL_VARIABLES),
-        scope_vars('policy', tf.GraphKeys.GLOBAL_VARIABLES))
-    for t,w in copy_vars:
-        ops.per_epoch.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
+    if FLAGS.tdc:
+        with tf.name_scope('_value'):
+            error_predict = layer_dense(combined, 1, None, norm=False)[1][:,0]
+            repl = gradient_override(error_predict, ac.td_error-error_predict)
+            grads = opt_error.compute_gradients(repl, scope_vars())
+            accum_gradient(grads, opt_error)
+
+        repl = gradient_override(next_state_value, -FLAGS.gamma*error_predict)
+        grad_s2 = opt_td.compute_gradients(repl, value_weights)
+        for i in range(len(grad_s)):
+            (g, w), g2 = grad_s[i], grad_s2[i][0]
+            grad_s[i] = (g+g2, w)
+    else:
+        for i in [-1]: # Q-network weight decay
+            g,w = grad_s[i]
+            grad_s[i] = (g + FLAGS.decay*w, w)
+        copy_vars = zip(
+            # Include moving_mean/variance, which are not TRAINABLE_VARIABLES
+            scope_vars('_value', tf.GraphKeys.GLOBAL_VARIABLES),
+            scope_vars('value', tf.GraphKeys.GLOBAL_VARIABLES)) + zip(
+            scope_vars('_policy', tf.GraphKeys.GLOBAL_VARIABLES),
+            scope_vars('policy', tf.GraphKeys.GLOBAL_VARIABLES))
+        for t,w in copy_vars:
+            ops.per_epoch.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
+    ac.global_norm_qvalue = accum_gradient(grad_s, opt_td)
 
     stats.reward_sum.append(tf.reduce_sum(ph.rewards[:,r]))
     stats.td_error.append(tf.reduce_sum(ac.td_error**2))
