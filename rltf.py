@@ -17,7 +17,7 @@ flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved 
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
 flags.DEFINE_string('summary', '/tmp/tf', 'Summaries path for Tensorboard')
 flags.DEFINE_string('env_seed', '', 'Seed number for new environment')
-flags.DEFINE_boolean('quantize', False, 'Quantize actions to list')
+flags.DEFINE_boolean('discrete', False, 'Discretize actions to list')
 flags.DEFINE_float('sample_action', 0., 'Sample actions, or use policy')
 flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
@@ -34,7 +34,7 @@ sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 STATE_FRAMES = 3    # Frames an action is repeated for, combined into a state
 
-QUANT_ACTIONS = []
+DISCRETE_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
 if not ENV_NAME:
     raise Exception('Missing ENV environment variable')
@@ -43,15 +43,11 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing = gym.envs.box2d.car_racing
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
-    QUANT_ACTIONS = [
+    DISCRETE_ACTIONS = [
         [1, 0, 0],
-        [0.1, 0, 0],
-        [-1,0, 0],
-        [-0.1, 0, 0],
+        [-1, 0, 0],
         [0, 1, 0],
-        [0, 0.5, 0],
         [0, 0, 0],
-        [0, 0, 1],
         [0, 0, 0.8],
     ] if 1 else []
 elif ENV_NAME == 'FlappyBird-v0':
@@ -68,7 +64,7 @@ ACTION_DIMS = (env.action_space.shape or [env.action_space.n])[0]
 ACTION_DISCRETE = not env.action_space.shape
 def onehot_vector(action_index): return [1. if action_index == i else 0. for i in range(ACTION_DIMS)]
 if ACTION_DISCRETE: MULTI_ACTIONS = [onehot_vector(a) for a in range(ACTION_DIMS)]
-else: MULTI_ACTIONS = QUANT_ACTIONS
+else: MULTI_ACTIONS = DISCRETE_ACTIONS
 MULTI_ACTIONS = tf.expand_dims(tf.constant(MULTI_ACTIONS, DTYPE), 0)
 POLICY_SOFTMAX = ACTION_DISCRETE
 FRAME_DIM = list(env.observation_space.shape)
@@ -190,15 +186,14 @@ def make_conv_net(x):
         return x
 
     LAYERS = [
-        (32, 8, 4),
-        (32, 4, 2),
-        (32, 3, 1)]
+        (16, 8, 4),
+        (32, 4, 2)]
     for l in range(len(LAYERS)):
         filters, width, stride = LAYERS[l]
         with tf.name_scope('conv'):
             x = layer_batch_norm(x)
             _scope = tf.contrib.framework.get_name_scope()
-            conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, activation=tf.nn.relu, _scope=_scope)
+            conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, activation=tf.nn.elu, _scope=_scope)
             x = [conv.apply(n) for n in x]
             for w in conv.weights: variable_summaries(w)
         print(x[0].shape)
@@ -206,7 +201,7 @@ def make_conv_net(x):
     print(x[0].shape)
     return x
 
-def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False, trainable=True):
+def layer_dense(x, outputs, activation, norm=True, use_bias=False, trainable=True):
     if norm: x = layer_batch_norm(x)
     _scope = tf.contrib.framework.get_name_scope()
     dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable, _scope=_scope)
@@ -261,23 +256,20 @@ def make_acrl():
     def make_shared(x, use_lstm=False):
         x = make_conv_net(x)
         with tf.name_scope('hidden1'):
-            x = layer_dense(x, HIDDEN1)
+            x = layer_dense(x, HIDDEN1, tf.nn.elu)
         with tf.name_scope('hidden2'):
-            x = layer_lstm(x, ac) if use_lstm else layer_dense(x, HIDDEN2)
+            x = layer_lstm(x, ac) if use_lstm else layer_dense(x, HIDDEN2, tf.nn.elu)
         return x
 
     def make_policy(x):
         x = make_shared(x)
         with tf.name_scope('output'):
-            if POLICY_SOFTMAX:
-                policy = layer_dense(x, ACTION_DIMS, tf.nn.softmax)
-            elif ENV_NAME == 'CarRacing-v0':
-                policy = layer_dense(x, ACTION_DIMS*2+1, None)
-                policy = [tf.stack([
-                    tf.nn.sigmoid(n[:,0])*(0.2+tf.nn.sigmoid(n[:,1])*0.8)*tf.tanh(n[:,6]),
-                    tf.nn.sigmoid(n[:,2])*(0.2+tf.nn.sigmoid(n[:,3])*0.8),
-                    tf.nn.sigmoid(n[:,4])*(0.2+tf.nn.sigmoid(n[:,5])*0.3),
-                    ], 1) for n in policy]
+            softmax_dims = ACTION_DIMS if POLICY_SOFTMAX else len(DISCRETE_ACTIONS)
+            if softmax_dims:
+                policy = layer_dense(x, softmax_dims, tf.nn.softmax)
+                if DISCRETE_ACTIONS:
+                    discrete = tf.constant([DISCRETE_ACTIONS])
+                    policy = [tf.reduce_sum(discrete*tf.expand_dims(n, -1), 1) for n in policy]
             else:
                 policy = layer_dense(x, ACTION_DIMS, tf.tanh)
         return policy
@@ -303,6 +295,9 @@ def make_acrl():
         n = tf.reduce_max(n, 1) if reduce_max else n
         return n
 
+    def make_value_lower(state):
+        # Output layer needs one-sided input
+        return [tf.nn.relu(n) for n in make_shared(state)]
     def make_value_output(hidden, actions):
         with tf.name_scope('output'):
             if not ACTION_DISCRETE:
@@ -312,7 +307,7 @@ def make_acrl():
                     , -1)) for a in actions]
                 actions = [tf.where(a>1., tf.ones_like(a), a) for a in actions]
             with tf.name_scope('actions'):
-                a1 = layer_dense(actions, HIDDEN2, norm=False)
+                a1 = layer_dense(actions, HIDDEN2, tf.nn.relu, norm=False)
             with tf.name_scope('combined'):
                 combined = [n*a for n,a in zip(hidden, a1)]
                 output = layer_dense(combined, 1, None, norm=False)
@@ -325,7 +320,7 @@ def make_acrl():
         with tf.name_scope('_policy'):
             target_policy = make_policy(state_inputs)
         with tf.name_scope('_value'):
-            net = make_shared(state_inputs)
+            net = make_value_lower(state_inputs)
             #net[1], target_policy[1] = multi_actions_pre(net[1], target_policy[1])
             [_, target_value], _ = make_value_output(net, target_policy)
             #target_value = multi_actions_post(target_value, reduce_max=True)
@@ -339,7 +334,7 @@ def make_acrl():
         else: [ac.ph_policy, ac.policy, ac.policy_next] = x
 
     with tf.name_scope('value'):
-        net = make_shared(state_inputs)
+        net = make_value_lower(state_inputs)
         if FLAGS.async:
             actions = [ac.ph_policy]
         else:
@@ -420,7 +415,7 @@ def setup_key_actions():
         d = dict(async=FLAGS.async,
             policy_index=app.policy_index,
             options=(['sample '+str(FLAGS.sample_action)] if FLAGS.sample_action else []) +
-                (['quantize'] if FLAGS.quantize else []) +
+                (['discrete'] if FLAGS.discrete else []) +
                 (['print'] if app.print_action else []))
         print(d)
         window.set_caption(str(d))
@@ -439,8 +434,8 @@ def setup_key_actions():
             app.print_action ^= True
         elif k==ord('s'):
             FLAGS.sample_action = 0.
-        elif k==ord('q'):
-            FLAGS.quantize ^= True
+        elif k==ord('d'):
+            FLAGS.discrete ^= True
         elif k==ord('i'):
             app.show_state_image = True
         elif k==ord('t'):
@@ -486,9 +481,9 @@ def step_to_frames():
         offset = np.array([FLAGS.sample_action*math.sin(2*math.pi*(r + 8./(1+state.count))) for r in np.random.rand(ACTION_DIMS)])
         a = np.clip(a+offset, -1, 1.)
 
-    if FLAGS.quantize and QUANT_ACTIONS:
-        idx = np.argmin(((np.array(QUANT_ACTIONS) - a)**2).sum(1))
-        a = QUANT_ACTIONS[idx]
+    if FLAGS.discrete and DISCRETE_ACTIONS:
+        idx = np.argmin(((np.array(DISCRETE_ACTIONS) - a)**2).sum(1))
+        a = DISCRETE_ACTIONS[idx]
 
     env_action = a
     if ACTION_DISCRETE:
