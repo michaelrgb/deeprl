@@ -10,8 +10,8 @@ from pprint import pprint
 flags = tf.app.flags
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
 flags.DEFINE_integer('batch_keep', 6, 'Batches recorded from user actions')
-flags.DEFINE_integer('batch_async', 100, 'Batches to wait for from async agents')
-flags.DEFINE_integer('batch_per_async', 10, 'Batches recorded per async agent')
+flags.DEFINE_integer('batch_async', 200, 'Batches to wait for from async agents')
+flags.DEFINE_integer('batch_per_async', 100, 'Batches recorded per async agent')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved raw frames')
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
@@ -19,11 +19,11 @@ flags.DEFINE_string('summary', '/tmp/tf', 'Summaries path for Tensorboard')
 flags.DEFINE_string('env_seed', '', 'Seed number for new environment')
 flags.DEFINE_boolean('discrete', False, 'Discretize actions to list')
 flags.DEFINE_float('sample_action', 0., 'Sample actions, or use policy')
-flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
+flags.DEFINE_float('learning_rate', 1e-4, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
 flags.DEFINE_float('gamma', 0.99, 'Discount rate')
 flags.DEFINE_float('decay', 0.01, 'Q-network L2 weight decay')
-flags.DEFINE_integer('minibatch', 20, 'Minibatch size')
+flags.DEFINE_integer('minibatch', 32, 'Minibatch size')
 flags.DEFINE_boolean('tdc', True, 'TDC instead of target networks')
 FLAGS = flags.FLAGS
 
@@ -46,7 +46,7 @@ if ENV_NAME == 'CarRacing-v0':
     DISCRETE_ACTIONS = [
         [1, 0, 0],
         [-1, 0, 0],
-        [0, 1, 0],
+        [0, 0.5, 0],
         [0, 0, 0],
         [0, 0, 0.8],
     ] if 1 else []
@@ -186,7 +186,8 @@ def make_conv_net(x):
         return x
 
     LAYERS = [
-        (16, 8, 4),
+        (32, 8, 2),
+        (32, 4, 2),
         (32, 4, 2)]
     for l in range(len(LAYERS)):
         filters, width, stride = LAYERS[l]
@@ -215,18 +216,16 @@ def layer_lstm(x, ac):
     with tf.name_scope('lstm'):
         scope = tf.contrib.framework.get_name_scope()
         for i in range(len(x)):
-            create_initial_state = i==0
-            is_async = create_initial_state and not layer_lstm.is_target_network
+            create_initial_state = i<2
+            is_async = i==0
             if create_initial_state:
                 with tf.name_scope(str(FLAGS.async)):
                     batch_size = x[i].shape[0]
                     vars = [tf.Variable(s, trainable=False, collections=[None]) for s in cell.zero_state(batch_size, DTYPE)]
                     sess.run(tf.variables_initializer(vars))
                     initial_state = tf.contrib.rnn.LSTMStateTuple(*vars)
-            elif layer_lstm.is_target_network:
-                initial_state = final_state
             else:
-                initial_state = ac.target_initial_state[scope]
+                initial_state = final_state
 
             x[i] = tf.expand_dims(x[i], 1) # [batch_size, max_time (i.e. 1), ...],
             output, final_state = tf.nn.dynamic_rnn(cell, x[i], initial_state=initial_state, scope=scope)
@@ -236,8 +235,6 @@ def layer_lstm(x, ac):
                 [ops.post_minibatch, ops.post_step][is_async] += [initial_state[c].assign(final_state[c]) for c in range(2)]
                 if not is_async:
                     ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
-                    # Save the final_state to be used by the other network
-                    ac.target_initial_state[scope.replace('/_', '/')] = final_state
 
         for w in cell.weights: variable_summaries(w)
     return x
@@ -274,20 +271,20 @@ def make_acrl():
                 policy = layer_dense(x, ACTION_DIMS, tf.tanh)
         return policy
 
-    def multi_actions_pre(net, actions, batch_size=FLAGS.minibatch, include_policy=True):
+    def multi_actions_pre(net, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
         num_actions = int(MULTI_ACTIONS.shape[1])
         if not num_actions: return
         a = tf.tile(MULTI_ACTIONS, [batch_size, 1, 1])
         if include_policy:
             num_actions += 1
-            policy_action = tf.expand_dims(actions, 1)
+            policy_action = tf.expand_dims(actions[idx], 1)
             a = tf.concat([policy_action, a], 1)
         action_combis = a
-        n = tf.expand_dims(net, 1)
+        n = tf.expand_dims(net[idx], 1)
         n = tf.tile(n, [1, num_actions, 1])
         n = tf.reshape(n, [batch_size*num_actions, -1])
         a = tf.reshape(a, [batch_size*num_actions, -1])
-        return n, a
+        net[idx], actions[idx] = n, a
     def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
         num_actions = int(MULTI_ACTIONS.shape[1])
         if not num_actions: return
@@ -303,7 +300,9 @@ def make_acrl():
             if not ACTION_DISCRETE:
                 TILES = 10
                 actions = [tf.nn.relu(tf.concat(
-                    [TILES*a + f for f in range(TILES, -TILES, -1)]
+                    [TILES*a -f for f in range(TILES)]+
+                    [TILES*-a -f for f in range(TILES)]+
+                    [TILES*tf.sqrt(tf.maximum(0., 1-a**2)) -f for f in range(TILES)]
                     , -1)) for a in actions]
                 actions = [tf.where(a>1., tf.ones_like(a), a) for a in actions]
             with tf.name_scope('actions'):
@@ -314,17 +313,15 @@ def make_acrl():
                 return [n[:,0] for n in output], combined
 
     layer_batch_norm.training_idx = -1 # No UPDATE_OPS for target network
-    layer_lstm.is_target_network = True
     if not FLAGS.tdc and not FLAGS.async:
         state_inputs = [ph.states, ph.next_states]
         with tf.name_scope('_policy'):
             target_policy = make_policy(state_inputs)
         with tf.name_scope('_value'):
             net = make_value_lower(state_inputs)
-            #net[1], target_policy[1] = multi_actions_pre(net[1], target_policy[1])
+            #multi_actions_pre(net, target_policy, 1)
             [_, target_value], _ = make_value_output(net, target_policy)
             #target_value = multi_actions_post(target_value, reduce_max=True)
-    layer_lstm.is_target_network = False
 
     layer_batch_norm.training_idx = 1
     state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states, ph.next_states])
@@ -340,13 +337,15 @@ def make_acrl():
         else:
             net = [net[0], net[1], net[1], net[2]]
             actions = [ac.ph_policy, ph.actions, ac.policy, ac.policy_next]
-        net[0], actions[0] = multi_actions_pre(net[0], actions[0], 1)
+            #multi_actions_pre(net, actions, 3)
+        multi_actions_pre(net, actions, 0, 1)
 
         net, combined = make_value_output(net, actions)
         if FLAGS.async:
             [ph_policy_value] = net
         else:
             [ph_policy_value, ac.q_value, ac.state_value, next_state_value] = net
+            #next_state_value = multi_actions_post(next_state_value, reduce_max=True)
         # Q for all actions in agent's current state
         ac.ph_policy_value = multi_actions_post(ph_policy_value, 1)
 
