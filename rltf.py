@@ -2,6 +2,7 @@ import tensorflow as tf, numpy as np
 from tensorflow.contrib import rnn
 import sys, os, multiprocessing, time, math
 from utils import *
+from mhdpa import *
 from pprint import pprint
 
 # python rltf.py --batch_keep 6 --batch_async 20 --record 0
@@ -60,10 +61,41 @@ env = gym.make(ENV_NAME)
 env._max_episode_steps = None # Disable step limit
 envu = env.unwrapped
 
+from pyglet import gl
+def draw_line(a, b, color=(1,1,1,1)):
+    gl.glLineWidth(3)
+    gl.glBegin(gl.GL_LINES)
+    gl.glColor4f(*color)
+    gl.glVertex3f(window.width*a[0], window.height*(1-a[1]), 0)
+    gl.glVertex3f(window.width*b[0], window.height*(1-b[1]), 0)
+    gl.glEnd()
+def draw_attention():
+    if not app.draw_attention or state.ph_attention is None:
+        return
+    s = state.ph_attention.shape[1:3]
+    for head in range(3):
+        color = onehot_vector(head, 3)
+        for y1 in range(s[0]):
+            for x1 in range(s[1]):
+                for y2 in range(s[0]):
+                    for x2 in range(s[1]):
+                        f = state.ph_attention[0, y1,x1, y2,x2, head]
+                        if f < 0.1: continue
+                        draw_line(
+                            ((x1+0.5)/s[1], (y1+0.5)/s[0]),
+                            ((x2+0.5)/s[1], (y2+0.5)/s[0]),
+                            color+[f])
+def hook_swapbuffers():
+    flip = window.flip
+    def hook():
+        draw_attention()
+        flip()
+    window.flip = hook
+
 ACTION_DIMS = (env.action_space.shape or [env.action_space.n])[0]
 ACTION_DISCRETE = not env.action_space.shape
-def onehot_vector(action_index): return [1. if action_index == i else 0. for i in range(ACTION_DIMS)]
-if ACTION_DISCRETE: MULTI_ACTIONS = [onehot_vector(a) for a in range(ACTION_DIMS)]
+def onehot_vector(idx, dims): return [1. if idx == i else 0. for i in range(dims)]
+if ACTION_DISCRETE: MULTI_ACTIONS = [onehot_vector(a, ACTION_DIMS) for a in range(ACTION_DIMS)]
 else: MULTI_ACTIONS = DISCRETE_ACTIONS
 MULTI_ACTIONS = tf.expand_dims(tf.constant(MULTI_ACTIONS, DTYPE), 0)
 POLICY_SOFTMAX = ACTION_DISCRETE
@@ -133,7 +165,7 @@ else:
     frame_to_state = tf.reshape(ph.frame, [1] + STATE_DIM)
 
 training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None)
-app = Struct(policy_index=0, quit=False, epoch_count=0, print_action=False, show_state_image=False)
+app = Struct(policy_index=0, quit=False, epoch_count=0, print_action=False, show_state_image=False, draw_attention=True)
 if FLAGS.async:
     FIRST_BATCH = (FLAGS.async-1)*FLAGS.batch_per_async
 else:
@@ -147,7 +179,7 @@ training.append_batch = FIRST_BATCH
 
 ops = Struct(per_minibatch=[], post_minibatch=[], per_epoch=[], post_epoch=[], post_step=[], new_batches=[])
 def accum_value(value):
-    accum = tf.Variable(tf.zeros_like(value),trainable=False)
+    accum = tf.Variable(tf.zeros_like(value), trainable=False)
     ops.per_minibatch.append(accum.assign_add(value))
     ops.post_epoch.append(accum.assign(tf.zeros_like(value)))
     return accum
@@ -187,22 +219,20 @@ def make_conv_net(x):
 
     LAYERS = [
         (32, 8, 2),
-        (32, 4, 2),
+        (32, 8, 2),
         (32, 4, 2)]
     for l in range(len(LAYERS)):
         filters, width, stride = LAYERS[l]
         with tf.name_scope('conv'):
             x = layer_batch_norm(x)
             _scope = tf.contrib.framework.get_name_scope()
-            conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, activation=tf.nn.elu, _scope=_scope)
+            conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, activation=tf.nn.relu, _scope=_scope)
             x = [conv.apply(n) for n in x]
             for w in conv.weights: variable_summaries(w)
         print(x[0].shape)
-    x = [tf.layers.flatten(n) for n in x]
-    print(x[0].shape)
     return x
 
-def layer_dense(x, outputs, activation, norm=True, use_bias=False, trainable=True):
+def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False, trainable=True):
     if norm: x = layer_batch_norm(x)
     _scope = tf.contrib.framework.get_name_scope()
     dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable, _scope=_scope)
@@ -211,7 +241,7 @@ def layer_dense(x, outputs, activation, norm=True, use_bias=False, trainable=Tru
     return x
 
 def layer_lstm(x, ac):
-    cell = rnn.LSTMCell(LSTM_NODES, use_peepholes=True)
+    cell = rnn.LSTMCell(HIDDEN_NODES, use_peepholes=True)
     x = layer_batch_norm(x)
     with tf.name_scope('lstm'):
         scope = tf.contrib.framework.get_name_scope()
@@ -239,10 +269,11 @@ def layer_lstm(x, ac):
         for w in cell.weights: variable_summaries(w)
     return x
 
-HIDDEN1, HIDDEN2 = (500,500)
-LSTM_NODES = HIDDEN2
+SHARED_LAYERS = True
+MHDPA_LAYERS = 0#3
+HIDDEN_NODES = 500
 opt_td = tf.train.AdamOptimizer(ph.learning_rate)
-opt_error = tf.train.AdamOptimizer(0.1)
+opt_error = tf.train.AdamOptimizer(1)
 opt_policy = tf.train.AdamOptimizer(ph.learning_rate/20)
 
 allac = []
@@ -252,21 +283,37 @@ def make_acrl():
     allac.append(ac)
     def make_shared(x, use_lstm=False):
         x = make_conv_net(x)
-        with tf.name_scope('hidden1'):
-            x = layer_dense(x, HIDDEN1, tf.nn.elu)
-        with tf.name_scope('hidden2'):
-            x = layer_lstm(x, ac) if use_lstm else layer_dense(x, HIDDEN2, tf.nn.elu)
+        if MHDPA_LAYERS:
+            x = [concat_coord_xy(n) for n in x]
+            for l in range(MHDPA_LAYERS):
+                relational = MHDPA()
+                for i,n in enumerate(x):
+                    with tf.name_scope('mhdpa'):
+                        last_layer = l==MHDPA_LAYERS-1
+                        x[i], attention = relational.apply(n)#, combine_heads=not last_layer)
+                        if i==0 and l==last_layer:
+                            ac.ph_attention = attention # Display agent attention
+            #x = [tf.reduce_sum(n, [1, 2]) for n in x] # Paper uses max-pooling...
+        x = [tf.layers.flatten(n) for n in x]
+        print(x[0].shape)
         return x
 
-    def make_policy(x):
-        x = make_shared(x)
+    def make_dense(x):
+        for i in range(2):
+            with tf.name_scope('hidden'):
+                #x = layer_lstm(x, ac) if use_lstm
+                x = layer_dense(x, HIDDEN_NODES)
+        return x
+
+    def make_policy(shared):
+        x = make_dense(shared)
         with tf.name_scope('output'):
             softmax_dims = ACTION_DIMS if POLICY_SOFTMAX else len(DISCRETE_ACTIONS)
             if softmax_dims:
                 policy = layer_dense(x, softmax_dims, tf.nn.softmax)
                 if DISCRETE_ACTIONS:
-                    discrete = tf.constant([DISCRETE_ACTIONS])
-                    policy = [tf.reduce_sum(discrete*tf.expand_dims(n, -1), 1) for n in policy]
+                    discrete = tf.constant(DISCRETE_ACTIONS)
+                    policy = [tf.tensordot(n,discrete, [[1],[0]]) for n in policy]
             else:
                 policy = layer_dense(x, ACTION_DIMS, tf.tanh)
         return policy
@@ -292,12 +339,11 @@ def make_acrl():
         n = tf.reduce_max(n, 1) if reduce_max else n
         return n
 
-    def make_value_lower(state):
-        # Output layer needs one-sided input
-        return [tf.nn.relu(n) for n in make_shared(state)]
     def make_value_output(hidden, actions):
-        with tf.name_scope('output'):
-            if not ACTION_DISCRETE:
+        with tf.name_scope('actions'):
+            if ACTION_DISCRETE:
+                a1 = layer_dense(actions, HIDDEN_NODES, norm=False)
+            else:
                 TILES = 10
                 actions = [tf.nn.relu(tf.concat(
                     [TILES*a -f for f in range(TILES)]+
@@ -305,12 +351,13 @@ def make_acrl():
                     [TILES*tf.sqrt(tf.maximum(0., 1-a**2)) -f for f in range(TILES)]
                     , -1)) for a in actions]
                 actions = [tf.where(a>1., tf.ones_like(a), a) for a in actions]
-            with tf.name_scope('actions'):
-                a1 = layer_dense(actions, HIDDEN2, tf.nn.relu, norm=False)
-            with tf.name_scope('combined'):
-                combined = [n*a for n,a in zip(hidden, a1)]
-                output = layer_dense(combined, 1, None, norm=False)
-                return [n[:,0] for n in output], combined
+                a1 = layer_dense(actions, HIDDEN_NODES/2, None, norm=False)
+                # Prevent dead neurons in the action layer, as it takes one-sided input
+                a1 = [tf.concat([tf.nn.relu(a), tf.nn.relu(-a)], 1) for a in a1]
+        with tf.name_scope('output'):
+            combined = [n*a for n,a in zip(hidden, a1)]
+            output = layer_dense(combined, 1, None, norm=False)
+            return [n[:,0] for n in output], combined
 
     layer_batch_norm.training_idx = -1 # No UPDATE_OPS for target network
     if not FLAGS.tdc and not FLAGS.async:
@@ -326,12 +373,15 @@ def make_acrl():
     layer_batch_norm.training_idx = 1
     state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states, ph.next_states])
     with tf.name_scope('policy'):
-        x = make_policy(state_inputs)
-        if FLAGS.async: [ac.ph_policy] = x
-        else: [ac.ph_policy, ac.policy, ac.policy_next] = x
+        shared = make_shared(state_inputs)
+        shared_weights = scope_vars() if SHARED_LAYERS else []
+        policy = make_policy(shared)
+        if FLAGS.async: [ac.ph_policy] = policy
+        else: [ac.ph_policy, ac.policy, ac.policy_next] = policy
 
     with tf.name_scope('value'):
-        net = make_value_lower(state_inputs)
+        if not SHARED_LAYERS: shared = make_shared(state_inputs)
+        net = make_dense(shared)
         if FLAGS.async:
             actions = [ac.ph_policy]
         else:
@@ -362,7 +412,7 @@ def make_acrl():
     ac.td_error = ac.step_1 - ac.q_value
 
     repl = gradient_override(ac.q_value, ac.td_error)
-    value_weights = scope_vars('value')
+    value_weights = scope_vars('value') + shared_weights
     grad_s = opt_td.compute_gradients(repl, value_weights)
 
     if FLAGS.tdc:
@@ -402,7 +452,8 @@ for r in range(REWARDS_ALL):
 
 state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
                count=0, last_obs=None, last_pos_reward=0,
-               done=True, next_reset=False, last_reset=0)
+               done=True, next_reset=False, last_reset=0,
+               ph_attention=None)
 
 envu.isRender = True # pybullet-gym
 env.reset(); env.render()# Gym needs at least 1 reset&render before valid observation
@@ -415,7 +466,8 @@ def setup_key_actions():
             policy_index=app.policy_index,
             options=(['sample '+str(FLAGS.sample_action)] if FLAGS.sample_action else []) +
                 (['discrete'] if FLAGS.discrete else []) +
-                (['print'] if app.print_action else []))
+                (['print'] if app.print_action else []) +
+                (['attention'] if app.draw_attention else []))
         print(d)
         window.set_caption(str(d))
 
@@ -441,6 +493,8 @@ def setup_key_actions():
             training.enable ^= True
         elif k==ord('r'):
             state.next_reset = True
+        elif k==ord('m'):
+            app.draw_attention ^= True
         else: return
         settings_caption()
 
@@ -452,11 +506,13 @@ def setup_key_actions():
 
     if not hasattr(envu, 'viewer'): # pybullet-gym
         return a
+    global window
     window = envu.viewer.window
     window.on_key_press = key_press
     window.on_key_release = key_release
     window.on_close = lambda: setattr(app, 'quit', True)
     settings_caption()
+    hook_swapbuffers()
     return a
 
 action = Struct(to_take=None, policy=[], keyboard=setup_key_actions())
@@ -468,7 +524,7 @@ def step_to_frames():
         return np.random.choice(value.shape[0], p=softmax(value)) if FLAGS.sample_action else np.argmax(value)
 
     a = action.keyboard[:ACTION_DIMS].copy()
-    if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1.))
+    if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1., ACTION_DIMS))
 
     if state.count > 0 and app.policy_index != -1:
         a = action.policy.copy()
@@ -487,7 +543,7 @@ def step_to_frames():
     env_action = a
     if ACTION_DISCRETE:
         env_action = np.argmax(a)
-        a = onehot_vector(env_action)
+        a = onehot_vector(env_action, ACTION_DIMS)
     action.to_save = a
     if app.print_action: print(list(action.to_save), list(action.policy))#, list(action.policy_value))
 
@@ -512,7 +568,7 @@ def step_to_frames():
         if ENV_NAME == 'MountainCar-v0':
             # Mountain car env doesnt give any +reward
             reward = 1. if state.done else 0.
-        elif ENV_NAME == 'CarRacing-v0':
+        elif ENV_NAME == 'CarRacing-v0' and not FLAGS.record:
             if state.last_reset > 100 and state.last_pos_reward > 60:
                 state.done = True # Reset track if spinning
                 reward = -100
@@ -525,7 +581,8 @@ ops.ph_step = [frame_to_state] + [
     i for sublist in [
         [ac.ph_policy[0],# Policy from uploaded state,
         ac.ph_policy_value[0],
-        ] for ac in allac]
+        ] + ([ac.ph_attention] if MHDPA_LAYERS else [])
+        for ac in allac]
     for i in sublist]
 with tf.get_default_graph().control_dependencies(ops.ph_step):
     ops.ph_step.append(tf.group(*ops.post_step))
@@ -546,6 +603,7 @@ def append_to_batch():
     save_state = ret[0]
     action.policy = ret[1]
     action.policy_value = ret[2]
+    if MHDPA_LAYERS: state.ph_attention = ret[3]
     if app.show_state_image:
         app.show_state_image = False
         proc = multiprocessing.Process(target=imshow,
