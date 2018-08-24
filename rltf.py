@@ -10,7 +10,7 @@ from pprint import pprint
 
 flags = tf.app.flags
 flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
-flags.DEFINE_integer('batch_keep', 6, 'Batches recorded from user actions')
+flags.DEFINE_integer('batch_keep', 0, 'Batches recorded from user actions')
 flags.DEFINE_integer('batch_async', 200, 'Batches to wait for from async agents')
 flags.DEFINE_integer('batch_per_async', 100, 'Batches recorded per async agent')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
@@ -24,7 +24,7 @@ flags.DEFINE_float('learning_rate', 1e-4, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
 flags.DEFINE_float('gamma', 0.99, 'Discount rate')
 flags.DEFINE_float('decay', 0.01, 'Q-network L2 weight decay')
-flags.DEFINE_integer('minibatch', 32, 'Minibatch size')
+flags.DEFINE_integer('minibatch', 64, 'Minibatch size')
 flags.DEFINE_boolean('tdc', True, 'TDC instead of target networks')
 FLAGS = flags.FLAGS
 
@@ -47,7 +47,7 @@ if ENV_NAME == 'CarRacing-v0':
     DISCRETE_ACTIONS = [
         [1, 0, 0],
         [-1, 0, 0],
-        [0, 0.5, 0],
+        [0, 0.4, 0],
         [0, 0, 0],
         [0, 0, 0.8],
     ] if 1 else []
@@ -298,11 +298,12 @@ def make_acrl():
         print(x[0].shape)
         return x
 
-    def make_dense(x):
-        for i in range(2):
+    def make_dense(x, outputs=HIDDEN_NODES):
+        layers = [HIDDEN_NODES, outputs]
+        for nodes in layers:
             with tf.name_scope('hidden'):
                 #x = layer_lstm(x, ac) if use_lstm
-                x = layer_dense(x, HIDDEN_NODES)
+                x = layer_dense(x, nodes)
         return x
 
     def make_policy(shared):
@@ -318,7 +319,7 @@ def make_acrl():
                 policy = layer_dense(x, ACTION_DIMS, tf.tanh)
         return policy
 
-    def multi_actions_pre(net, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
+    def multi_actions_pre(state, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
         num_actions = int(MULTI_ACTIONS.shape[1])
         if not num_actions: return
         a = tf.tile(MULTI_ACTIONS, [batch_size, 1, 1])
@@ -327,11 +328,11 @@ def make_acrl():
             policy_action = tf.expand_dims(actions[idx], 1)
             a = tf.concat([policy_action, a], 1)
         action_combis = a
-        n = tf.expand_dims(net[idx], 1)
+        n = tf.expand_dims(state[idx], 1)
         n = tf.tile(n, [1, num_actions, 1])
         n = tf.reshape(n, [batch_size*num_actions, -1])
         a = tf.reshape(a, [batch_size*num_actions, -1])
-        net[idx], actions[idx] = n, a
+        state[idx], actions[idx] = n, a
     def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
         num_actions = int(MULTI_ACTIONS.shape[1])
         if not num_actions: return
@@ -340,35 +341,26 @@ def make_acrl():
         return n
 
     def make_value_output(hidden, actions):
-        with tf.name_scope('actions'):
-            if ACTION_DISCRETE:
-                a1 = layer_dense(actions, HIDDEN_NODES, norm=False)
-            else:
-                TILES = 10
-                actions = [tf.nn.relu(tf.concat(
-                    [TILES*a -f for f in range(TILES)]+
-                    [TILES*-a -f for f in range(TILES)]+
-                    [TILES*tf.sqrt(tf.maximum(0., 1-a**2)) -f for f in range(TILES)]
-                    , -1)) for a in actions]
-                actions = [tf.where(a>1., tf.ones_like(a), a) for a in actions]
+        if not ACTION_DISCRETE:
+            TILES = 10
+            actions = [tf.nn.relu(tf.concat(
+                [TILES*a -f for f in range(TILES)]+
+                [TILES*-a -f for f in range(TILES)]+
+                [TILES*tf.sqrt(tf.maximum(0., 1-a**2)) -f for f in range(TILES)]
+                , -1)) for a in actions]
+            actions = [tf.where(a>1., tf.ones_like(a), a) for a in actions]
+
+        combined = hidden
+        for i in range(2):
+            with tf.name_scope('actions'):
                 a1 = layer_dense(actions, HIDDEN_NODES/2, None, norm=False)
                 # Prevent dead neurons in the action layer, as it takes one-sided input
                 a1 = [tf.concat([tf.nn.relu(a), tf.nn.relu(-a)], 1) for a in a1]
+                combined = [n*a for n,a in zip(combined, a1)]
+                if ACTION_DISCRETE: break
         with tf.name_scope('output'):
-            combined = [n*a for n,a in zip(hidden, a1)]
             output = layer_dense(combined, 1, None, norm=False)
             return [n[:,0] for n in output], combined
-
-    layer_batch_norm.training_idx = -1 # No UPDATE_OPS for target network
-    if not FLAGS.tdc and not FLAGS.async:
-        state_inputs = [ph.states, ph.next_states]
-        with tf.name_scope('_policy'):
-            target_policy = make_policy(state_inputs)
-        with tf.name_scope('_value'):
-            net = make_value_lower(state_inputs)
-            #multi_actions_pre(net, target_policy, 1)
-            [_, target_value], _ = make_value_output(net, target_policy)
-            #target_value = multi_actions_post(target_value, reduce_max=True)
 
     layer_batch_norm.training_idx = 1
     state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states, ph.next_states])
@@ -381,20 +373,22 @@ def make_acrl():
 
     with tf.name_scope('value'):
         if not SHARED_LAYERS: shared = make_shared(state_inputs)
-        net = make_dense(shared)
+        REPEAT_STATE = 10 # Force network to learn multiple action values per state
+        state = make_dense(shared, HIDDEN_NODES/REPEAT_STATE)
         if FLAGS.async:
             actions = [ac.ph_policy]
         else:
-            net = [net[0], net[1], net[1], net[2]]
+            state = [state[0], state[1], state[1], state[2]]
             actions = [ac.ph_policy, ph.actions, ac.policy, ac.policy_next]
-            #multi_actions_pre(net, actions, 3)
-        multi_actions_pre(net, actions, 0, 1)
+            #multi_actions_pre(state, actions, 3)
+        multi_actions_pre(state, actions, 0, 1)
 
-        net, combined = make_value_output(net, actions)
+        state = [tf.tile(n, [1,REPEAT_STATE]) for n in state]
+        q, combined = make_value_output(state, actions)
         if FLAGS.async:
-            [ph_policy_value] = net
+            [ph_policy_value] = q
         else:
-            [ph_policy_value, ac.q_value, ac.state_value, next_state_value] = net
+            [ph_policy_value, ac.q_value, ac.state_value, next_state_value] = q
             #next_state_value = multi_actions_post(next_state_value, reduce_max=True)
         # Q for all actions in agent's current state
         ac.ph_policy_value = multi_actions_post(ph_policy_value, 1)
@@ -439,6 +433,13 @@ def make_acrl():
             scope_vars('policy', tf.GraphKeys.GLOBAL_VARIABLES))
         for t,w in copy_vars:
             ops.per_epoch.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
+
+    action_weights = scope_vars('value/actions')
+    for i in range(len(grad_s)): # Unit L2 norm weights per action tile
+        g,w = grad_s[i]
+        if w not in action_weights: continue
+        norm = tf.norm(w, axis=1, keep_dims=True)
+        grad_s[i] = (g + 1e-1*(norm-1.)*w, w)
     ac.global_norm_qvalue = accum_gradient(grad_s, opt_td)
 
     stats.reward_sum.append(tf.reduce_sum(ph.rewards[:,r]))
