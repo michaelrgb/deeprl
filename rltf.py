@@ -26,7 +26,7 @@ flags.DEFINE_float('gamma', 0.99, 'Discount rate')
 flags.DEFINE_float('decay', 0.01, 'Q-network L2 weight decay')
 flags.DEFINE_integer('minibatch', 64, 'Minibatch size')
 flags.DEFINE_boolean('tdc', True, 'TDC instead of target networks')
-flags.DEFINE_string('n_step', '10,30', 'List of multi-step returns for Q-function')
+flags.DEFINE_string('nsteps', '1,10,20,30', 'List of multi-step returns for Q-function')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -143,15 +143,16 @@ def mmap_batch(paths, mode, only_actions=False, states=True, rawframes=True):
         batch.arrays.append(batch.rawframes)
     return batch
 
-training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None,
-    n_step=[1]+[int(s) for s in FLAGS.n_step.split(',') if s])
-ph = Struct(learning_rate=tf.placeholder(DTYPE, ()),
+training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None, multi_step=True,
+    nsteps=[int(s) for s in FLAGS.nsteps.split(',') if s])
+ph = Struct(
+    multi_step=tf.placeholder('bool', ()),
     states=tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM),
     actions=tf.placeholder(DTYPE, [FLAGS.minibatch, ACTION_DIMS]),
-    next_states=[tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM) for n in training.n_step],
-    rewards=[tf.placeholder(DTYPE, [FLAGS.minibatch, REWARDS_GLOBAL]) for n in training.n_step],
+    next_states=[tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM) for n in training.nsteps],
+    rewards=[tf.placeholder(DTYPE, [FLAGS.minibatch, REWARDS_GLOBAL]) for n in training.nsteps],
     frame=tf.placeholder(DTYPE, [1, STATE_FRAMES] + FRAME_DIM),
-    n_step=tf.placeholder('int32', [len(training.n_step)]))
+    nsteps=tf.placeholder('int32', [len(training.nsteps)]))
 
 if CONV_NET:
     frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Move STATE_FRAMES into batches
@@ -290,9 +291,10 @@ def make_shared(x):
 SHARED_LAYERS = True
 MHDPA_LAYERS = 0#3
 HIDDEN_NODES = 500
-opt_td = tf.train.AdamOptimizer(ph.learning_rate)
-opt_error = tf.train.AdamOptimizer(1)
-opt_policy = tf.train.AdamOptimizer(ph.learning_rate/20)
+
+opt = Struct(td=tf.train.AdamOptimizer(FLAGS.learning_rate),
+    policy=tf.train.AdamOptimizer(FLAGS.learning_rate/20),
+    error=tf.train.AdamOptimizer(1))
 
 allac = []
 stats = Struct(reward_sum=[], td_error=[], _policy_minmax=[])
@@ -300,11 +302,10 @@ def make_acrl():
     ac = Struct(target_initial_state={})
     allac.append(ac)
 
-    def make_dense(x, outputs=HIDDEN_NODES):
-        with tf.name_scope('hidden'):
-            x = layer_dense(x, HIDDEN_NODES)
-        with tf.name_scope('hidden'):
-            x = layer_dense(x, outputs)
+    def make_dense(x, nodes=[HIDDEN_NODES]*2):
+        for n in nodes:
+            with tf.name_scope('hidden'):
+                x = layer_dense(x, n)
         return x
 
     def make_policy(shared):
@@ -318,6 +319,17 @@ def make_acrl():
             else:
                 policy = layer_dense(x, ACTION_DIMS, tf.tanh)
         return policy
+
+    layer_batch_norm.training_idx = 1
+    state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states]+ph.next_states)
+    with tf.name_scope('policy'):
+        shared = make_shared(state_inputs)
+        shared_weights = scope_vars() if SHARED_LAYERS else []
+        policy = make_policy(shared)
+        ac.ph_policy = policy[0]
+        if not FLAGS.async:
+            ac.policy = policy[1]
+            ac.policy_next = policy[2:]
 
     def multi_actions_pre(state, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
         num_actions = len(DISCRETE_ACTIONS)
@@ -347,95 +359,131 @@ def make_acrl():
                 [TILES*a -f for f in range(TILES)]+
                 [TILES*-a -f for f in range(TILES)]+
                 #[TILES*tf.sqrt(tf.maximum(0., 1-a**2)) -f for f in range(TILES)]
-                [TILES*(1-tf.abs(a)) -f for f in range(TILES)] # Drives straighter
+                [TILES*(1-tf.abs(a)) -f for f in range(TILES)]
                 , -1)) for a in actions]
             actions = [tf.where(a>1., tf.ones_like(a), a) for a in actions]
 
-        combined = state
-        for i in range(1):
-            with tf.name_scope('actions'):
-                a1 = layer_dense(actions, HIDDEN_NODES/2, None, norm=False)
-                # Prevent dead neurons in the action layer, as it takes one-sided input
-                a1 = [tf.concat([tf.nn.relu(a), tf.nn.relu(-a)], 1) for a in a1]
-                combined = [n*a for n,a in zip(combined, a1)]
-                if ACTION_DISCRETE: break
+        # Prevent dead neurons if taking one-sided input
+        double_relu = lambda x: tf.concat([tf.nn.relu(x), tf.nn.relu(-x)], 1)
+
+        with tf.name_scope('actions'):
+            if 1:
+                a1 = layer_dense(actions, HIDDEN_NODES/2, double_relu, norm=False)
+                combined = [n*a for n,a in zip(state, a1)]
+            else: # Does not work with repeated states
+                combined = [tf.concat([s,10*a], 1) for s,a in zip(state, actions)]
+                combined = layer_dense(combined, HIDDEN_NODES, double_relu, norm=False)
         with tf.name_scope('output'):
             output = layer_dense(combined, 1, None, norm=False)
             return [n[:,0] for n in output], combined
 
-    layer_batch_norm.training_idx = 1
-    state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states]+ph.next_states)
-    with tf.name_scope('policy'):
-        shared = make_shared(state_inputs)
-        shared_weights = scope_vars() if SHARED_LAYERS else []
-        policy = make_policy(shared)
-        ac.ph_policy = policy[0]
-        if not FLAGS.async:
-            ac.policy = policy[1]
-            ac.policy_next = policy[2:]
-
-    with tf.name_scope('value'):
+    gamma_nsteps = tf.expand_dims(tf.stack([FLAGS.gamma**tf.cast(ph.nsteps[i], DTYPE)
+        for i in range(len(training.nsteps))]), 0)
+    def make_qvalue(shared):
         if not SHARED_LAYERS: shared = make_shared(state_inputs)
-        REPEAT_STATE = 20 # Force network to learn multiple action values per state
-        state = make_dense(shared, HIDDEN_NODES/REPEAT_STATE)
-        if FLAGS.async:
-            actions = [ac.ph_policy]
-        else:
-            state = [state[0], state[1], state[1]] + state[2:]
-            actions = [ac.ph_policy, ph.actions, ac.policy] + ac.policy_next
-        multi_actions_pre(state, actions, 0, 1)
+        with tf.name_scope('value'):
+            state = make_dense(shared)
+            if FLAGS.async:
+                actions = [ac.ph_policy]
+            else:
+                state = [state[0], state[1], state[1]] + state[2:]
+                # Add noise to smooth value estimate and prevent overfitting
+                noise = lambda a: tf.clip_by_value(tf.random_normal(a.shape, stddev=0.2), -0.5, 0.5)
+                #next_state_actions = [a + noise(a) for a in ac.policy_next]
+                next_state_actions = ac.policy_next
+                actions = [ac.ph_policy, ph.actions, ac.policy] + next_state_actions
+            multi_actions_pre(state, actions, 0, 1)
 
-        state = [tf.tile(n, [1,REPEAT_STATE]) for n in state]
-        q, combined = make_value_output(state, actions)
-        ph_policy_value = q[0]
-        if not FLAGS.async:
-            [ac.q_value, ac.state_value] = q[1:3]
-            next_state_value = q[3:]
-        # Q for all actions in agent's current state
-        ac.ph_policy_value = multi_actions_post(ph_policy_value, 1)
+            q, combined = make_value_output(state, actions)
+            # Q for all actions in agent's current state
+            q[0] = multi_actions_post(q[0], 1)
 
-    if FLAGS.async:
-        return
+            if FLAGS.async: return q, None, None
+            value_weights = scope_vars() + shared_weights
+            action_weights = scope_vars('actions')
 
-    target_value = 0.
-    for i in range(len(training.n_step)):
-        n_return = ph.rewards[i][:,r] + next_state_value[i] * tf.expand_dims(FLAGS.gamma**tf.cast(ph.n_step[i], DTYPE), 0)
-        target_value = tf.maximum(target_value, n_return)
-    ac.td_error = target_value - ac.q_value
-
-    ac.q_grad = tf.gradients(ac.state_value, ac.policy)[0]
-    repl = gradient_override(ac.policy, ac.q_grad)
-    policy_weights = scope_vars('policy')
-    grads = opt_policy.compute_gradients(repl, policy_weights)
-    if 1:
-        adv = target_value - ac.state_value
-        adv = tf.maximum(0., adv) # Only pull towards better actions
-        adv = tf.tile(tf.expand_dims(adv,-1), [1,ACTION_DIMS]) / ACTION_DIMS
-        # Multi-step policy updates
-        action_diff = ph.actions - ac.policy
-        adv_action = tf.where(tf.abs(action_diff)>0.1, adv/action_diff, tf.zeros_like(adv))
-        repl = gradient_override(ac.policy, adv_action)
-        grads_adv = opt_policy.compute_gradients(repl, policy_weights)
-        grads = [(g+g2,w) for (g,w),(g2,_) in zip(grads, grads_adv)]
-    ac.global_norm_policy = accum_gradient(grads, opt_policy)
-
-    repl = gradient_override(ac.q_value, ac.td_error)
-    value_weights = scope_vars('value') + shared_weights
-    grad_s = opt_td.compute_gradients(repl, value_weights)
-
-    if FLAGS.tdc:
-        with tf.name_scope('_value'):
+        with tf.name_scope('error_value'):
             error_predict = layer_dense(combined, 1, None, norm=False)[1][:,0]
-            repl = gradient_override(error_predict, ac.td_error-error_predict)
-            grads = opt_error.compute_gradients(repl, scope_vars())
-            accum_gradient(grads, opt_error)
+            error_weights = scope_vars()
 
-        repl = gradient_override(next_state_value[0], -FLAGS.gamma*error_predict)
-        grad_s2 = opt_td.compute_gradients(repl, value_weights)
-        for i in range(len(grad_s)):
-            (g, w), g2 = grad_s[i], grad_s2[i][0]
-            grad_s[i] = (g+g2, w)
-    else:
+        next_state_value = q[3:]
+        nstep_values = []
+        for i in range(len(training.nsteps)):
+            n_return = ph.rewards[i][:,r] + next_state_value[i] * gamma_nsteps[:,i]
+            nstep_values.append(n_return)
+
+        def post_common_target(common_target_value):
+            q_value = q[1]
+            td_error = common_target_value - q_value
+            repl = gradient_override(error_predict, td_error-error_predict)
+            grads = opt.error.compute_gradients(repl, error_weights)
+            accum_gradient(grads, opt.error)
+
+            repl = gradient_override(q_value, td_error)
+            grad_s = opt.td.compute_gradients(repl, value_weights)
+            # TDC
+            repl = gradient_override(next_state_value[0], -error_predict * gamma_nsteps[:,0])
+            grad_s2 = opt.td.compute_gradients(repl, value_weights)
+            for i in range(len(grad_s)):
+                (g, w), g2 = grad_s[i], grad_s2[i][0]
+                grad_s[i] = (g+g2, w)
+
+            # Maintain equal weighting per action tile
+            init_vars()
+            for i in range(len(grad_s)):
+                g,w = grad_s[i]
+                if w not in action_weights: continue
+
+                # 0-mean per action tile
+                mean = tf.reduce_mean(w, 1)
+                g += opt.td.compute_gradients(mean**2, w)[0][0]
+
+                # L1 Norm per action tile
+                norm = tf.norm(w, ord=1, axis=1)
+                initial_norm = tf.reduce_mean(norm).eval()
+                print('Action weights:', w.shape.as_list(), 'initial_norm:', initial_norm)
+                g += opt.td.compute_gradients((norm-initial_norm)**2, w)[0][0]
+                grad_s[i] = g,w
+
+            global_norm_qvalue = accum_gradient(grad_s, opt.td)
+            return td_error, global_norm_qvalue
+
+        return q, nstep_values, post_common_target
+
+    [q, nstep_values1, fn1] = make_qvalue(shared)
+    ac.ph_policy_value = q[0]
+    if FLAGS.async: return
+    [_, nstep_values2, fn2] = make_qvalue(shared)
+
+    target_value = -sys.float_info.max
+    for i in range(len(training.nsteps)):
+        # Fix value overestimation by clipping the actor's critic with a second critic,
+        # to avoid the bias introduced by the policy update.
+        nstep_return = tf.minimum(nstep_values1[i], nstep_values2[i])
+        # Maximize over the n-step returns
+        target_value = tf.maximum(target_value, nstep_return)
+
+    [ac.td_error, ac.global_norm_qvalue] =\
+    fn1(target_value)
+    fn2(target_value)
+
+    ac.state_value = q[2]
+    ac.value_grad = tf.gradients(ac.state_value, ac.policy)[0]
+    repl = gradient_override(ac.policy, ac.value_grad)
+    policy_weights = scope_vars('policy')
+    grads = opt.policy.compute_gradients(repl, policy_weights)
+    if 1: # Multi-step policy updates.
+        adv = tf.maximum(0., target_value - ac.state_value) # Only towards better actions
+        adv = tf.where(ph.multi_step, adv, tf.zeros_like(adv))
+        adv = tf.tile(tf.expand_dims(adv,-1), [1,ACTION_DIMS]) / ACTION_DIMS
+        a_diff = ph.actions - ac.policy
+        adv = tf.where(tf.abs(a_diff)>0.1, adv/a_diff, tf.zeros_like(adv))
+        repl = gradient_override(ac.policy, adv)
+        grads_adv = opt.policy.compute_gradients(repl, policy_weights)
+        grads = [(g+g2,w) for (g,w),(g2,_) in zip(grads, grads_adv)]
+    ac.global_norm_policy = accum_gradient(grads, opt.policy)
+
+    if 0:
         for i in [-1]: # Q-network weight decay
             g,w = grad_s[i]
             grad_s[i] = (g + FLAGS.decay*w, w)
@@ -447,24 +495,6 @@ def make_acrl():
             scope_vars('policy', tf.GraphKeys.GLOBAL_VARIABLES))
         for t,w in copy_vars:
             ops.per_epoch.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
-
-    action_weights = scope_vars('value/actions')
-    for i in range(len(grad_s)):
-        g,w = grad_s[i]
-        if w not in action_weights: continue
-
-        # 0-mean per action tile
-        mean = tf.reduce_mean(w, 1)
-        g += opt_td.compute_gradients(mean**2, w)[0][0]
-
-        # L1 Norm per action tile
-        norm = tf.norm(w, ord=1, axis=1)
-        init_vars(); initial_norm = tf.reduce_mean(norm).eval()
-        print('Action weights:', w.shape.as_list(), 'initial_norm:', initial_norm)
-        g += opt_td.compute_gradients((norm-initial_norm)**2, w)[0][0]
-
-        grad_s[i] = g,w
-    ac.global_norm_qvalue = accum_gradient(grad_s, opt_td)
 
     stats.reward_sum.append(tf.reduce_sum(ph.rewards[0][:,r]))
     stats.td_error.append(tf.reduce_sum(ac.td_error**2))
@@ -497,7 +527,6 @@ def setup_key_actions():
         window.set_caption(str(d))
 
     def key_press(k, mod):
-        if k==0xff0d: restart = True
         if k==key.LEFT:  a[0] = -1.0
         if k==key.RIGHT: a[0] = +1.0
         if k==key.UP:    a[1] = +1.0
@@ -514,6 +543,8 @@ def setup_key_actions():
             FLAGS.discrete ^= True
         elif k==ord('i'):
             app.show_state_image = True
+        elif k==ord('m'):
+            training.multi_step ^= True
         elif k==ord('t'):
             training.enable ^= True
         elif k==ord('k'):
@@ -582,6 +613,7 @@ def step_to_frames():
         state.done |= state.next_reset
         state.last_reset += 1
         if state.done:
+            state.last_pos_reward = 0
             state.next_reset = False
             state.last_reset = 0
             # New episode
@@ -593,14 +625,14 @@ def step_to_frames():
         state.frames[frame] = obs
 
         obs, reward, state.done, info = env.step(env_action)
+        state.last_pos_reward = 0 if reward>0. else state.last_pos_reward+1
         if ENV_NAME == 'MountainCar-v0':
             # Mountain car env doesnt give any +reward
             reward = 1. if state.done else 0.
         elif ENV_NAME == 'CarRacing-v0' and not FLAGS.record:
-            if state.last_reset > 100 and state.last_pos_reward > 60:
+            if state.last_reset > 100 and state.last_pos_reward > 20:
                 state.done = True # Reset track if spinning
                 reward = -100
-        state.last_pos_reward = 0 if reward>0. or state.done else state.last_pos_reward+1
         reward_sum += reward
     state.last_obs = obs
     return [reward_sum]
@@ -711,9 +743,9 @@ proclist = []
 mb = Struct(
     states = np.zeros([FLAGS.minibatch] + STATE_DIM),
     actions = np.zeros([FLAGS.minibatch, ACTION_DIMS]),
-    next_states = [np.zeros([FLAGS.minibatch] + STATE_DIM) for n in training.n_step],
-    rewards = [np.zeros([FLAGS.minibatch, REWARDS_GLOBAL]) for n in training.n_step],
-    n_step = range(len(training.n_step)))
+    next_states = [np.zeros([FLAGS.minibatch] + STATE_DIM) for n in training.nsteps],
+    rewards = [np.zeros([FLAGS.minibatch, REWARDS_GLOBAL]) for n in training.nsteps],
+    nsteps = range(len(training.nsteps)))
 def make_minibatch(): # Each minibatch is random subset of batch trajectories
     next_step = make_minibatch.current_step + 1
     if next_step == ER_BATCH_STEPS:
@@ -739,27 +771,28 @@ def make_minibatch(): # Each minibatch is random subset of batch trajectories
     for b,batch in enumerate(make_minibatch.batch_set):
         mb.states[b] = batch.states[step]
         mb.actions[b] = batch.actions[next_step]
-        for i,n_step in enumerate(training.n_step):
+        for i,nsteps in enumerate(training.nsteps):
             accum_reward = 0.
-            for n in range(n_step):
+            for n in range(nsteps):
                 last_state = next_step + n
                 accum_reward += batch.rewards[last_state] * FLAGS.gamma**n
                 if last_state == ER_BATCH_SIZE-1:
                     break
             mb.rewards[i][b] = accum_reward
             mb.next_states[i][b] = batch.states[last_state]
-    for i,n in enumerate(training.n_step):
-        mb.n_step[i] = min(ER_BATCH_SIZE-next_step, n)
+    for i,n in enumerate(training.nsteps):
+        mb.nsteps[i] = min(ER_BATCH_SIZE-next_step, n)
 make_minibatch.current_step = 0
 
 def train_accum_minibatch():
     # Upload & train minibatch
     make_minibatch()
     feed_dict = {
+        ph.multi_step: training.multi_step,
         ph.states: mb.states,
         ph.actions: mb.actions,
-        ph.n_step: mb.n_step}
-    for i in range(len(training.n_step)):
+        ph.nsteps: mb.nsteps}
+    for i in range(len(training.nsteps)):
         feed_dict[ph.next_states[i]] = mb.next_states[i]
         feed_dict[ph.rewards[i]] = mb.rewards[i]
     # imshow([mb.states[0][:,:,i] for i in range(STATE_FRAMES)])
@@ -770,11 +803,12 @@ def train_accum_minibatch():
         print('')
 
 def train_apply_gradients():
-    r = sess.run(ops.per_epoch, feed_dict={ph.learning_rate: FLAGS.learning_rate})
+    r = sess.run(ops.per_epoch, feed_dict={})
     app.epoch_count += 1
     sess.run(ops.post_epoch)
     pprint(dict(
-        n_step=mb.n_step,#training.n_step,
+        multi_step=training.multi_step,
+        nsteps=mb.nsteps,
         epoch_count=app.epoch_count,
         epoch_td_error=    r[0][app.policy_index],
         global_norm_qvalue=r[1][app.policy_index],
