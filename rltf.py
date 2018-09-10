@@ -5,14 +5,14 @@ from utils import *
 from mhdpa import *
 from pprint import pprint
 
-# python rltf.py --batch_keep 6 --batch_async 20 --record 0
-# for i in {1..4}; do python rltf.py --async $i --batch_per_async 5 & sleep 1; done
+# python rltf.py --batch_keep 6 --batch_queue 20 --record 0
+# for i in {1..4}; do python rltf.py --inst $i --batch_per_inst 5 & sleep 1; done
 
 flags = tf.app.flags
-flags.DEFINE_integer('async', 0, 'ID of async agent that accumulates gradients on server')
+flags.DEFINE_integer('inst', 0, 'ID of agent that accumulates gradients on server')
 flags.DEFINE_integer('batch_keep', 0, 'Batches recorded from user actions')
-flags.DEFINE_integer('batch_async', 200, 'Batches to wait for from async agents')
-flags.DEFINE_integer('batch_per_async', 100, 'Batches recorded per async agent')
+flags.DEFINE_integer('batch_queue', 200, 'Batches in queue recorded from agents')
+flags.DEFINE_integer('batch_per_inst', 100, 'Batches recorded per agent instance')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved raw frames')
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
@@ -30,7 +30,7 @@ flags.DEFINE_string('nsteps', '1,10,20,30', 'List of multi-step returns for Q-fu
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
-if not FLAGS.async:
+if not FLAGS.inst:
     server = tf.train.Server({'local': [PORT]}, protocol=PROTOCOL, start=True)
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
@@ -50,7 +50,7 @@ if ENV_NAME == 'CarRacing-v0':
         [-1, 0, 0],
         [0, 1, 0],
         [0, 0, 0],
-        [0, 0, 0.8],
+        [0, 0, 1],
     ] if 1 else []
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple # [512, 288]
@@ -117,7 +117,7 @@ if CONV_NET:
 STATE_DIM[-1] *= STATE_FRAMES
 
 FIRST_BATCH = -FLAGS.batch_keep
-LAST_BATCH = FLAGS.batch_async
+LAST_BATCH = FLAGS.batch_queue
 ER_BATCH_SIZE = 100
 ER_BATCH_STEPS = ER_BATCH_SIZE-1
 
@@ -169,9 +169,9 @@ if CONV_NET:
 else:
     frame_to_state = tf.reshape(ph.frame, [1] + STATE_DIM)
 
-app = Struct(policy_index=0, quit=False, epoch_count=0, print_action=False, show_state_image=False, draw_attention=True)
-if FLAGS.async:
-    FIRST_BATCH = (FLAGS.async-1)*FLAGS.batch_per_async
+app = Struct(policy_index=0, quit=False, update_count=0, print_action=False, show_state_image=False, draw_attention=True)
+if FLAGS.inst:
+    FIRST_BATCH = (FLAGS.inst-1)*FLAGS.batch_per_inst
 else:
     def init_vars(): sess.run(tf.global_variables_initializer())
     if FLAGS.record or FLAGS.replay or FLAGS.recreate_states:
@@ -181,11 +181,11 @@ else:
         training.batches_recorded = FLAGS.batch_keep
 training.append_batch = FIRST_BATCH
 
-ops = Struct(per_minibatch=[], post_minibatch=[], per_epoch=[], post_epoch=[], post_step=[], new_batches=[])
+ops = Struct(per_minibatch=[], post_minibatch=[], per_update=[], post_update=[], post_step=[], new_batches=[])
 def accum_value(value):
     accum = tf.Variable(tf.zeros_like(value), trainable=False)
     ops.per_minibatch.append(accum.assign_add(value))
-    ops.post_epoch.append(accum.assign(tf.zeros_like(value)))
+    ops.post_update.append(accum.assign(tf.zeros_like(value)))
     return accum
 def accum_gradient(grads, opt):
     global_norm = None
@@ -194,7 +194,7 @@ def accum_gradient(grads, opt):
     # Clip gradients by global norm to prevent destabilizing policy
     grads,global_norm = tf.clip_by_global_norm(grads, 10.)
     grads = zip(grads, weights)
-    ops.per_epoch.append(opt.apply_gradients(grads))
+    ops.per_update.append(opt.apply_gradients(grads))
     return global_norm
 
 # Custom gradients to pre-multiply weight gradients before they are aggregated across the batch.
@@ -231,9 +231,9 @@ def layer_lstm(x, ac):
         scope = tf.contrib.framework.get_name_scope()
         for i in range(len(x)):
             create_initial_state = i<2
-            is_async = i==0
+            is_inst = i==0
             if create_initial_state:
-                with tf.name_scope(str(FLAGS.async)):
+                with tf.name_scope(str(FLAGS.inst)):
                     batch_size = x[i].shape[0]
                     vars = [tf.Variable(s, trainable=False, collections=[None]) for s in cell.zero_state(batch_size, DTYPE)]
                     sess.run(tf.variables_initializer(vars))
@@ -246,8 +246,8 @@ def layer_lstm(x, ac):
             x[i] = output[:,0,:]
 
             if create_initial_state:
-                [ops.post_minibatch, ops.post_step][is_async] += [initial_state[c].assign(final_state[c]) for c in range(2)]
-                if not is_async:
+                [ops.post_minibatch, ops.post_step][is_inst] += [initial_state[c].assign(final_state[c]) for c in range(2)]
+                if not is_inst:
                     ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
 
         for w in cell.weights: variable_summaries(w)
@@ -297,9 +297,8 @@ opt = Struct(td=tf.train.AdamOptimizer(FLAGS.learning_rate),
     error=tf.train.AdamOptimizer(1))
 
 allac = []
-stats = Struct(reward_sum=[], td_error=[], _policy_minmax=[])
 def make_acrl():
-    ac = Struct(target_initial_state={})
+    ac = Struct(per_minibatch=Struct(), per_update=Struct())
     allac.append(ac)
 
     def make_dense(x, nodes=[HIDDEN_NODES]*2):
@@ -321,13 +320,13 @@ def make_acrl():
         return policy
 
     layer_batch_norm.training_idx = 1
-    state_inputs = [frame_to_state] + ([] if FLAGS.async else [ph.states]+ph.next_states)
+    state_inputs = [frame_to_state] + ([] if FLAGS.inst else [ph.states]+ph.next_states)
     with tf.name_scope('policy'):
         shared = make_shared(state_inputs)
         shared_weights = scope_vars() if SHARED_LAYERS else []
         policy = make_policy(shared)
         ac.ph_policy = policy[0]
-        if not FLAGS.async:
+        if not FLAGS.inst:
             ac.policy = policy[1]
             ac.policy_next = policy[2:]
 
@@ -370,7 +369,7 @@ def make_acrl():
             if 1:
                 a1 = layer_dense(actions, HIDDEN_NODES/2, double_relu, norm=False)
                 combined = [n*a for n,a in zip(state, a1)]
-            else: # Does not work with repeated states
+            else:
                 combined = [tf.concat([s,10*a], 1) for s,a in zip(state, actions)]
                 combined = layer_dense(combined, HIDDEN_NODES, double_relu, norm=False)
         with tf.name_scope('output'):
@@ -383,22 +382,18 @@ def make_acrl():
         if not SHARED_LAYERS: shared = make_shared(state_inputs)
         with tf.name_scope('value'):
             state = make_dense(shared)
-            if FLAGS.async:
+            if FLAGS.inst:
                 actions = [ac.ph_policy]
             else:
                 state = [state[0], state[1], state[1]] + state[2:]
-                # Add noise to smooth value estimate and prevent overfitting
-                noise = lambda a: tf.clip_by_value(tf.random_normal(a.shape, stddev=0.2), -0.5, 0.5)
-                #next_state_actions = [a + noise(a) for a in ac.policy_next]
-                next_state_actions = ac.policy_next
-                actions = [ac.ph_policy, ph.actions, ac.policy] + next_state_actions
+                actions = [ac.ph_policy, ph.actions, ac.policy] + ac.policy_next
             multi_actions_pre(state, actions, 0, 1)
 
             q, combined = make_value_output(state, actions)
             # Q for all actions in agent's current state
             q[0] = multi_actions_post(q[0], 1)
 
-            if FLAGS.async: return q, None, None
+            if FLAGS.inst: return q, None, None
             value_weights = scope_vars() + shared_weights
             action_weights = scope_vars('actions')
 
@@ -435,7 +430,7 @@ def make_acrl():
                 if w not in action_weights: continue
 
                 # 0-mean per action tile
-                mean = tf.reduce_mean(w, 1)
+                mean = tf.reduce_mean(w, axis=1)
                 g += opt.td.compute_gradients(mean**2, w)[0][0]
 
                 # L1 Norm per action tile
@@ -445,14 +440,14 @@ def make_acrl():
                 g += opt.td.compute_gradients((norm-initial_norm)**2, w)[0][0]
                 grad_s[i] = g,w
 
-            global_norm_qvalue = accum_gradient(grad_s, opt.td)
-            return td_error, global_norm_qvalue
+            gnorm_qvalue = accum_gradient(grad_s, opt.td)
+            return td_error, gnorm_qvalue
 
         return q, nstep_values, post_common_target
 
     [q, nstep_values1, fn1] = make_qvalue(shared)
     ac.ph_policy_value = q[0]
-    if FLAGS.async: return
+    if FLAGS.inst: return
     [_, nstep_values2, fn2] = make_qvalue(shared)
 
     target_value = -sys.float_info.max
@@ -463,7 +458,7 @@ def make_acrl():
         # Maximize over the n-step returns
         target_value = tf.maximum(target_value, nstep_return)
 
-    [ac.td_error, ac.global_norm_qvalue] =\
+    [ac.td_error, ac.per_update.gnorm_qvalue] =\
     fn1(target_value)
     fn2(target_value)
 
@@ -472,16 +467,16 @@ def make_acrl():
     repl = gradient_override(ac.policy, ac.value_grad)
     policy_weights = scope_vars('policy')
     grads = opt.policy.compute_gradients(repl, policy_weights)
+    ac.per_update.gnorm_policy = accum_gradient(grads, opt.policy)
+
     if 1: # Multi-step policy updates.
         adv = tf.maximum(0., target_value - ac.state_value) # Only towards better actions
         adv = tf.where(ph.multi_step, adv, tf.zeros_like(adv))
-        adv = tf.tile(tf.expand_dims(adv,-1), [1,ACTION_DIMS]) / ACTION_DIMS
+        adv = tf.tile(tf.expand_dims(adv,-1), [1,ACTION_DIMS])
         a_diff = ph.actions - ac.policy
-        adv = tf.where(tf.abs(a_diff)>0.1, adv/a_diff, tf.zeros_like(adv))
-        repl = gradient_override(ac.policy, adv)
+        repl = gradient_override(ac.policy, adv*a_diff)
         grads_adv = opt.policy.compute_gradients(repl, policy_weights)
-        grads = [(g+g2,w) for (g,w),(g2,_) in zip(grads, grads_adv)]
-    ac.global_norm_policy = accum_gradient(grads, opt.policy)
+        ac.per_update.gnorm_policy_adv = accum_gradient(grads_adv, opt.policy)
 
     if 0:
         for i in [-1]: # Q-network weight decay
@@ -494,13 +489,13 @@ def make_acrl():
             scope_vars('_policy', tf.GraphKeys.GLOBAL_VARIABLES),
             scope_vars('policy', tf.GraphKeys.GLOBAL_VARIABLES))
         for t,w in copy_vars:
-            ops.per_epoch.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
+            ops.per_update.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
 
-    stats.reward_sum.append(tf.reduce_sum(ph.rewards[0][:,r]))
-    stats.td_error.append(tf.reduce_sum(ac.td_error**2))
-    stats._policy_minmax.append(tf.concat([
+    ac.per_minibatch.reward_sum = tf.reduce_sum(ph.rewards[0][:,r])
+    ac.per_minibatch.td_error = tf.reduce_sum(ac.td_error**2)
+    ac.per_minibatch._policy_minmax = tf.concat([
         [tf.reduce_min(ac.policy, axis=0)],
-        [tf.reduce_max(ac.policy, axis=0)]], axis=0))
+        [tf.reduce_max(ac.policy, axis=0)]], axis=0)
 
 for r in range(REWARDS_ALL):
     with tf.name_scope('ac'): make_acrl()
@@ -517,7 +512,7 @@ def setup_key_actions():
     a = np.array([0.]*max(3, ACTION_DIMS))
 
     def settings_caption():
-        d = dict(async=FLAGS.async,
+        d = dict(inst=FLAGS.inst,
             policy_index=app.policy_index,
             options=(['sample '+str(FLAGS.sample_action)] if FLAGS.sample_action else []) +
                 (['discrete'] if FLAGS.discrete else []) +
@@ -648,7 +643,7 @@ with tf.get_default_graph().control_dependencies(ops.ph_step):
     ops.ph_step.append(tf.group(*ops.post_step))
 def append_to_batch():
     save_paths = batch_paths(training.append_batch)
-    if not FLAGS.async and FLAGS.recreate_states:
+    if not FLAGS.inst and FLAGS.recreate_states:
         if not state.count:
             training.saved_batch = mmap_batch(save_paths, 'r', states=False)
         batch = training.saved_batch
@@ -670,7 +665,7 @@ def append_to_batch():
             args=([save_state[0,:,:,CHANNELS*i:CHANNELS*(i+1)] for i in range(STATE_FRAMES)],))
         proc.start()
 
-    temp_paths = batch_paths(FLAGS.async, 'temp')
+    temp_paths = batch_paths(FLAGS.inst, 'temp')
     if not training.temp_batch:
         training.temp_batch = mmap_batch(temp_paths, 'w+')
     batch = training.temp_batch
@@ -681,12 +676,12 @@ def append_to_batch():
 
     state.count += 1
     if state.count == ER_BATCH_SIZE:
-        if FLAGS.async or training.batches_recorded < FLAGS.batch_keep:
+        if FLAGS.inst or training.batches_recorded < FLAGS.batch_keep:
             print('Replacing batch #%i' % training.append_batch)
             for a in batch.arrays: del a
             training.temp_batch = None
 
-            # Rename async batch files into server's ER batches.
+            # Rename inst batch files into server's ER batches.
             for k in save_paths.keys():
                 src = temp_paths[k]
                 dst = save_paths[k]
@@ -695,33 +690,34 @@ def append_to_batch():
 
         training.batches_recorded += 1
         training.append_batch += 1
-        if FLAGS.async and training.batches_recorded == FLAGS.batch_per_async:
+        if FLAGS.inst and training.batches_recorded == FLAGS.batch_per_inst:
             training.batches_recorded = 0
             training.append_batch = FIRST_BATCH
         state.count = 0
 
-if not FLAGS.async:
-    epoch_td_error = accum_value(tf.concat([stats.td_error], 0))
-    #variable_summaries(epoch_td_error, 'td_error')
-    ops.per_epoch = [
-        epoch_td_error,
-        tf.concat([[ac.global_norm_qvalue] for ac in allac], 0),
-        tf.concat([[ac.global_norm_policy] for ac in allac], 0),
-    ] + ops.per_epoch
+def tensor_dict_print(r, dict_name):
+    if app.policy_index == -1: return
+    keys = sorted(allac[0].__dict__[dict_name].__dict__.keys())
+    d = {s: r[-i-1][app.policy_index] for i,s in enumerate(reversed(keys))}
+    pprint({dict_name: d})
+def tensor_dict_compile(dict_name):
+    keys = sorted(allac[0].__dict__[dict_name].__dict__.keys())
+    ops.__dict__[dict_name] += [tf.concat([[allac[r].__dict__[dict_name].__dict__[s]]
+        for r in range(len(allac))], 0) for s in keys]
+
+if not FLAGS.inst:
     init_vars()
 
-    updates = tf.get_collection(tf.GraphKeys.UPDATE_OPS) # batch_norm
-    #updates.pop(-2) # Skip output layer mean_update
-    ops.per_minibatch += updates
+    ops.per_minibatch += tf.get_collection(tf.GraphKeys.UPDATE_OPS) # batch_norm
     with tf.get_default_graph().control_dependencies(ops.per_minibatch):
         ops.per_minibatch.append(tf.group(*ops.post_minibatch))
-    for s in sorted(stats.__dict__.keys()):
-        ops.per_minibatch.append(tf.concat([[r] for r in stats.__dict__[s]], 0))
+    tensor_dict_compile('per_minibatch')
 
+    tensor_dict_compile('per_update')
     if FLAGS.summary:
         train_writer = tf.summary.FileWriter(FLAGS.summary, sess.graph)
         merged = tf.summary.merge_all()
-        ops.per_epoch.append(merged)
+        ops.per_update.insert(0, merged)
 
 manager = multiprocessing.Manager()
 batch_sets = manager.list()
@@ -730,7 +726,7 @@ def proc_batch_set():
     while len(batch_set) < FLAGS.minibatch:
         try:
             idx = -np.random.choice(FLAGS.batch_keep+1) if np.random.choice(2) \
-                else np.random.choice(FLAGS.batch_async)
+                else np.random.choice(FLAGS.batch_queue)
             if idx in batch_set: continue
             b = mmap_batch(batch_paths(idx), 'r', rawframes=False)
             batch_set[idx] = b
@@ -797,33 +793,29 @@ def train_accum_minibatch():
         feed_dict[ph.rewards[i]] = mb.rewards[i]
     # imshow([mb.states[0][:,:,i] for i in range(STATE_FRAMES)])
     r = sess.run(ops.per_minibatch, feed_dict)
-    if app.policy_index != -1:
-        for i,s in enumerate(reversed(sorted(stats.__dict__.keys()))):
-            sys.stdout.write(s+': ' + ('\n'if s[0]=='_'else'') + str(r[-i-1][app.policy_index])+'  ')
-        print('')
+    tensor_dict_print(r, 'per_minibatch')
 
 def train_apply_gradients():
-    r = sess.run(ops.per_epoch, feed_dict={})
-    app.epoch_count += 1
-    sess.run(ops.post_epoch)
+    r = sess.run(ops.per_update, feed_dict={})
+    tensor_dict_print(r, 'per_update')
+
+    app.update_count += 1
+    sess.run(ops.post_update)
     pprint(dict(
         multi_step=training.multi_step,
         nsteps=mb.nsteps,
-        epoch_count=app.epoch_count,
-        epoch_td_error=    r[0][app.policy_index],
-        global_norm_qvalue=r[1][app.policy_index],
-        global_norm_policy=r[2][app.policy_index],
+        update_count=app.update_count,
         rates=dict(learning_rate=FLAGS.learning_rate, tau=FLAGS.tau, decay=FLAGS.decay, gamma=FLAGS.gamma),
-        batches=dict(keep=FLAGS.batch_keep,async=FLAGS.batch_async,minibatch=FLAGS.minibatch)))
+        batches=dict(keep=FLAGS.batch_keep,inst=FLAGS.batch_queue,minibatch=FLAGS.minibatch)))
     os.system('clear') # Scroll up to see status
 
-    if FLAGS.summary and not app.epoch_count%100:
-        summary = r[-1]
-        train_writer.add_summary(summary, app.epoch_count)
+    if FLAGS.summary and not app.update_count%100:
+        summary = r[0]
+        train_writer.add_summary(summary, app.update_count)
 
 def rl_loop():
     while not app.quit:
-        if FLAGS.async or not training.enable or training.batches_recorded < FLAGS.batch_keep:
+        if FLAGS.inst or not training.enable or training.batches_recorded < FLAGS.batch_keep:
             append_to_batch()
             continue
         for i in range(1):
