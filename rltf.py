@@ -18,7 +18,6 @@ flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved 
 flags.DEFINE_boolean('record', False, 'Record over kept batches')
 flags.DEFINE_string('summary', '/tmp/tf', 'Summaries path for Tensorboard')
 flags.DEFINE_string('env_seed', '', 'Seed number for new environment')
-flags.DEFINE_boolean('discrete', False, 'Discretize actions to list')
 flags.DEFINE_float('sample_action', 0., 'Sample actions, or use policy')
 flags.DEFINE_float('learning_rate', 1e-4, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
@@ -34,7 +33,7 @@ if not FLAGS.inst:
     server = tf.train.Server({'local': [PORT]}, protocol=PROTOCOL, start=True)
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
-STATE_FRAMES = 3    # Frames an action is repeated for, combined into a state
+STATE_FRAMES = 5    # Frames an action is repeated for, combined into a state
 
 DISCRETE_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
@@ -96,8 +95,12 @@ def hook_swapbuffers():
 ACTION_DIMS = (env.action_space.shape or [env.action_space.n])[0]
 ACTION_DISCRETE = not env.action_space.shape
 def onehot_vector(idx, dims): return [1. if idx == i else 0. for i in range(dims)]
-if ACTION_DISCRETE: MULTI_ACTIONS = [onehot_vector(a, ACTION_DIMS) for a in range(ACTION_DIMS)]
-else: MULTI_ACTIONS = DISCRETE_ACTIONS
+ACTION_DOUBLE = 1
+if ACTION_DISCRETE:
+    MULTI_ACTIONS = [onehot_vector(a, ACTION_DIMS) for a in range(ACTION_DIMS)]
+else:
+    MULTI_ACTIONS = DISCRETE_ACTIONS
+    ACTION_DOUBLE = 2
 MULTI_ACTIONS = tf.constant(MULTI_ACTIONS, DTYPE)
 POLICY_SOFTMAX = ACTION_DISCRETE
 FRAME_DIM = list(env.observation_space.shape)
@@ -123,14 +126,14 @@ ER_BATCH_STEPS = ER_BATCH_SIZE-1
 
 def batch_paths(batch_num, path=None):
     if not path:
-        path = ENV_NAME + '_' + str(STATE_FRAMES)
+        path = '%s_%i_%i' % (ENV_NAME, STATE_FRAMES, ACTION_DOUBLE)
     os.system('mkdir -p batches')
     path = 'batches/' + path + '_%i_%s.mmap'
     return {key: path % (batch_num, key) for key in ['rawframes', 'states', 'actions', 'rewards']}
 
 REWARDS_GLOBAL = REWARDS_ALL = 1
 def mmap_batch(paths, mode, only_actions=False, states=True, rawframes=True):
-    batch = Struct(actions=np.memmap(paths['actions'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_DIMS)))
+    batch = Struct(actions=np.memmap(paths['actions'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_DIMS*ACTION_DOUBLE)))
     if only_actions:
         return batch.actions
     batch.rewards = np.memmap(paths['rewards'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, REWARDS_GLOBAL))
@@ -150,7 +153,7 @@ ph = Struct(
     adv=tf.placeholder('bool', ()),
     ddpg=tf.placeholder('bool', ()),
     states=tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM),
-    actions=tf.placeholder(DTYPE, [FLAGS.minibatch, ACTION_DIMS]),
+    actions=tf.placeholder(DTYPE, [FLAGS.minibatch, ACTION_DIMS*ACTION_DOUBLE]),
     next_states=[tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM) for n in training.nsteps],
     rewards=[tf.placeholder(DTYPE, [FLAGS.minibatch, REWARDS_GLOBAL]) for n in training.nsteps],
     frame=tf.placeholder(DTYPE, [1, STATE_FRAMES] + FRAME_DIM),
@@ -256,36 +259,40 @@ def layer_lstm(x, ac):
     return x
 
 def make_conv_net(x):
-    print(x[0].shape)
-    if not CONV_NET:
-        return x
-
     LAYERS = [
-        (32, 8, 2),
-        (32, 8, 2),
-        (32, 4, 2)]
+        (32, 8, 4),
+        (32, 4, 2),
+        (32, 3, 1)]
     for l,(filters, width, stride) in enumerate(LAYERS):
         with tf.name_scope('conv'):
             x = layer_batch_norm(x)
             _scope = tf.contrib.framework.get_name_scope()
-            conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, activation=tf.tanh, _scope=_scope)
+            conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, activation=tf.nn.elu, _scope=_scope)
             x = [conv.apply(n) for n in x]
             for w in conv.weights: variable_summaries(w)
         print(x[0].shape)
     return x
 
-def make_shared(x, ac):
-    x = make_conv_net(x)
-    if MHDPA_LAYERS:
-        x = [concat_coord_xy(n) for n in x]
-        for l in range(MHDPA_LAYERS):
-            relational = MHDPA()
-            with tf.name_scope('mhdpa'):
+def make_attention_net(x, ac):
+    relational = MHDPA()
+    for l in range(MHDPA_LAYERS):
+        with tf.name_scope('mhdpa'):
+            if l == 0:
                 x = layer_batch_norm(x)
-                for i,n in enumerate(x):
-                    x[i], attention = relational.apply(n)
-                    if i==0 and l==(MHDPA_LAYERS-1):
-                        ac.ph_attention = attention # Display agent attention
+                x = [concat_coord_xy(n) for n in x]
+            for i,n in enumerate(x):
+                x[i], attention = relational.apply(n)
+                if i==0 and l==(MHDPA_LAYERS-1):
+                    ac.ph_attention = attention # Display agent attention
+    return x
+
+def make_shared(x, ac):
+    print(x[0].shape)
+    if CONV_NET:
+        x = make_conv_net(x)
+    if MHDPA_LAYERS:
+        x = make_attention_net(x, ac)
+
     x = [tf.layers.flatten(n) for n in x]
     print(x[0].shape)
     return x
@@ -310,15 +317,18 @@ def make_acrl():
         return x
 
     def make_policy(shared):
-        x = make_dense(shared)
+        hidden = make_dense(shared)
         with tf.name_scope('output'):
             softmax_dims = ACTION_DIMS if POLICY_SOFTMAX else len(DISCRETE_ACTIONS)
             if softmax_dims:
-                policy = layer_dense(x, softmax_dims, tf.nn.softmax)
+                policy = layer_dense(hidden, softmax_dims, tf.nn.softmax)
                 if DISCRETE_ACTIONS:
                     policy = [tf.matmul(n,MULTI_ACTIONS) for n in policy]
             else:
-                policy = layer_dense(x, ACTION_DIMS, tf.tanh)
+                policy = layer_dense(hidden, ACTION_DIMS, tf.tanh)
+        if ACTION_DOUBLE == 2:
+            with tf.name_scope('multiply'):
+                policy = [tf.concat([p,m],-1) for p,m in zip(policy, layer_dense(hidden, ACTION_DIMS, tf.nn.sigmoid))]
         return policy
 
     layer_batch_norm.training_idx = 1
@@ -335,7 +345,7 @@ def make_acrl():
     def multi_actions_pre(state, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
         num_actions = len(DISCRETE_ACTIONS)
         if not num_actions: return
-        a = tf.tile(tf.expand_dims(MULTI_ACTIONS, 0), [batch_size, 1, 1])
+        a = tf.tile(tf.expand_dims(MULTI_ACTIONS, 0), [batch_size, 1, ACTION_DOUBLE])
         if include_policy:
             num_actions += 1
             policy_action = tf.expand_dims(actions[idx], 1)
@@ -355,8 +365,8 @@ def make_acrl():
 
     def make_value_output(state, actions):
         actions = [tf.concat([a, 1-a, a+1], -1) for a in actions]
-        offsets = [0.1, 0.25, 0.5]
-        actions = [tf.concat(
+        offsets = [0.05, 0.1, 0.2, 0.4]
+        actions = [tf.concat([a] +
             [a+o for o in offsets] +
             [a-o for o in offsets], -1) for a in actions]
 
@@ -416,12 +426,14 @@ def make_acrl():
 
             repl = gradient_override(value.q, td_error)
             grad_s = opt.td.compute_gradients(repl, value_weights)
-            # TDC
-            repl = gradient_override(next_state_value[0], -error_predict * gamma_nsteps[:,0])
-            grad_s2 = opt.td.compute_gradients(repl, value_weights)
-            for i in range(len(grad_s)):
-                (g, w), g2 = grad_s[i], grad_s2[i][0]
-                grad_s[i] = (g+g2, w)
+            # TDC averaged over all n-steps
+            tdc_steps = len(training.nsteps)
+            for i in range(tdc_steps):
+                repl = gradient_override(next_state_value[i], -gamma_nsteps[:,i]*error_predict / tdc_steps)
+                grad_s2 = opt.td.compute_gradients(repl, value_weights)
+                for i in range(len(grad_s)):
+                    (g, w), g2 = grad_s[i], grad_s2[i][0]
+                    grad_s[i] = (g+g2, w)
 
             ac.td_error = td_error
             ac.per_update.gnorm_qvalue = accum_gradient(grad_s, opt.td)
@@ -455,7 +467,7 @@ def make_acrl():
     if 1: # Policy updates using multi-step advantage value
         adv = tf.maximum(0., target_value - value1.state) # Only towards better actions
         adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
-        adv = tf.tile(tf.expand_dims(adv,-1), [1,ACTION_DIMS])
+        adv = tf.expand_dims(adv, -1)
         a_diff = ph.actions - ac.policy
         repl = gradient_override(ac.policy, adv*a_diff)
         grads_adv = opt.policy.compute_gradients(repl, policy_weights)
@@ -476,9 +488,8 @@ def make_acrl():
 
     ac.per_minibatch.reward_sum = tf.reduce_sum(ph.rewards[0][:,r])
     ac.per_minibatch.td_error = tf.reduce_sum(ac.td_error**2)
-    ac.per_minibatch._policy_minmax = tf.concat([
-        [tf.reduce_min(ac.policy, axis=0)],
-        [tf.reduce_max(ac.policy, axis=0)]], axis=0)
+    ac.per_minibatch.policy_min = tf.reduce_min(ac.policy, axis=0)
+    ac.per_minibatch.policy_max = tf.reduce_max(ac.policy, axis=0)
 
 for r in range(REWARDS_ALL):
     with tf.name_scope('ac'): make_acrl()
@@ -498,7 +509,6 @@ def setup_key_actions():
         d = dict(inst=FLAGS.inst,
             policy_index=app.policy_index,
             options=(['sample '+str(FLAGS.sample_action)] if FLAGS.sample_action else []) +
-                (['discrete'] if FLAGS.discrete else []) +
                 (['print'] if app.print_action else []) +
                 (['attention'] if app.draw_attention else []))
         print(d)
@@ -517,8 +527,6 @@ def setup_key_actions():
             app.print_action ^= True
         elif k==ord('s'):
             FLAGS.sample_action = 0.
-        elif k==ord('d'):
-            FLAGS.discrete ^= True
         elif k==ord('i'):
             app.show_state_image = True
         elif k==ord('v'):
@@ -561,9 +569,11 @@ def step_to_frames():
         return e_x / e_x.sum()
     def choose_action(value): # Choose from Q-values or softmax policy
         return np.random.choice(value.shape[0], p=softmax(value)) if FLAGS.sample_action else np.argmax(value)
+    def interp(f, a, b): return a + f*(b-a)
 
     a = action.keyboard[:ACTION_DIMS].copy()
     if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1., ACTION_DIMS))
+    if ACTION_DOUBLE == 2: a = np.concatenate([a,a], 0)
 
     if state.count > 0 and app.policy_index != -1:
         a = action.policy.copy()
@@ -572,12 +582,8 @@ def step_to_frames():
             a = ([action.policy] + MULTI_ACTIONS)[idx]
     if FLAGS.sample_action:
         np.random.seed(0)
-        offset = np.array([FLAGS.sample_action*math.sin(2*math.pi*(r + 8./(1+state.count))) for r in np.random.rand(ACTION_DIMS)])
+        offset = np.array([FLAGS.sample_action*math.sin(2*math.pi*(r + state.count/10.)) for r in np.random.rand(ACTION_DIMS*ACTION_DOUBLE)])
         a = np.clip(a+offset, -1, 1.)
-
-    if FLAGS.discrete and DISCRETE_ACTIONS:
-        idx = np.argmin(((np.array(DISCRETE_ACTIONS) - a)**2).sum(1))
-        a = DISCRETE_ACTIONS[idx]
 
     env_action = a
     if ACTION_DISCRETE:
@@ -604,14 +610,19 @@ def step_to_frames():
         #imshow([obs, test_lcn(obs, sess)[0]])
         state.frames[frame] = obs
 
-        obs, reward, state.done, info = env.step(env_action)
+        if ACTION_DOUBLE == 2:
+            a,b = env_action[:ACTION_DIMS], env_action[ACTION_DIMS:]
+            lerp = interp(frame/(STATE_FRAMES-1.), a, a*b)
+        else: lerp = env_action
+
+        obs, reward, state.done, info = env.step(lerp)
         state.last_pos_reward = 0 if reward>0. else state.last_pos_reward+1
         if ENV_NAME == 'MountainCar-v0':
             # Mountain car env doesnt give any +reward
             reward = 1. if state.done else 0.
         elif ENV_NAME == 'CarRacing-v0' and not FLAGS.record:
-            if state.last_reset > 100 and state.last_pos_reward > 20:
-                state.done = True # Reset track if spinning
+            if state.last_pos_reward > 100 or not any([len(w.tiles) for w in envu.car.wheels]):
+                state.done = True # Reset track if on grass
                 reward = -100
         reward_sum += reward
     state.last_obs = obs
@@ -683,7 +694,8 @@ def append_to_batch():
 def tensor_dict_print(r, dict_name):
     if app.policy_index == -1: return
     keys = sorted(allac[0].__dict__[dict_name].__dict__.keys())
-    d = {s: r[-i-1][app.policy_index] for i,s in enumerate(reversed(keys))}
+    np.set_printoptions(suppress=True, precision=6, sign=' ')
+    d = {s: str(r[-i-1][app.policy_index]) for i,s in enumerate(reversed(keys))}
     pprint({dict_name: d})
 def tensor_dict_compile(dict_name):
     keys = sorted(allac[0].__dict__[dict_name].__dict__.keys())
@@ -723,7 +735,7 @@ def proc_batch_set():
 proclist = []
 mb = Struct(
     states = np.zeros([FLAGS.minibatch] + STATE_DIM),
-    actions = np.zeros([FLAGS.minibatch, ACTION_DIMS]),
+    actions = np.zeros([FLAGS.minibatch, ACTION_DIMS*ACTION_DOUBLE]),
     next_states = [np.zeros([FLAGS.minibatch] + STATE_DIM) for n in training.nsteps],
     rewards = [np.zeros([FLAGS.minibatch, REWARDS_GLOBAL]) for n in training.nsteps],
     nsteps = range(len(training.nsteps)))

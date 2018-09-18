@@ -18,7 +18,8 @@ def concat_coord_xy(x):
     return tf.concat([x, coord], -1)
 
 class MHDPA(base.Layer):
-    def __init__(self, heads=4, d_k=32, d_ff=128):
+    # heads*d_k should be >= d_model
+    def __init__(self, heads=8, d_k=16, d_ff=128):
         super(MHDPA, self).__init__()
         self.heads = heads
         self.d_k = d_k
@@ -26,16 +27,17 @@ class MHDPA(base.Layer):
 
     def apply(self, x):
         s = x.shape.as_list()
-        d_v = s[-1]
+        d_model = s[-1]
+        d_v = self.d_k
         if not self.weights:
             # Sublayer 1
-            self.query = self.add_variable('query', [d_v, self.heads, self.d_k])
-            self.key = self.add_variable('key',     [d_v, self.heads, self.d_k])
-            self.value = self.add_variable('value', [d_v, self.heads, d_v])
-            self.final = self.add_variable('final', [self.heads, d_v, d_v])
+            self.query = self.add_variable('query', [d_model, self.heads, self.d_k])
+            self.key = self.add_variable('key',     [d_model, self.heads, self.d_k])
+            self.value = self.add_variable('value', [d_model, self.heads, d_v])
+            self.final = self.add_variable('final', [self.heads, d_v, d_model])
             # Sublayer 2
-            self.kernel1 = self.add_variable('kernel1', [d_v, self.d_ff])
-            self.kernel2 = self.add_variable('kernel2', [self.d_ff, d_v])
+            self.kernel1 = self.add_variable('kernel1', [d_model, self.d_ff])
+            self.kernel2 = self.add_variable('kernel2', [self.d_ff, d_model])
 
         def layer_norm(n): return tf.contrib.layers.layer_norm(n, False, False, begin_norm_axis=-1)
 
@@ -44,15 +46,17 @@ class MHDPA(base.Layer):
         key = tf.tensordot(x, self.key, [[-1], [0]])
         value = tf.tensordot(x, self.value, [[-1], [0]])
 
-        if 0:
+        if 1:
             query = layer_norm(query)
             key = layer_norm(key)
-            value = layer_norm(value)
+            #value = layer_norm(value)
 
         # Compare each q with every other entity k via dot-product
-        query = tf.expand_dims(tf.expand_dims(query, 3), 3)
-        key = tf.expand_dims(tf.expand_dims(key, 1), 1)
-        value = tf.expand_dims(tf.expand_dims(value, 1), 1)
+        dims = 2
+        for d in range(dims):
+            query = tf.expand_dims(query, 3)
+            key = tf.expand_dims(key, 1)
+            value = tf.expand_dims(value, 1)
         unnormalized = tf.reduce_sum(query * key, -1)
 
         # Softmax on combined dimension
