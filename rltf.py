@@ -25,7 +25,7 @@ flags.DEFINE_float('gamma', 0.99, 'Discount rate')
 flags.DEFINE_float('decay', 0.01, 'Q-network L2 weight decay')
 flags.DEFINE_integer('minibatch', 64, 'Minibatch size')
 flags.DEFINE_boolean('tdc', True, 'TDC instead of target networks')
-flags.DEFINE_string('nsteps', '1,10,20,30', 'List of multi-step returns for Q-function')
+flags.DEFINE_string('nsteps', '1,30', 'List of multi-step returns for Q-function')
 FLAGS = flags.FLAGS
 
 PORT, PROTOCOL = 'localhost:2222', 'grpc'
@@ -34,6 +34,7 @@ if not FLAGS.inst:
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 STATE_FRAMES = 5    # Frames an action is repeated for, combined into a state
+USE_LSTM = False
 
 DISCRETE_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
@@ -218,21 +219,21 @@ def layer_batch_norm(x):
     _scope = tf.contrib.framework.get_name_scope()
     norm = tf.layers.BatchNormalization(_scope=_scope, scale=False, center=False)
     x = [norm.apply(x[i], training=i==layer_batch_norm.training_idx) for i in range(len(x))]
-    for w in norm.weights: variable_summaries(w)
+    map(variable_summaries, norm.weights)
     return x
 
 def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False, trainable=True):
     if norm: x = layer_batch_norm(x)
     _scope = tf.contrib.framework.get_name_scope()
     dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable, _scope=_scope)
-    x = [dense.apply(n) for n in x]
-    for w in dense.weights: variable_summaries(w)
+    x = map(dense.apply, x)
+    map(variable_summaries, dense.weights)
     return x
 
-def layer_lstm(x, ac):
-    cell = rnn.LSTMCell(HIDDEN_NODES, use_peepholes=True)
-    x = layer_batch_norm(x)
+def layer_lstm(x, outputs, ac):
+    cell = rnn.LSTMCell(outputs, use_peepholes=True)
     with tf.name_scope('lstm'):
+        x = layer_batch_norm(x)
         scope = tf.contrib.framework.get_name_scope()
         for i in range(len(x)):
             create_initial_state = i<2
@@ -243,12 +244,14 @@ def layer_lstm(x, ac):
                     vars = [tf.Variable(s, trainable=False, collections=[None]) for s in cell.zero_state(batch_size, DTYPE)]
                     sess.run(tf.variables_initializer(vars))
                     initial_state = tf.contrib.rnn.LSTMStateTuple(*vars)
-            else:
+            elif i>=3: # Multi-next-states have no valid initial_state
+                initial_state = None
+            else: # Next-state
                 initial_state = final_state
 
             x[i] = tf.expand_dims(x[i], 1) # [batch_size, max_time (i.e. 1), ...],
-            output, final_state = tf.nn.dynamic_rnn(cell, x[i], initial_state=initial_state, scope=scope)
-            x[i] = output[:,0,:]
+            output, final_state = tf.nn.dynamic_rnn(cell, x[i], initial_state=initial_state, dtype=DTYPE, scope=scope)
+            x[i] = tf.nn.relu(output[:,0,:]) # Need sparsity
 
             if create_initial_state:
                 [ops.post_minibatch, ops.post_step][is_inst] += [initial_state[c].assign(final_state[c]) for c in range(2)]
@@ -267,9 +270,18 @@ def make_conv_net(x):
         with tf.name_scope('conv'):
             x = layer_batch_norm(x)
             _scope = tf.contrib.framework.get_name_scope()
-            conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, activation=tf.nn.elu, _scope=_scope)
-            x = [conv.apply(n) for n in x]
-            for w in conv.weights: variable_summaries(w)
+            kwds = dict(activation=tf.nn.relu, _scope=_scope)
+            conv3d = 0==l
+            if conv3d:
+                filters /= 2
+                conv = tf.layers.Conv3D(filters, (width, width, 3), (stride, stride, 1), use_bias=False, **kwds)
+                x = [tf.expand_dims(n,-1) for n in x]
+            else:
+                conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, **kwds)
+            x = map(conv.apply, x)
+            map(variable_summaries, conv.weights)
+            if conv3d:
+                x = [tf.reshape(n, n.shape.as_list()[:-2] + [-1]) for n in x]
         print(x[0].shape)
     return x
 
@@ -279,7 +291,7 @@ def make_attention_net(x, ac):
         with tf.name_scope('mhdpa'):
             if l == 0:
                 x = layer_batch_norm(x)
-                x = [concat_coord_xy(n) for n in x]
+                x = map(concat_coord_xy, x)
             for i,n in enumerate(x):
                 x[i], attention = relational.apply(n)
                 if i==0 and l==(MHDPA_LAYERS-1):
@@ -293,7 +305,7 @@ def make_shared(x, ac):
     if MHDPA_LAYERS:
         x = make_attention_net(x, ac)
 
-    x = [tf.layers.flatten(n) for n in x]
+    x = map(tf.layers.flatten, x)
     print(x[0].shape)
     return x
 
@@ -310,10 +322,11 @@ def make_acrl():
     ac = Struct(per_minibatch=Struct(), per_update=Struct())
     allac.append(ac)
 
-    def make_dense(x, nodes=[HIDDEN_NODES]*2):
-        for n in nodes:
+    def make_dense(x, layers=[HIDDEN_NODES]*2):
+        for i,l in enumerate(layers):
             with tf.name_scope('hidden'):
-                x = layer_dense(x, n)
+                if USE_LSTM and i==0: x = layer_lstm(x, l, ac)
+                else: x = layer_dense(x, l)
         return x
 
     def make_policy(shared):
@@ -369,9 +382,6 @@ def make_acrl():
         actions = [tf.concat([a] +
             [a+o for o in offsets] +
             [a-o for o in offsets], -1) for a in actions]
-
-        # Prevent dead neurons if taking one-sided input
-        double_relu = lambda x: tf.nn.relu(tf.concat([x, -x], -1))
 
         with tf.name_scope('actions'):
             if 1:
@@ -465,7 +475,7 @@ def make_acrl():
         ac.per_update.gnorm_policy_ddpg = accum_gradient(grads, opt.policy)
 
     if 1: # Policy updates using multi-step advantage value
-        adv = tf.maximum(0., target_value - value1.state) # Only towards better actions
+        adv = tf.maximum(0., target_value - tf.maximum(value1.state, value2.state)) # Only towards better actions
         adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
         adv = tf.expand_dims(adv, -1)
         a_diff = ph.actions - ac.policy

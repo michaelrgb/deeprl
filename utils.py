@@ -17,6 +17,9 @@ def variable_summaries(var, scope=None):
         tf.summary.scalar('stddev', stddev)
         tf.summary.histogram('histogram', var)
 
+# Prevent dead neurons if taking one-sided input
+double_relu = lambda x: tf.nn.relu(tf.concat([x, -x], -1))
+
 def conv2d(x, W, stride=1, padding='VALID'):
     return tf.nn.conv2d(x, W, strides=[1, stride, stride, 1], padding=padding)
 def max_pool(x, size=4, stride=1, padding='VALID'):
