@@ -2,7 +2,6 @@ import tensorflow as tf, numpy as np
 from tensorflow.contrib import rnn
 import sys, os, multiprocessing, time, math
 from utils import *
-from mhdpa import *
 from pprint import pprint
 
 # python rltf.py --batch_keep 6 --batch_queue 20 --record 0
@@ -22,7 +21,6 @@ flags.DEFINE_float('sample_action', 0., 'Sample actions, or use policy')
 flags.DEFINE_float('learning_rate', 1e-4, 'Learning rate')
 flags.DEFINE_float('tau', 1e-3, 'Target network update rate')
 flags.DEFINE_float('gamma', 0.99, 'Discount rate')
-flags.DEFINE_float('decay', 0.01, 'Q-network L2 weight decay')
 flags.DEFINE_integer('minibatch', 64, 'Minibatch size')
 flags.DEFINE_boolean('tdc', True, 'TDC instead of target networks')
 flags.DEFINE_string('nsteps', '1,30', 'List of multi-step returns for Q-function')
@@ -153,10 +151,9 @@ training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=
 ph = Struct(
     adv=tf.placeholder('bool', ()),
     ddpg=tf.placeholder('bool', ()),
-    states=tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM),
     actions=tf.placeholder(DTYPE, [FLAGS.minibatch, ACTION_DIMS*ACTION_DOUBLE]),
-    next_states=[tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM) for n in training.nsteps],
-    rewards=[tf.placeholder(DTYPE, [FLAGS.minibatch, REWARDS_GLOBAL]) for n in training.nsteps],
+    states=[tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM) for n in training.nsteps+[1]],
+    rewards=tf.placeholder(DTYPE, [FLAGS.minibatch, len(training.nsteps), REWARDS_GLOBAL]),
     frame=tf.placeholder(DTYPE, [1, STATE_FRAMES] + FRAME_DIM),
     nsteps=tf.placeholder('int32', [len(training.nsteps)]))
 
@@ -175,7 +172,7 @@ if CONV_NET:
 else:
     frame_to_state = tf.reshape(ph.frame, [1] + STATE_DIM)
 
-app = Struct(policy_index=0, quit=False, update_count=0, print_action=False, show_state_image=False, draw_attention=True)
+app = Struct(policy_index=0, quit=False, update_count=0, print_action=False, show_state_image=False, draw_attention=False)
 if FLAGS.inst:
     FIRST_BATCH = (FLAGS.inst-1)*FLAGS.batch_per_inst
 else:
@@ -219,15 +216,15 @@ def layer_batch_norm(x):
     _scope = tf.contrib.framework.get_name_scope()
     norm = tf.layers.BatchNormalization(_scope=_scope, scale=False, center=False)
     x = [norm.apply(x[i], training=i==layer_batch_norm.training_idx) for i in range(len(x))]
-    map(variable_summaries, norm.weights)
+    for w in norm.weights: variable_summaries(w)
     return x
 
 def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False, trainable=True):
     if norm: x = layer_batch_norm(x)
     _scope = tf.contrib.framework.get_name_scope()
     dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable, _scope=_scope)
-    x = map(dense.apply, x)
-    map(variable_summaries, dense.weights)
+    x = [dense.apply(n) for n in x]
+    for w in dense.weights: variable_summaries(w)
     return x
 
 def layer_lstm(x, outputs, ac):
@@ -237,22 +234,20 @@ def layer_lstm(x, outputs, ac):
         scope = tf.contrib.framework.get_name_scope()
         for i in range(len(x)):
             create_initial_state = i<2
-            is_inst = i==0
             if create_initial_state:
                 with tf.name_scope(str(FLAGS.inst)):
                     batch_size = x[i].shape[0]
                     vars = [tf.Variable(s, trainable=False, collections=[None]) for s in cell.zero_state(batch_size, DTYPE)]
                     sess.run(tf.variables_initializer(vars))
                     initial_state = tf.contrib.rnn.LSTMStateTuple(*vars)
-            elif i>=3: # Multi-next-states have no valid initial_state
-                initial_state = None
-            else: # Next-state
+            else: # Next-states
                 initial_state = final_state
 
             x[i] = tf.expand_dims(x[i], 1) # [batch_size, max_time (i.e. 1), ...],
             output, final_state = tf.nn.dynamic_rnn(cell, x[i], initial_state=initial_state, dtype=DTYPE, scope=scope)
             x[i] = tf.nn.relu(output[:,0,:]) # Need sparsity
 
+            is_inst = i==0
             if create_initial_state:
                 [ops.post_minibatch, ops.post_step][is_inst] += [initial_state[c].assign(final_state[c]) for c in range(2)]
                 if not is_inst:
@@ -278,8 +273,8 @@ def make_conv_net(x):
                 x = [tf.expand_dims(n,-1) for n in x]
             else:
                 conv = tf.layers.Conv2D(filters, width, stride, use_bias=False, **kwds)
-            x = map(conv.apply, x)
-            map(variable_summaries, conv.weights)
+            x = [conv.apply(n) for n in x]
+            for w in conv.weights: variable_summaries(w)
             if conv3d:
                 x = [tf.reshape(n, n.shape.as_list()[:-2] + [-1]) for n in x]
         print(x[0].shape)
@@ -291,7 +286,7 @@ def make_attention_net(x, ac):
         with tf.name_scope('mhdpa'):
             if l == 0:
                 x = layer_batch_norm(x)
-                x = map(concat_coord_xy, x)
+                x = [concat_coord_xy(n) for n in x]
             for i,n in enumerate(x):
                 x[i], attention = relational.apply(n)
                 if i==0 and l==(MHDPA_LAYERS-1):
@@ -305,7 +300,7 @@ def make_shared(x, ac):
     if MHDPA_LAYERS:
         x = make_attention_net(x, ac)
 
-    x = map(tf.layers.flatten, x)
+    x = [tf.layers.flatten(n) for n in x]
     print(x[0].shape)
     return x
 
@@ -345,7 +340,7 @@ def make_acrl():
         return policy
 
     layer_batch_norm.training_idx = 1
-    state_inputs = [frame_to_state] + ([] if FLAGS.inst else [ph.states]+ph.next_states)
+    state_inputs = [frame_to_state] + ([] if FLAGS.inst else ph.states)
     with tf.name_scope('policy'):
         shared = make_shared(state_inputs, ac)
         shared_weights = scope_vars() if SHARED_LAYERS else []
@@ -371,7 +366,7 @@ def make_acrl():
         state[idx], actions[idx] = n, a
     def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
         num_actions = len(DISCRETE_ACTIONS)
-        if not num_actions: return
+        if not num_actions: return n
         n = tf.reshape(n, [batch_size, int(n.shape[0])/batch_size])
         n = tf.reduce_max(n, 1) if reduce_max else n
         return n
@@ -417,16 +412,12 @@ def make_acrl():
             value.q = q[1]
             value.state = q[2]
             next_state_value = q[3:]
+            value.nstep = ph.rewards[:,:,r] + gamma_nsteps*tf.stack(next_state_value, -1)
 
             value_weights = scope_vars() + shared_weights
         with tf.name_scope('error_value'):
             error_predict = layer_dense(combined, 1, None, norm=False)[1][:,0]
             error_weights = scope_vars()
-
-        value.nstep = []
-        for i in range(len(training.nsteps)):
-            n_return = ph.rewards[i][:,r] + next_state_value[i] * gamma_nsteps[:,i]
-            value.nstep.append(n_return)
 
         def post_common_target(common_target_value):
             td_error = common_target_value - value.q
@@ -447,7 +438,6 @@ def make_acrl():
 
             ac.td_error = td_error
             ac.per_update.gnorm_qvalue = accum_gradient(grad_s, opt.td)
-
         return value, post_common_target
 
     [value1, fn1] = make_qvalue(shared)
@@ -456,13 +446,12 @@ def make_acrl():
     if FLAGS.inst: return
     [value2, fn2] = make_qvalue(shared)
 
-    target_value = -sys.float_info.max
-    for i in range(len(training.nsteps)):
-        # Fix value overestimation by clipping the actor's critic with a second critic,
-        # to avoid the bias introduced by the policy update.
-        nstep_return = tf.minimum(value1.nstep[i], value2.nstep[i])
-        # Maximize over the n-step returns
-        target_value = tf.maximum(target_value, nstep_return)
+    # Fix value overestimation by clipping the actor's critic with a second critic,
+    # to avoid the bias introduced by the policy update.
+    target_value = tf.minimum(value1.nstep, value2.nstep)
+    # Maximize over the n-step returns
+    target_value = tf.reduce_max(target_value, -1)
+
     fn1(target_value)
     fn2(target_value)
 
@@ -484,9 +473,6 @@ def make_acrl():
         ac.per_update.gnorm_policy_adv = accum_gradient(grads_adv, opt.policy)
 
     if 0:
-        for i in [-1]: # Q-network weight decay
-            g,w = grad_s[i]
-            grad_s[i] = (g + FLAGS.decay*w, w)
         copy_vars = zip(
             # Include moving_mean/variance, which are not TRAINABLE_VARIABLES
             scope_vars('_value', tf.GraphKeys.GLOBAL_VARIABLES),
@@ -496,7 +482,7 @@ def make_acrl():
         for t,w in copy_vars:
             ops.per_update.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
 
-    ac.per_minibatch.reward_sum = tf.reduce_sum(ph.rewards[0][:,r])
+    ac.per_minibatch.reward_sum = tf.reduce_sum(ph.rewards[:,0,r])
     ac.per_minibatch.td_error = tf.reduce_sum(ac.td_error**2)
     ac.per_minibatch.policy_min = tf.reduce_min(ac.policy, axis=0)
     ac.per_minibatch.policy_max = tf.reduce_max(ac.policy, axis=0)
@@ -509,8 +495,6 @@ state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
                done=True, next_reset=False, last_reset=0,
                ph_attention=None)
 
-envu.isRender = True # pybullet-gym
-env.reset(); env.render()# Gym needs at least 1 reset&render before valid observation
 def setup_key_actions():
     from pyglet.window import key
     a = np.array([0.]*max(3, ACTION_DIMS))
@@ -524,6 +508,7 @@ def setup_key_actions():
         print(d)
         window.set_caption(str(d))
 
+    on_close = lambda: setattr(app, 'quit', True)
     def key_press(k, mod):
         if k==key.LEFT:  a[0] = -1.0
         if k==key.RIGHT: a[0] = +1.0
@@ -552,6 +537,7 @@ def setup_key_actions():
             state.next_reset = True
         elif k==ord('m'):
             app.draw_attention ^= True
+        elif k==ord('q'): on_close()
         else: return
         settings_caption()
 
@@ -561,13 +547,15 @@ def setup_key_actions():
         if k==key.UP:    a[1] = 0
         if k==key.DOWN:  a[2] = 0
 
+    envu.isRender = True
     if not hasattr(envu, 'viewer'): # pybullet-gym
         return a
     global window
+    env.reset(); env.render() # Needed for viewer.window
     window = envu.viewer.window
     window.on_key_press = key_press
     window.on_key_release = key_release
-    window.on_close = lambda: setattr(app, 'quit', True)
+    window.on_close = on_close
     settings_caption()
     hook_swapbuffers()
     return a
@@ -730,11 +718,12 @@ manager = multiprocessing.Manager()
 batch_sets = manager.list()
 def proc_batch_set():
     batch_set = {}
+    shuffled = list(range(-1,-(FLAGS.batch_keep+1),-1)) + list(range(FLAGS.batch_queue))
+    np.random.shuffle(shuffled)
     while len(batch_set) < FLAGS.minibatch:
         try:
-            idx = -np.random.choice(FLAGS.batch_keep+1) if np.random.choice(2) \
-                else np.random.choice(FLAGS.batch_queue)
-            if idx in batch_set: continue
+            if not len(shuffled): return
+            idx = shuffled.pop()
             b = mmap_batch(batch_paths(idx), 'r', rawframes=False)
             batch_set[idx] = b
         except Exception as e:
@@ -744,11 +733,10 @@ def proc_batch_set():
 
 proclist = []
 mb = Struct(
-    states = np.zeros([FLAGS.minibatch] + STATE_DIM),
     actions = np.zeros([FLAGS.minibatch, ACTION_DIMS*ACTION_DOUBLE]),
-    next_states = [np.zeros([FLAGS.minibatch] + STATE_DIM) for n in training.nsteps],
-    rewards = [np.zeros([FLAGS.minibatch, REWARDS_GLOBAL]) for n in training.nsteps],
-    nsteps = range(len(training.nsteps)))
+    states = [np.zeros([FLAGS.minibatch] + STATE_DIM) for n in training.nsteps+[1]],
+    rewards = np.zeros([FLAGS.minibatch, len(training.nsteps), REWARDS_GLOBAL]),
+    nsteps = list(range(len(training.nsteps))))
 def make_minibatch(): # Each minibatch is random subset of batch trajectories
     next_step = make_minibatch.current_step + 1
     if next_step == ER_BATCH_STEPS:
@@ -756,7 +744,6 @@ def make_minibatch(): # Each minibatch is random subset of batch trajectories
         next_step = 1
 
     step = make_minibatch.current_step
-    make_minibatch.current_step = next_step
     if step == 0:
         sess.run(ops.new_batches)
         if 1:
@@ -764,15 +751,19 @@ def make_minibatch(): # Each minibatch is random subset of batch trajectories
             while len(proclist) < PROCESSES:
                 proc = multiprocessing.Process(target=proc_batch_set)
                 proc.start()
-                proclist.insert(0, proc)
-            proc = proclist.pop()
-            proc.join()
+                proclist.append(proc)
+            proc = next((proc for proc in proclist if not proc.is_alive()), None)
+            if proc:
+                proc.join()
+                proclist.remove(proc)
         else:
             proc_batch_set()
+        if not len(batch_sets): return False
         make_minibatch.batch_set = batch_sets.pop()
+    make_minibatch.current_step = next_step
 
     for b,batch in enumerate(make_minibatch.batch_set):
-        mb.states[b] = batch.states[step]
+        mb.states[0][b] = batch.states[step]
         mb.actions[b] = batch.actions[next_step]
         for i,nsteps in enumerate(training.nsteps):
             accum_reward = 0.
@@ -781,25 +772,23 @@ def make_minibatch(): # Each minibatch is random subset of batch trajectories
                 accum_reward += batch.rewards[last_state] * FLAGS.gamma**n
                 if last_state == ER_BATCH_SIZE-1:
                     break
-            mb.rewards[i][b] = accum_reward
-            mb.next_states[i][b] = batch.states[last_state]
+            mb.rewards[b,i] = accum_reward
+            mb.states[i+1][b] = batch.states[last_state]
     for i,n in enumerate(training.nsteps):
         mb.nsteps[i] = min(ER_BATCH_SIZE-next_step, n)
+    return True
 make_minibatch.current_step = 0
 
 def train_accum_minibatch():
     # Upload & train minibatch
-    make_minibatch()
     feed_dict = {
         ph.adv: training.adv,
         ph.ddpg: training.ddpg,
-        ph.states: mb.states,
         ph.actions: mb.actions,
+        ph.rewards: mb.rewards,
         ph.nsteps: mb.nsteps}
-    for i in range(len(training.nsteps)):
-        feed_dict[ph.next_states[i]] = mb.next_states[i]
-        feed_dict[ph.rewards[i]] = mb.rewards[i]
-    # imshow([mb.states[0][:,:,i] for i in range(STATE_FRAMES)])
+    for i in range(len(training.nsteps)+1):
+        feed_dict[ph.states[i]] = mb.states[i]
     r = sess.run(ops.per_minibatch, feed_dict)
     tensor_dict_print(r, 'per_minibatch')
 
@@ -813,7 +802,7 @@ def train_apply_gradients():
         policy_updates=dict(adv=training.adv, ddpg=training.ddpg),
         nsteps=mb.nsteps,
         update_count=app.update_count,
-        rates=dict(learning_rate=FLAGS.learning_rate, tau=FLAGS.tau, decay=FLAGS.decay, gamma=FLAGS.gamma),
+        rates=dict(learning_rate=FLAGS.learning_rate, tau=FLAGS.tau, gamma=FLAGS.gamma),
         batches=dict(keep=FLAGS.batch_keep,inst=FLAGS.batch_queue,minibatch=FLAGS.minibatch)))
     os.system('clear') # Scroll up to see status
 
@@ -822,12 +811,13 @@ def train_apply_gradients():
         train_writer.add_summary(summary, app.update_count)
 
 def rl_loop():
-    while not app.quit:
-        if FLAGS.inst or not training.enable or training.batches_recorded < FLAGS.batch_keep:
-            append_to_batch()
-            continue
-        for i in range(1):
+    if app.quit: return False
+    if FLAGS.inst or not training.enable or training.batches_recorded < FLAGS.batch_keep:
+        append_to_batch()
+    else:
+        if make_minibatch():
             train_accum_minibatch()
-        train_apply_gradients()
+            train_apply_gradients()
         env.render() # Render needed for keyboard events
-rl_loop()
+    return True
+import utils; utils.loop_while(rl_loop)

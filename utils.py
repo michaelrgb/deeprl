@@ -1,6 +1,8 @@
 import tensorflow as tf, numpy as np
 DTYPE = tf.float32
 
+def loop_while(f):
+    while f(): pass
 def wrapList(value):
     return value if type(value) == list else [value]
 class Struct:
@@ -71,8 +73,8 @@ def gaussian_filter(kernel_size):
         return 1. / Z * np.exp(-(x ** 2 + y ** 2) / (2. * sigma ** 2))
 
     mid = np.floor(kernel_size / 2.)
-    for i in xrange(0, kernel_size):
-        for j in xrange(0, kernel_size):
+    for i in range(0, kernel_size):
+        for j in range(0, kernel_size):
             x[i, j, 0, 0] = gauss(i - mid, j - mid)
 
     weights = x / np.sum(x)
