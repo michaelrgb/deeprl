@@ -32,9 +32,10 @@ def max_pool(x, size=4, stride=1, padding='VALID'):
 def weight_variable(shape, init_zeros=False):
     return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else
         tf.contrib.layers.xavier_initializer(seed=0)(shape))
-def scope_vars(scope_name='', key=tf.GraphKeys.TRAINABLE_VARIABLES): # '' for current scope
-    current = tf.contrib.framework.get_name_scope()
+def scope_vars(scope_name='', GLOBAL=False): # '' for current scope
+    current = tf.get_variable_scope().name
     if current: scope_name = current + '/' + scope_name
+    key = tf.GraphKeys.GLOBAL_VARIABLES if GLOBAL else tf.GraphKeys.TRAINABLE_VARIABLES
     return tf.get_collection(key, scope=scope_name)
 def grads_clamp(grads, max_value):
     grads = wrapList(grads)
