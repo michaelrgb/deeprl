@@ -31,8 +31,15 @@ if not FLAGS.inst:
     server = tf.train.Server({'local': [PORT]}, protocol=PROTOCOL, start=True)
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
-STATE_FRAMES = 5    # Frames an action is repeated for, combined into a state
+# Frames an action is repeated for, combined into a state
+STATE_FRAMES = 1
+# Concat frame states instead of repeating actions over multiple frames.
+CONCAT_STATES = 5
+
 USE_LSTM = False
+SHARED_LAYERS = True
+MHDPA_LAYERS = 0#3
+HIDDEN_NODES = 500
 
 DISCRETE_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
@@ -69,16 +76,16 @@ def draw_line(a, b, color=(1,1,1,1)):
     gl.glVertex3f(window.width*b[0], window.height*(1-b[1]), 0)
     gl.glEnd()
 def draw_attention():
-    if not app.draw_attention or state.ph_attention is None:
+    if not app.draw_attention or state.inst_attention is None:
         return
-    s = state.ph_attention.shape[1:3]
+    s = state.inst_attention.shape[1:3]
     for head in range(3):
         color = onehot_vector(head, 3)
         for y1 in range(s[0]):
             for x1 in range(s[1]):
                 for y2 in range(s[0]):
                     for x2 in range(s[1]):
-                        f = state.ph_attention[0, y1,x1, y2,x2, head]
+                        f = state.inst_attention[0, y1,x1, y2,x2, head]
                         if f < 0.1: continue
                         draw_line(
                             ((x1+0.5)/s[1], (y1+0.5)/s[0]),
@@ -99,7 +106,7 @@ if ACTION_DISCRETE:
     MULTI_ACTIONS = [onehot_vector(a, ACTION_DIMS) for a in range(ACTION_DIMS)]
 else:
     MULTI_ACTIONS = DISCRETE_ACTIONS
-    ACTION_DOUBLE = 2
+    #ACTION_DOUBLE = 2
 MULTI_ACTIONS = tf.constant(MULTI_ACTIONS, DTYPE)
 POLICY_SOFTMAX = ACTION_DISCRETE
 FRAME_DIM = list(env.observation_space.shape)
@@ -152,13 +159,13 @@ ph = Struct(
     adv=tf.placeholder('bool', ()),
     ddpg=tf.placeholder('bool', ()),
     actions=tf.placeholder(DTYPE, [FLAGS.minibatch, ACTION_DIMS*ACTION_DOUBLE]),
-    states=[tf.placeholder(DTYPE, [FLAGS.minibatch] + STATE_DIM) for n in training.nsteps+[1]],
+    states=[tf.placeholder(DTYPE, [FLAGS.minibatch, CONCAT_STATES] + STATE_DIM) for n in training.nsteps+[1]],
     rewards=tf.placeholder(DTYPE, [FLAGS.minibatch, len(training.nsteps), REWARDS_GLOBAL]),
-    frame=tf.placeholder(DTYPE, [1, STATE_FRAMES] + FRAME_DIM),
+    frame=tf.placeholder(DTYPE, [CONCAT_STATES, STATE_FRAMES] + FRAME_DIM),
     nsteps=tf.placeholder('int32', [len(training.nsteps)]))
 
 if CONV_NET:
-    frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Move STATE_FRAMES into batches
+    frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Combine CONCAT_STATES and STATE_FRAMES
     if RESIZE:
         frame_to_state = tf.image.resize_images(frame_to_state, RESIZE, tf.image.ResizeMethod.AREA)
     if FRAME_LCN:
@@ -167,10 +174,10 @@ if CONV_NET:
     else:
         if GRAYSCALE: frame_to_state = tf.reduce_mean(frame_to_state, axis=-1, keep_dims=True)
         frame_to_state = frame_to_state/255.
-    frame_to_state = tf.transpose(frame_to_state, [1, 2, 0, 3])# Move STATE_FRAMES into channels
-    frame_to_state = tf.reshape(frame_to_state, [1] + STATE_DIM)
+    frame_to_state = tf.reshape(frame_to_state, [CONCAT_STATES, STATE_FRAMES] + RESIZE)
+    frame_to_state = tf.transpose(frame_to_state, [0, 2, 3, 1])# Move STATE_FRAMES into channels
 else:
-    frame_to_state = tf.reshape(ph.frame, [1] + STATE_DIM)
+    frame_to_state = tf.reshape(ph.frame, [CONCAT_STATES] + STATE_DIM)
 
 app = Struct(policy_index=0, quit=False, update_count=0, print_action=False, show_state_image=False, draw_attention=False)
 if FLAGS.inst:
@@ -285,23 +292,24 @@ def make_attention_net(x, ac):
             for i,n in enumerate(x):
                 x[i], attention = relational.apply(n)
                 if i==0 and l==(MHDPA_LAYERS-1):
-                    ac.ph_attention = attention # Display agent attention
+                    ac.inst_attention = attention # Display agent attention
+    return x
+
+def make_dense(x, layers=[HIDDEN_NODES]*2):
+    for i,l in enumerate(layers):
+        with tf.variable_scope('hidden_%i' % i):
+            if USE_LSTM and i==1: x = layer_lstm(x, l, ac)
+            else: x = layer_dense(x, l)
     return x
 
 def make_shared(x, ac):
     print(x[0].shape)
-    if CONV_NET:
-        x = make_conv_net(x)
-    if MHDPA_LAYERS:
-        x = make_attention_net(x, ac)
+    if CONV_NET: x = make_conv_net(x)
+    if MHDPA_LAYERS: x = make_attention_net(x, ac)
 
     x = [tf.layers.flatten(n) for n in x]
     print(x[0].shape)
     return x
-
-SHARED_LAYERS = True
-MHDPA_LAYERS = 0#3
-HIDDEN_NODES = 500
 
 opt = Struct(td=tf.train.AdamOptimizer(FLAGS.learning_rate),
     policy=tf.train.AdamOptimizer(FLAGS.learning_rate/20),
@@ -311,13 +319,6 @@ allac = []
 def make_acrl():
     ac = Struct(per_minibatch=Struct(), per_update=Struct())
     allac.append(ac)
-
-    def make_dense(x, layers=[HIDDEN_NODES]*2):
-        for i,l in enumerate(layers):
-            with tf.variable_scope('hidden_%i' % i):
-                if USE_LSTM and i==1: x = layer_lstm(x, l, ac)
-                else: x = layer_dense(x, l)
-        return x
 
     def make_policy(shared):
         hidden = make_dense(shared)
@@ -337,13 +338,21 @@ def make_acrl():
                 policy = [tf.concat([p,m],-1) for p,m in zip(policy, layer_dense(hidden, ACTION_DIMS, tf.nn.sigmoid))]
         return policy
 
+    # Move concat states to last dimension
+    state_inputs = [tf.expand_dims(frame_to_state,0)] + ([] if FLAGS.inst else ph.states)
+    idx = range(len(state_inputs[0].shape))
+    idx = [0] + idx[2:]
+    idx.insert(-1, 1)
+    CONCAT_STATE_DIM = STATE_DIM[:]
+    CONCAT_STATE_DIM[-1] *= CONCAT_STATES
+    state_inputs = [tf.reshape(tf.transpose(n,idx), [-1]+CONCAT_STATE_DIM) for n in state_inputs]
+
     layer_batch_norm.training_idx = 1
-    state_inputs = [frame_to_state] + ([] if FLAGS.inst else ph.states)
     with tf.variable_scope('policy'):
         shared = make_shared(state_inputs, ac)
         shared_weights = scope_vars() if SHARED_LAYERS else []
         policy = make_policy(shared)
-        ac.ph_policy = policy[0]
+        ac.inst_policy = policy[0]
         if not FLAGS.inst:
             ac.policy = policy[1]
             ac.policy_next = policy[2:]
@@ -394,21 +403,21 @@ def make_acrl():
     gamma_nsteps = tf.expand_dims(tf.stack([FLAGS.gamma**tf.cast(ph.nsteps[i], DTYPE)
         for i in range(len(training.nsteps))]), 0)
     def make_qvalue(shared):
-        if not SHARED_LAYERS: shared = make_shared(state_inputs, ac)
+        shared = shared if SHARED_LAYERS else make_shared(state_inputs, ac)
 
         state = make_dense(shared)
         if FLAGS.inst:
-            actions = [ac.ph_policy]
+            actions = [ac.inst_policy]
         else:
             state = [state[0], state[1], state[1]] + state[2:]
-            actions = [ac.ph_policy, ph.actions, ac.policy] + ac.policy_next
+            actions = [ac.inst_policy, ph.actions, ac.policy] + ac.policy_next
         multi_actions_pre(state, actions, 0, 1)
 
         q, combined = make_value_output(state, actions)
         # Q for all actions in agent's current state
         q[0] = multi_actions_post(q[0], 1)
 
-        value = Struct(ph_policy=q[0])
+        value = Struct(inst_policy=q[0])
         if FLAGS.inst: return value, None
         value.q = q[1]
         value.state = q[2]
@@ -493,7 +502,7 @@ def make_acrl():
 for r in range(REWARDS_ALL):
     with tf.variable_scope('ac'): make_acrl()
 
-state = Struct(frames=np.zeros([STATE_FRAMES] + FRAME_DIM),
+state = Struct(frames=np.zeros([CONCAT_STATES, STATE_FRAMES] + FRAME_DIM),
                count=0, last_obs=None, last_pos_reward=0,
                done=True, next_reset=False, last_reset=0,
                ph_attention=None)
@@ -583,7 +592,7 @@ def step_to_frames():
             a = ([action.policy] + MULTI_ACTIONS)[idx]
     if FLAGS.sample_action:
         np.random.seed(0)
-        offset = np.array([FLAGS.sample_action*math.sin(2*math.pi*(r + state.count/10.)) for r in np.random.rand(ACTION_DIMS*ACTION_DOUBLE)])
+        offset = np.array([FLAGS.sample_action*math.sin(2*math.pi*(r + state.count/20.)) for r in np.random.rand(ACTION_DIMS*ACTION_DOUBLE)])
         a = np.clip(a+offset, -1, 1.)
 
     env_action = a
@@ -609,7 +618,7 @@ def step_to_frames():
             obs = env.reset()
         env.render()
         #imshow([obs, test_lcn(obs, sess)[0]])
-        state.frames[frame] = obs
+        state.frames[-1, frame] = obs
 
         if ACTION_DOUBLE == 2:
             a,b = env_action[:ACTION_DIMS], env_action[ACTION_DIMS:]
@@ -629,33 +638,33 @@ def step_to_frames():
     state.last_obs = obs
     return [reward_sum]
 
-ops.ph_step = [frame_to_state] + [
+ops.inst_step = [frame_to_state] + [
     i for sublist in [
-        [ac.ph_policy[0],# Policy from uploaded state,
-        ac.value1.ph_policy[0],
-        ] + ([ac.ph_attention] if MHDPA_LAYERS else [])
+        [ac.inst_policy[0],# Policy from uploaded state,
+        ac.value1.inst_policy[0],
+        ] + ([ac.inst_attention] if MHDPA_LAYERS else [])
         for ac in allac]
     for i in sublist]
-with tf.get_default_graph().control_dependencies(ops.ph_step):
-    ops.ph_step.append(tf.group(*ops.post_step))
+with tf.get_default_graph().control_dependencies(ops.inst_step):
+    ops.inst_step.append(tf.group(*ops.post_step))
 def append_to_batch():
     save_paths = batch_paths(training.append_batch)
     if not FLAGS.inst and FLAGS.recreate_states:
         if not state.count:
             training.saved_batch = mmap_batch(save_paths, 'r', states=False)
         batch = training.saved_batch
-        state.frames = batch.rawframes[state.count]
+        state.frames[-1] = batch.rawframes[state.count]
         save_reward = batch.rewards[state.count]
         save_action = batch.actions[state.count]
     else:
         save_reward = step_to_frames()
         save_action = action.to_save
 
-    ret = sess.run(ops.ph_step, feed_dict={ph.frame: [state.frames]})
+    ret = sess.run(ops.inst_step, feed_dict={ph.frame: state.frames})
     save_state = ret[0]
     action.policy = ret[1]
     action.policy_value = ret[2]
-    if MHDPA_LAYERS: state.ph_attention = ret[3]
+    if MHDPA_LAYERS: state.inst_attention = ret[3]
     if app.show_state_image:
         app.show_state_image = False
         proc = multiprocessing.Process(target=imshow,
@@ -666,8 +675,8 @@ def append_to_batch():
     if not training.temp_batch:
         training.temp_batch = mmap_batch(temp_paths, 'w+')
     batch = training.temp_batch
-    batch.rawframes[state.count] = state.frames
-    batch.states[state.count] = save_state[0]
+    batch.rawframes[state.count] = state.frames[-1]
+    batch.states[state.count] = save_state[-1]
     batch.rewards[state.count] = save_reward
     batch.actions[state.count] = save_action
 
@@ -737,16 +746,14 @@ def proc_batch_set():
 proclist = []
 mb = Struct(
     actions = np.zeros([FLAGS.minibatch, ACTION_DIMS*ACTION_DOUBLE]),
-    states = [np.zeros([FLAGS.minibatch] + STATE_DIM) for n in training.nsteps+[1]],
+    states = [np.zeros([FLAGS.minibatch, CONCAT_STATES] + STATE_DIM) for n in training.nsteps+[1]],
     rewards = np.zeros([FLAGS.minibatch, len(training.nsteps), REWARDS_GLOBAL]),
     nsteps = list(range(len(training.nsteps))))
 def make_minibatch(): # Each minibatch is random subset of batch trajectories
-    next_step = make_minibatch.current_step + 1
-    if next_step == ER_BATCH_STEPS:
-        make_minibatch.current_step = 0
-        next_step = 1
-
     step = make_minibatch.current_step
+    if step+CONCAT_STATES == ER_BATCH_STEPS:
+        step = 0
+
     if step == 0:
         sess.run(ops.new_batches)
         if 1:
@@ -763,22 +770,24 @@ def make_minibatch(): # Each minibatch is random subset of batch trajectories
             proc_batch_set()
         if not len(batch_sets): return False
         make_minibatch.batch_set = batch_sets.pop()
-    make_minibatch.current_step = next_step
+    make_minibatch.current_step = step+1
 
+    step += CONCAT_STATES
     for b,batch in enumerate(make_minibatch.batch_set):
-        mb.states[0][b] = batch.states[step]
-        mb.actions[b] = batch.actions[next_step]
+        mb.states[0][b] = batch.states[step-CONCAT_STATES:step]
+        mb.actions[b] = batch.actions[step]
         for i,nsteps in enumerate(training.nsteps):
             accum_reward = 0.
             for n in range(nsteps):
-                last_state = next_step + n
-                accum_reward += batch.rewards[last_state] * FLAGS.gamma**n
-                if last_state == ER_BATCH_SIZE-1:
+                next_step = step + n
+                accum_reward += batch.rewards[next_step] * FLAGS.gamma**n
+                next_step += 1
+                if next_step == ER_BATCH_SIZE:
                     break
             mb.rewards[b,i] = accum_reward
-            mb.states[i+1][b] = batch.states[last_state]
-    for i,n in enumerate(training.nsteps):
-        mb.nsteps[i] = min(ER_BATCH_SIZE-next_step, n)
+            mb.states[i+1][b] = batch.states[next_step-CONCAT_STATES:next_step]
+            if b==0:
+                mb.nsteps[i] = next_step - step
     return True
 make_minibatch.current_step = 0
 
