@@ -32,9 +32,9 @@ if not FLAGS.inst:
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 # Frames an action is repeated for, combined into a state
-STATE_FRAMES = 1
-# Concat frame states instead of repeating actions over multiple frames.
-CONCAT_STATES = 5
+ACTION_REPEAT = 5
+# Concat frame states instead of repeating actions over multiple frames
+CONCAT_STATES = 1
 
 USE_LSTM = False
 SHARED_LAYERS = True
@@ -102,11 +102,14 @@ ACTION_DIMS = (env.action_space.shape or [env.action_space.n])[0]
 ACTION_DISCRETE = not env.action_space.shape
 def onehot_vector(idx, dims): return [1. if idx == i else 0. for i in range(dims)]
 ACTION_DOUBLE = 1
+FINITE_DIFF_Q = not ACTION_DISCRETE
 if ACTION_DISCRETE:
     MULTI_ACTIONS = [onehot_vector(a, ACTION_DIMS) for a in range(ACTION_DIMS)]
 else:
     MULTI_ACTIONS = DISCRETE_ACTIONS
-    #ACTION_DOUBLE = 2
+    if ACTION_REPEAT >= 5:
+        # Interpolate actions if repeating for many frames
+        ACTION_DOUBLE = 2
 MULTI_ACTIONS = tf.constant(MULTI_ACTIONS, DTYPE)
 POLICY_SOFTMAX = ACTION_DISCRETE
 FRAME_DIM = list(env.observation_space.shape)
@@ -123,16 +126,15 @@ if CONV_NET:
     RESIZE = [84, 84]
     if RESIZE:
         STATE_DIM[:2] = RESIZE
-STATE_DIM[-1] *= STATE_FRAMES
+STATE_DIM[-1] *= ACTION_REPEAT
 
 FIRST_BATCH = -FLAGS.batch_keep
 LAST_BATCH = FLAGS.batch_queue
 ER_BATCH_SIZE = 100
-ER_BATCH_STEPS = ER_BATCH_SIZE-1
 
 def batch_paths(batch_num, path=None):
     if not path:
-        path = '%s_%i_%i' % (ENV_NAME, STATE_FRAMES, ACTION_DOUBLE)
+        path = '%s_%i_%i' % (ENV_NAME, ACTION_REPEAT, ACTION_DOUBLE)
     os.system('mkdir -p batches')
     path = 'batches/' + path + '_%i_%s.mmap'
     return {key: path % (batch_num, key) for key in ['rawframes', 'states', 'actions', 'rewards']}
@@ -148,7 +150,7 @@ def mmap_batch(paths, mode, only_actions=False, states=True, rawframes=True):
         batch.states = np.memmap(paths['states'], DTYPE.name, mode, shape=(ER_BATCH_SIZE,) + tuple(STATE_DIM))
         batch.arrays.append(batch.states)
     if rawframes:
-        batch.rawframes = np.memmap(paths['rawframes'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, STATE_FRAMES) + tuple(FRAME_DIM))
+        batch.rawframes = np.memmap(paths['rawframes'], DTYPE.name, mode, shape=(ER_BATCH_SIZE, ACTION_REPEAT) + tuple(FRAME_DIM))
         batch.arrays.append(batch.rawframes)
     return batch
 
@@ -161,11 +163,11 @@ ph = Struct(
     actions=tf.placeholder(DTYPE, [FLAGS.minibatch, ACTION_DIMS*ACTION_DOUBLE]),
     states=[tf.placeholder(DTYPE, [FLAGS.minibatch, CONCAT_STATES] + STATE_DIM) for n in training.nsteps+[1]],
     rewards=tf.placeholder(DTYPE, [FLAGS.minibatch, len(training.nsteps), REWARDS_GLOBAL]),
-    frame=tf.placeholder(DTYPE, [CONCAT_STATES, STATE_FRAMES] + FRAME_DIM),
+    frame=tf.placeholder(DTYPE, [CONCAT_STATES, ACTION_REPEAT] + FRAME_DIM),
     nsteps=tf.placeholder('int32', [len(training.nsteps)]))
 
 if CONV_NET:
-    frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Combine CONCAT_STATES and STATE_FRAMES
+    frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Combine CONCAT_STATES and ACTION_REPEAT
     if RESIZE:
         frame_to_state = tf.image.resize_images(frame_to_state, RESIZE, tf.image.ResizeMethod.AREA)
     if FRAME_LCN:
@@ -174,8 +176,8 @@ if CONV_NET:
     else:
         if GRAYSCALE: frame_to_state = tf.reduce_mean(frame_to_state, axis=-1, keep_dims=True)
         frame_to_state = frame_to_state/255.
-    frame_to_state = tf.reshape(frame_to_state, [CONCAT_STATES, STATE_FRAMES] + RESIZE)
-    frame_to_state = tf.transpose(frame_to_state, [0, 2, 3, 1])# Move STATE_FRAMES into channels
+    frame_to_state = tf.reshape(frame_to_state, [CONCAT_STATES, ACTION_REPEAT] + RESIZE)
+    frame_to_state = tf.transpose(frame_to_state, [0, 2, 3, 1])# Move ACTION_REPEAT into channels
 else:
     frame_to_state = tf.reshape(ph.frame, [CONCAT_STATES] + STATE_DIM)
 
@@ -264,16 +266,17 @@ def layer_lstm(x, outputs, ac):
 
 def make_conv_net(x):
     LAYERS = [
-        (32, 8, 3, 2),
+        (32, 8, 3, (3,2)),
         (32, 4, 2, 0),
         (32, 4, 1, 0)]
     x = [tf.expand_dims(n,-1) for n in x]
-    for l,(filters, width, stride, width3d) in enumerate(LAYERS):
+    for l,(filters, width, stride, conv3d) in enumerate(LAYERS):
         with tf.variable_scope('conv_%i' % l):
             x = layer_batch_norm(x)
             kwds = dict(activation=tf.nn.relu, use_bias=False)
-            if width3d:
-                conv = tf.layers.Conv3D(filters, (width, width, width3d), (stride, stride, 1), **kwds)
+            if conv3d:
+                width3d, stride3d = conv3d
+                conv = tf.layers.Conv3D(filters, (width, width, width3d), (stride, stride, stride3d), **kwds)
             else:
                 conv = tf.layers.Conv2D(filters, width, stride, **kwds)
                 x = [tf.reshape(n, n.shape.as_list()[:3] + [-1]) for n in x] # Back to 2D conv
@@ -283,22 +286,23 @@ def make_conv_net(x):
     return x
 
 def make_attention_net(x, ac):
-    relational = MHDPA()
     for l in range(MHDPA_LAYERS):
-        with tf.variable_scope('mhdpa'):
+        with tf.variable_scope('mhdpa_%i' % l):
+            x = layer_batch_norm(x)
             if l == 0:
-                x = layer_batch_norm(x)
+                relational = MHDPA()
                 x = [concat_coord_xy(n) for n in x]
             for i,n in enumerate(x):
                 x[i], attention = relational.apply(n)
                 if i==0 and l==(MHDPA_LAYERS-1):
                     ac.inst_attention = attention # Display agent attention
+                if i==1: ac.per_minibatch.__dict__['attention_minmax_%i'%l] = tf.stack([tf.reduce_min(attention), tf.reduce_max(attention)])
     return x
 
 def make_dense(x, layers=[HIDDEN_NODES]*2):
     for i,l in enumerate(layers):
         with tf.variable_scope('hidden_%i' % i):
-            if USE_LSTM and i==1: x = layer_lstm(x, l, ac)
+            if i==1 and USE_LSTM: x = layer_lstm(x, l, ac)
             else: x = layer_dense(x, l)
     return x
 
@@ -378,16 +382,19 @@ def make_acrl():
         n = tf.reduce_max(n, 1) if reduce_max else n
         return n
 
+    STEP_FUNCS = 20
     def make_value_output(state, actions):
-        actions = [tf.concat([a, 1-a, a+1], -1) for a in actions]
-        offsets = [0.05, 0.1, 0.2, 0.4]
-        actions = [tf.concat([a] +
-            [a+o for o in offsets] +
-            [a-o for o in offsets], -1) for a in actions]
+        if not ACTION_DISCRETE:
+            rng = range(1-STEP_FUNCS, STEP_FUNCS)
+            actions = [tf.concat([STEP_FUNCS*a + f for f in rng], -1) for a in actions]
+            # Discontinuous step functions are better at learning binary actions
+            if FINITE_DIFF_Q:
+                if 1: actions = [tf.cast(tf.concat([a,-a],-1)>0, DTYPE) for a in actions] # OR
+                else: actions = [tf.sign(a) for a in actions] # AND
 
         if 1:
             a1 = actions
-            for i in range(2):
+            for i in range(1):
                 with tf.variable_scope('actions_%i' % i):
                     a1 = layer_dense(a1, HIDDEN_NODES/2, double_relu, norm=False)
             combined = [n*a for n,a in zip(state, a1)]
@@ -406,22 +413,20 @@ def make_acrl():
         shared = shared if SHARED_LAYERS else make_shared(state_inputs, ac)
 
         state = make_dense(shared)
-        if FLAGS.inst:
-            actions = [ac.inst_policy]
-        else:
-            state = [state[0], state[1], state[1]] + state[2:]
-            actions = [ac.inst_policy, ph.actions, ac.policy] + ac.policy_next
+        actions = [ac.inst_policy]
+        if not FLAGS.inst:
+            state = [state[0]] + [state[1]]*2 + state[2:]
+            actions += [ph.actions, ac.policy] + ac.policy_next
         multi_actions_pre(state, actions, 0, 1)
 
         q, combined = make_value_output(state, actions)
         # Q for all actions in agent's current state
         q[0] = multi_actions_post(q[0], 1)
 
-        value = Struct(inst_policy=q[0])
+        value = Struct(inst_policy=q.pop(0))
         if FLAGS.inst: return value, None
-        value.q = q[1]
-        value.state = q[2]
-        next_state_value = q[3:]
+        [value.q, value.state] = q[:2]
+        next_state_value = q[2:]
         value.nstep = ph.rewards[:,:,r] + gamma_nsteps*tf.stack(next_state_value, -1)
 
         value_weights = scope_vars() + shared_weights
@@ -468,18 +473,24 @@ def make_acrl():
     update2(min_values[:,0])
 
     policy_weights = scope_vars('policy')
+    a_diff = ph.actions - ac.policy
     if 1: # DDPG-style policy updates using Q-function gradient
-        value_grad = tf.gradients(value1.state, ac.policy)[0]
+        if FINITE_DIFF_Q:
+            value_grad = tf.where(tf.abs(a_diff) > 1e-3,
+                tf.expand_dims(value1.q - value1.state, -1) / a_diff,
+                tf.zeros_like(a_diff))
+        else:
+            value_grad = tf.gradients(value1.state, ac.policy)[0]
         value_grad = tf.where(ph.ddpg, value_grad, tf.zeros_like(value_grad))
         repl = gradient_override(ac.policy, value_grad)
         grads = opt.policy.compute_gradients(repl, policy_weights)
         ac.per_update.gnorm_policy_ddpg = accum_gradient(grads, opt.policy)
 
     if 1: # Policy updates using multi-step advantage value
-        adv = tf.maximum(0., target_value - tf.maximum(value1.state, value2.state)) # Only towards better actions
+        state_value = tf.maximum(value1.state, value2.state)
+        adv = tf.maximum(0., target_value - state_value) # Only towards better actions
         adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
         adv = tf.expand_dims(adv, -1)
-        a_diff = ph.actions - ac.policy
         repl = gradient_override(ac.policy, adv*a_diff)
         grads_adv = opt.policy.compute_gradients(repl, policy_weights)
         ac.per_update.gnorm_policy_adv = accum_gradient(grads_adv, opt.policy)
@@ -502,7 +513,7 @@ def make_acrl():
 for r in range(REWARDS_ALL):
     with tf.variable_scope('ac'): make_acrl()
 
-state = Struct(frames=np.zeros([CONCAT_STATES, STATE_FRAMES] + FRAME_DIM),
+state = Struct(frames=np.zeros([CONCAT_STATES, ACTION_REPEAT] + FRAME_DIM),
                count=0, last_obs=None, last_pos_reward=0,
                done=True, next_reset=False, last_reset=0,
                ph_attention=None)
@@ -582,7 +593,7 @@ def step_to_frames():
     def interp(f, a, b): return a + f*(b-a)
 
     a = action.keyboard[:ACTION_DIMS].copy()
-    if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1., ACTION_DIMS))
+    if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1.), ACTION_DIMS)
     if ACTION_DOUBLE == 2: a = np.concatenate([a,[1.]*ACTION_DIMS], 0)
 
     if state.count > 0 and app.policy_index != -1:
@@ -605,7 +616,7 @@ def step_to_frames():
     obs = state.last_obs
     reward_sum = 0.
     state.frames[:-1] = state.frames[1:]
-    for frame in range(STATE_FRAMES):
+    for frame in range(ACTION_REPEAT):
         state.done |= state.next_reset
         state.last_reset += 1
         if state.done:
@@ -622,7 +633,7 @@ def step_to_frames():
 
         if ACTION_DOUBLE == 2:
             a,b = env_action[:ACTION_DIMS], env_action[ACTION_DIMS:]
-            lerp = interp(frame/(STATE_FRAMES-1.), a, a*b)
+            lerp = interp(frame/(ACTION_REPEAT-1.), a, a*b)
         else: lerp = env_action
 
         obs, reward, state.done, info = env.step(lerp)
@@ -668,7 +679,7 @@ def append_to_batch():
     if app.show_state_image:
         app.show_state_image = False
         proc = multiprocessing.Process(target=imshow,
-            args=([save_state[0,:,:,CHANNELS*i:CHANNELS*(i+1)] for i in range(STATE_FRAMES)],))
+            args=([save_state[0,:,:,CHANNELS*i:CHANNELS*(i+1)] for i in range(ACTION_REPEAT)],))
         proc.start()
 
     temp_paths = batch_paths(FLAGS.inst, 'temp')
@@ -751,7 +762,7 @@ mb = Struct(
     nsteps = list(range(len(training.nsteps))))
 def make_minibatch(): # Each minibatch is random subset of batch trajectories
     step = make_minibatch.current_step
-    if step+CONCAT_STATES == ER_BATCH_STEPS:
+    if step+CONCAT_STATES == ER_BATCH_SIZE-1:
         step = 0
 
     if step == 0:
