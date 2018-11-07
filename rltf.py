@@ -38,10 +38,12 @@ CONCAT_STATES = 1
 
 USE_LSTM = False
 SHARED_LAYERS = True
+BATCH_NORM = True
 MHDPA_LAYERS = 0#3
-HIDDEN_NODES = 500
+FC_UNITS = 500
 
 DISCRETE_ACTIONS = []
+ACTION_TANH = []
 ENV_NAME = os.getenv('ENV')
 if not ENV_NAME:
     raise Exception('Missing ENV environment variable')
@@ -50,13 +52,7 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing = gym.envs.box2d.car_racing
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
-    DISCRETE_ACTIONS = [
-        [1, 0, 0],
-        [-1, 0, 0],
-        [0, 1, 0],
-        [0, 0, 0],
-        [0, 0, 1],
-    ] if 1 else []
+    ACTION_TANH = [0]
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple # [512, 288]
 elif 'Bullet' in ENV_NAME:
@@ -102,11 +98,11 @@ ACTION_DIMS = (env.action_space.shape or [env.action_space.n])[0]
 ACTION_DISCRETE = not env.action_space.shape
 def onehot_vector(idx, dims): return [1. if idx == i else 0. for i in range(dims)]
 ACTION_DOUBLE = 1
-FINITE_DIFF_Q = not ACTION_DISCRETE
+FINITE_DIFF_Q = 0#not ACTION_DISCRETE
 if ACTION_DISCRETE:
     MULTI_ACTIONS = [onehot_vector(a, ACTION_DIMS) for a in range(ACTION_DIMS)]
 else:
-    MULTI_ACTIONS = DISCRETE_ACTIONS
+    MULTI_ACTIONS = []
     if ACTION_REPEAT >= 5:
         # Interpolate actions if repeating for many frames
         ACTION_DOUBLE = 2
@@ -222,20 +218,18 @@ def gradient_override(expr, custom_grad):
 gradient_override.counter = 0
 
 def layer_batch_norm(x):
-    norm = tf.layers.BatchNormalization(scale=False, center=False)
+    norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.1)
     x = [norm.apply(x[i], training=i==layer_batch_norm.training_idx) for i in range(len(x))]
     for w in norm.weights: variable_summaries(w)
     return x
 
-def layer_dense(x, outputs, activation=tf.nn.relu, norm=True, use_bias=False, trainable=True):
-    if norm: x = layer_batch_norm(x)
+def layer_dense(x, outputs, activation=None, use_bias=False, trainable=True):
     dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable)
     x = [dense.apply(n) for n in x]
     for w in dense.weights: variable_summaries(w)
     return x
 
 def layer_lstm(x, outputs, ac):
-    x = layer_batch_norm(x)
     with tf.variable_scope('lstm'):
         cell = rnn.LSTMCell(outputs, use_peepholes=True, forget_bias=0.)
 
@@ -268,20 +262,22 @@ def make_conv_net(x):
     LAYERS = [
         (32, 8, 3, (3,2)),
         (32, 4, 2, 0),
-        (32, 4, 1, 0)]
+        (32, 3, 1, 0)]
     x = [tf.expand_dims(n,-1) for n in x]
     for l,(filters, width, stride, conv3d) in enumerate(LAYERS):
         with tf.variable_scope('conv_%i' % l):
-            x = layer_batch_norm(x)
-            kwds = dict(activation=tf.nn.relu, use_bias=False)
+            kwds = dict(activation=None, use_bias=False)
             if conv3d:
                 width3d, stride3d = conv3d
                 conv = tf.layers.Conv3D(filters, (width, width, width3d), (stride, stride, stride3d), **kwds)
             else:
+                if len(x[0].shape) == 5: # Back to 2D conv
+                    x = [tf.reshape(n, n.shape.as_list()[:3] + [-1]) for n in x]
                 conv = tf.layers.Conv2D(filters, width, stride, **kwds)
-                x = [tf.reshape(n, n.shape.as_list()[:3] + [-1]) for n in x] # Back to 2D conv
             x = [conv.apply(n) for n in x]
             for w in conv.weights: variable_summaries(w)
+            if BATCH_NORM: x = layer_batch_norm(x)
+            x = [tf.nn.relu(n) for n in x]
         print(x[0].shape)
     return x
 
@@ -299,11 +295,11 @@ def make_attention_net(x, ac):
                 if i==1: ac.per_minibatch.__dict__['attention_minmax_%i'%l] = tf.stack([tf.reduce_min(attention), tf.reduce_max(attention)])
     return x
 
-def make_dense(x, layers=[HIDDEN_NODES]*2):
-    for i,l in enumerate(layers):
+def make_fc(x, last_activation=double_relu):
+    for i in range(2):
         with tf.variable_scope('hidden_%i' % i):
-            if i==1 and USE_LSTM: x = layer_lstm(x, l, ac)
-            else: x = layer_dense(x, l)
+            if i==1 and USE_LSTM: x = layer_lstm(x, FC_UNITS, ac)
+            else: x = layer_dense(x, FC_UNITS, [double_relu, last_activation][i])
     return x
 
 def make_shared(x, ac):
@@ -325,21 +321,28 @@ def make_acrl():
     allac.append(ac)
 
     def make_policy(shared):
-        hidden = make_dense(shared)
+        hidden = make_fc(shared)
         with tf.variable_scope('output'):
-            softmax_dims = ACTION_DIMS if POLICY_SOFTMAX else len(DISCRETE_ACTIONS)
-            if softmax_dims:
-                policy = layer_dense(hidden, softmax_dims, tf.nn.softmax)
-                if DISCRETE_ACTIONS:
-                    policy = [tf.matmul(n,MULTI_ACTIONS) for n in policy]
-            else:
-                policy = layer_dense(hidden, ACTION_DIMS, tf.tanh)
-        with tf.variable_scope('multiply'):
-            half = layer_dense(hidden, ACTION_DIMS, tf.nn.sigmoid)
-            policy = [p*(1+3*h)/4 for p,h in zip(policy,half)]
-        if ACTION_DOUBLE == 2:
-            with tf.variable_scope('interp'):
-                policy = [tf.concat([p,m],-1) for p,m in zip(policy, layer_dense(hidden, ACTION_DIMS, tf.nn.sigmoid))]
+            if POLICY_SOFTMAX:
+                policy = layer_dense(hidden, ACTION_DIMS, tf.nn.softmax)
+                return policy
+
+            policy = layer_dense(hidden, ACTION_DIMS, tf.sigmoid)
+            with tf.variable_scope('multiply'):
+                policy = [p*(.5+.5*m) for p,m in zip(policy, layer_dense(hidden, ACTION_DIMS, tf.nn.sigmoid))]
+
+            if ACTION_TANH: # Multiply specific axes with tanh
+                with tf.variable_scope('tanh'):
+                    tanh = layer_dense(hidden, len(ACTION_TANH), tf.tanh)
+                    for i in range(len(policy)):
+                        mult = [tf.ones_like(tanh[i][:,0])]*ACTION_DIMS
+                        for j,t in enumerate(ACTION_TANH):
+                            mult[t] = tanh[i][:,j]
+                        policy[i] *= tf.stack(mult, -1)
+
+            if ACTION_DOUBLE == 2:
+                with tf.variable_scope('interp'):
+                    policy = [tf.concat([p,m],-1) for p,m in zip(policy, layer_dense(hidden, ACTION_DIMS, tf.nn.sigmoid))]
         return policy
 
     # Move concat states to last dimension
@@ -382,29 +385,24 @@ def make_acrl():
         n = tf.reduce_max(n, 1) if reduce_max else n
         return n
 
-    STEP_FUNCS = 20
+    STEP_FUNCS = 5
     def make_value_output(state, actions):
         if not ACTION_DISCRETE:
             rng = range(1-STEP_FUNCS, STEP_FUNCS)
-            actions = [tf.concat([STEP_FUNCS*a + f for f in rng], -1) for a in actions]
-            # Discontinuous step functions are better at learning binary actions
-            if FINITE_DIFF_Q:
-                if 1: actions = [tf.cast(tf.concat([a,-a],-1)>0, DTYPE) for a in actions] # OR
-                else: actions = [tf.sign(a) for a in actions] # AND
+            actions = [tf.nn.relu(tf.concat([STEP_FUNCS*a + f +0.5 for f in rng], -1)) for a in actions]
+            actions = [tf.where(a>=1., tf.ones_like(a), # Discontinuous step functions BETTER
+                #a if i==2 else # Attempt at gradient for policy value
+                tf.zeros_like(a)
+                ) for i,a in enumerate(actions)]
+            actions = [tf.concat([a, 1-a], -1) for a in actions]
 
-        if 1:
-            a1 = actions
-            for i in range(1):
-                with tf.variable_scope('actions_%i' % i):
-                    a1 = layer_dense(a1, HIDDEN_NODES/2, double_relu, norm=False)
-            combined = [n*a for n,a in zip(state, a1)]
-        else:
-            with tf.variable_scope('hidden'):
-                state = layer_batch_norm(state) # Only norm the state, not actions
-                combined = [tf.concat([s,a], -1) for s,a in zip(state, actions)]
-                combined = layer_dense(combined, HIDDEN_NODES, norm=False)
+        with tf.variable_scope('actions'):
+            actions = layer_dense(actions, FC_UNITS)
         with tf.variable_scope('output'):
-            output = layer_dense(combined, 1, None, norm=False)
+            combined = [double_relu(n+a)
+                #double_relu(n)*double_relu(a)
+                for n,a in zip(state, actions)]
+            output = layer_dense(combined, 1)
             return [n[:,0] for n in output], combined
 
     gamma_nsteps = tf.expand_dims(tf.stack([FLAGS.gamma**tf.cast(ph.nsteps[i], DTYPE)
@@ -412,11 +410,11 @@ def make_acrl():
     def make_qvalue(shared):
         shared = shared if SHARED_LAYERS else make_shared(state_inputs, ac)
 
-        state = make_dense(shared)
+        state = make_fc(shared, None)
         actions = [ac.inst_policy]
         if not FLAGS.inst:
+            actions = [actions[0], ph.actions, ac.policy] + ac.policy_next
             state = [state[0]] + [state[1]]*2 + state[2:]
-            actions += [ph.actions, ac.policy] + ac.policy_next
         multi_actions_pre(state, actions, 0, 1)
 
         q, combined = make_value_output(state, actions)
@@ -425,13 +423,16 @@ def make_acrl():
 
         value = Struct(inst_policy=q.pop(0))
         if FLAGS.inst: return value, None
+
         [value.q, value.state] = q[:2]
-        next_state_value = q[2:]
+        value.state_h = []
+        value.action_h = []
+        next_state_value = q[-len(training.nsteps):]
         value.nstep = ph.rewards[:,:,r] + gamma_nsteps*tf.stack(next_state_value, -1)
 
         value_weights = scope_vars() + shared_weights
         with tf.variable_scope('error_value'):
-            error_predict = layer_dense(combined, 1, None, norm=False)[1][:,0]
+            error_predict = layer_dense(combined, 1)[1][:,0]
             error_weights = scope_vars()
 
         def update_qvalue(common_target_value):
@@ -474,13 +475,18 @@ def make_acrl():
 
     policy_weights = scope_vars('policy')
     a_diff = ph.actions - ac.policy
-    if 1: # DDPG-style policy updates using Q-function gradient
-        if FINITE_DIFF_Q:
-            value_grad = tf.where(tf.abs(a_diff) > 1e-3,
-                tf.expand_dims(value1.q - value1.state, -1) / a_diff,
-                tf.zeros_like(a_diff))
-        else:
-            value_grad = tf.gradients(value1.state, ac.policy)[0]
+    if FINITE_DIFF_Q:
+        value_grad = 0.
+        zeros = tf.zeros_like(ac.policy)
+        for state_h, div in zip(value1.state_h+[value1.q],
+                                value1.action_h+[a_diff]):
+            no_div0 = tf.abs(div) > 1./STEP_FUNCS
+            diff = tf.expand_dims(state_h - value1.state, -1)
+            value_grad += tf.where(no_div0, diff / div, zeros)
+    else:
+        # DDPG-style policy updates using Q-function gradient
+        value_grad = tf.gradients(value1.state, ac.policy)[0]
+    if value_grad is not None:
         value_grad = tf.where(ph.ddpg, value_grad, tf.zeros_like(value_grad))
         repl = gradient_override(ac.policy, value_grad)
         grads = opt.policy.compute_gradients(repl, policy_weights)
