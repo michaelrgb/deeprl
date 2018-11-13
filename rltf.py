@@ -132,7 +132,7 @@ def batch_paths(batch_num, path=None):
     if not path:
         path = '%s_%i_%i' % (ENV_NAME, ACTION_REPEAT, ACTION_DOUBLE)
     os.system('mkdir -p batches')
-    path = 'batches/' + path + '_%i_%s.mmap'
+    path = ('batches_keep/' if batch_num<0 else 'batches/') + path + '_%i_%s.mmap'
     return {key: path % (batch_num, key) for key in ['rawframes', 'states', 'actions', 'rewards']}
 
 REWARDS_GLOBAL = REWARDS_ALL = 1
@@ -161,7 +161,7 @@ ph = Struct(
     rewards=tf.placeholder(DTYPE, [FLAGS.minibatch, len(training.nsteps), REWARDS_GLOBAL]),
     frame=tf.placeholder(DTYPE, [CONCAT_STATES, ACTION_REPEAT] + FRAME_DIM),
     nsteps=tf.placeholder('int32', [len(training.nsteps)]),
-    inst_explore=tf.placeholder(DTYPE, ()))
+    inst_explore=tf.placeholder(DTYPE, [ACTION_DIMS]))
 
 if CONV_NET:
     frame_to_state = tf.reshape(ph.frame, [-1] + FRAME_DIM) # Combine CONCAT_STATES and ACTION_REPEAT
@@ -179,7 +179,7 @@ else:
     frame_to_state = tf.reshape(ph.frame, [CONCAT_STATES] + STATE_DIM)
 
 app = Struct(policy_index=0, quit=False, update_count=0, print_action=False, show_state_image=False,
-    draw_attention=False, wireframe=True)
+    draw_attention=False, wireframe=True, pause=False)
 if FLAGS.inst:
     FIRST_BATCH = (FLAGS.inst-1)*FLAGS.batch_per_inst
 else:
@@ -257,6 +257,7 @@ def layer_lstm(x, outputs, ac):
             if i==1: ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
     return x
 
+ACTIVATION = tf.nn.relu
 def make_conv_net(x):
     LAYERS = [
         (32, 8, 4, 0),
@@ -281,26 +282,25 @@ def make_conv_net(x):
 
             if pool_stride: x = [tf.nn.avg_pool(n, pool_stride, pool_stride, 'VALID') for n in x]
             if BATCH_NORM: x = layer_batch_norm(x)
-            x = [tf.tanh(n) for n in x]
+            x = [ACTIVATION(n) for n in x]
         print(x[0].shape)
     return x
 
+if MHDPA_LAYERS: from tflayers.mhdpa import *
 def make_attention_net(x, ac):
     for l in range(MHDPA_LAYERS):
         with tf.variable_scope('mhdpa_%i' % l):
-            x = layer_batch_norm(x)
-            if l == 0:
-                relational = MHDPA()
-                x = [concat_coord_xy(n) for n in x]
+            mhdpa = MHDPA()
+            #if l == 0: x = [concat_coord_xy(n) for n in x]
             for i,n in enumerate(x):
-                x[i], attention = relational.apply(n)
+                x[i], attention = mhdpa.apply(n)
                 if i==0 and l==(MHDPA_LAYERS-1):
                     ac.inst_attention = attention # Display agent attention
                 if i==1: ac.per_minibatch.__dict__['attention_minmax_%i'%l] = tf.stack([tf.reduce_min(attention), tf.reduce_max(attention)])
     return x
 
 opt = Struct(td=tf.train.AdamOptimizer(FLAGS.learning_rate),
-    policy=tf.train.AdamOptimizer(FLAGS.learning_rate/20),
+    policy=tf.train.AdamOptimizer(FLAGS.learning_rate/5),
     error=tf.train.AdamOptimizer(1))
 
 allac = []
@@ -331,36 +331,27 @@ def make_acrl():
         with tf.variable_scope('hidden_0'):
             x = layer_dense(x, FC_UNITS)
             if BATCH_NORM: x = layer_batch_norm(x)
-            x = [tf.nn.relu(n) for n in x]
+            x = [ACTIVATION(n) for n in x]
         with tf.variable_scope('hidden_1'):
-            if actions: x = [tf.concat([n,a],-1) for n,a in zip(x,actions)]
+            #if actions: x = [tf.concat([n,a],-1) for n,a in zip(x,actions)]
             if USE_LSTM: x = layer_lstm(x, FC_UNITS, ac)
-            else: x = layer_dense(x, FC_UNITS)
-            x = [double_relu(n) for n in x]
-        return x
+            else: x = layer_dense(x, FC_UNITS, ACTIVATION)
+            if actions:
+                with tf.variable_scope('actions'):
+                    actions = layer_dense(actions, FC_UNITS/2, double_relu)
+                    x = [n*a for n,a in zip(x,actions)]
+        return [tf.nn.relu(n) for n in x]
 
     def make_policy_output(hidden):
         if POLICY_SOFTMAX:
             policy = layer_dense(hidden, ACTION_DIMS, tf.nn.softmax)
             return policy
+        with tf.variable_scope('sigmoid'):
+            policy = layer_dense(hidden, ACTION_DIMS, tf.sigmoid)
 
-        def binary_output(scope, dims=ACTION_DIMS, tanh=False):
-            with tf.variable_scope(scope):
-                logit = layer_dense(hidden, dims)
-                logit[0] += ph.inst_explore * tf.random_normal(logit[0].shape)
-                r = [tf.tanh(n) if tanh else tf.sigmoid(n) for n in logit]
-
-            for i in [0]:#range(len(r)):
-                bin = logit[i]
-                bin = tf.where(bin>0., tf.ones_like(bin), tf.zeros_like(bin))
-                bin = bin*2. - 1. if tanh else bin
-                #if i==1: r.insert(2, bin) # Discontinuous version of policy
-                #else: r[i] = bin
-            return r
-
-        policy = [m1*(.5+.5*m2) for m1,m2 in zip(binary_output('m1'), binary_output('m2'))]
         if ACTION_TANH: # Multiply specific axes with tanh
-            tanh = binary_output('tanh', len(ACTION_TANH), True)
+            with tf.variable_scope('tanh'):
+                tanh = layer_dense(hidden, len(ACTION_TANH), tf.tanh)
             for i in range(len(policy)):
                 mult = [tf.ones_like(tanh[i][:,0])]*ACTION_DIMS
                 for j,t in enumerate(ACTION_TANH):
@@ -369,7 +360,10 @@ def make_acrl():
 
         if ACTION_DOUBLE == 2:
             policy = [tf.concat([p,m],-1) for p,m in zip(policy, binary_output('interp'))]
-        return policy
+
+        with tf.variable_scope('stddev'):
+            stddev = layer_dense(hidden, policy[0].shape[1], tf.nn.softplus)
+        return policy, stddev
 
     layer_batch_norm.training_idx = 1
     with tf.variable_scope('policy'):
@@ -377,10 +371,12 @@ def make_acrl():
         shared_weights = scope_vars() if SHARED_LAYERS else []
         hidden = make_fc(shared, None)
         with tf.variable_scope('output'):
-            policy = make_policy_output(hidden)
+            policy, stddev = make_policy_output(hidden)
         ac.inst_policy = policy[0]
+        ac.inst_policy_stddev = stddev[0]
         if not FLAGS.inst:
             ac.policy = policy[1]
+            ac.policy_stddev = stddev[1]
             ac.policy_next = policy[-len(training.nsteps):]
 
     def multi_actions_pre(state, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
@@ -404,17 +400,13 @@ def make_acrl():
         n = tf.reduce_max(n, 1) if reduce_max else n
         return n
 
-    STEP_FUNCS = 10
     def tile_actions(actions):
-        if ACTION_DISCRETE:
-            return actions
-
-        rng = range(1-STEP_FUNCS, STEP_FUNCS)
-        actions = [tf.nn.relu(tf.concat([STEP_FUNCS*a + f +0.5 for f in rng], -1)) for a in actions]
-        actions = [tf.where(a>=1, #tf.logical_and(a>=1., a<2),
-            tf.ones_like(a), # Discontinuous step functions BETTER
-            #a if i==2 else # Attempt at gradient for policy value
-            tf.zeros_like(a)) for i,a in enumerate(actions)]
+        if not ACTION_DISCRETE:
+            TILES = 10
+            tiles = [1.5**-f * (TILES-1.)/TILES for f in range(TILES)]
+            tiles = tiles + [-t for t in tiles]
+            actions = [tf.concat([a-t for t in tiles], -1) for a in actions]
+            actions = [tf.where(a>0, tf.ones_like(a), tf.zeros_like(a)) for a in actions]
         actions = [tf.concat([a, 1-a], -1) for a in actions]
         return actions
 
@@ -478,6 +470,11 @@ def make_acrl():
     with tf.variable_scope('value2'):
         [value2, update2] = make_qvalue()
 
+    policy_pdf = tf.distributions.Normal(ac.policy, ac.policy_stddev)
+    importance_ratio = tf.reduce_prod(policy_pdf.prob(ph.actions), -1)
+    importance_ratio /= tf.reduce_sum(importance_ratio) + 1.
+    ac.per_minibatch.importance_ratio = tf.reduce_max(importance_ratio)
+
     # Fix value overestimation by clipping the actor's critic with a second critic,
     # to avoid the bias introduced by the policy update.
     min_values = tf.minimum(value1.nstep, value2.nstep)
@@ -494,7 +491,7 @@ def make_acrl():
         zeros = tf.zeros_like(ac.policy)
         for state_h, div in zip(value1.state_h+[value1.q],
                                 value1.action_h+[a_diff]):
-            no_div0 = tf.abs(div) > 1./STEP_FUNCS
+            no_div0 = tf.abs(div) > 1e-2
             diff = tf.expand_dims(state_h - value1.state, -1)
             value_grad += tf.where(no_div0, diff / div, zeros)
     else:
@@ -503,15 +500,15 @@ def make_acrl():
     if value_grad is not None:
         value_grad = tf.where(ph.ddpg, value_grad, tf.zeros_like(value_grad))
         repl = gradient_override(ac.policy, value_grad)
-        grads = opt.policy.compute_gradients(repl, policy_weights)
+        grads = opt.policy.compute_gradients(repl, policy_weights[:-1])
         ac.per_update.gnorm_policy_ddpg = accum_gradient(grads, opt.policy)
 
     if 1: # Policy updates using multi-step advantage value
-        state_value = tf.maximum(value1.state, value2.state)
+        state_value = value1.state
         adv = tf.maximum(0., return_value - state_value) # Only towards better actions
         adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
-        adv = tf.expand_dims(adv, -1)
-        repl = gradient_override(ac.policy, adv*a_diff)
+        adv = tf.tile(tf.expand_dims(adv, -1), [1, ac.policy.shape[1]])
+        repl = gradient_override(policy_pdf.log_prob(ph.actions), adv)
         grads_adv = opt.policy.compute_gradients(repl, policy_weights)
         ac.per_update.gnorm_policy_adv = accum_gradient(grads_adv, opt.policy)
 
@@ -527,8 +524,9 @@ def make_acrl():
 
     ac.per_minibatch.reward_sum = tf.reduce_sum(ph.rewards[:,0,r])
     ac.per_minibatch.td_error = tf.reduce_sum(ac.td_error**2)
-    ac.per_minibatch.policy_min = tf.reduce_min(ac.policy, axis=0)
-    ac.per_minibatch.policy_max = tf.reduce_max(ac.policy, axis=0)
+    ac.per_minibatch.policy_min = tf.reduce_min(ac.policy, 0)
+    ac.per_minibatch.policy_max = tf.reduce_max(ac.policy, 0)
+    ac.per_minibatch.action_max = tf.reduce_max(ph.actions, 0)
 
 for r in range(REWARDS_ALL):
     with tf.variable_scope('ac'): make_acrl()
@@ -553,7 +551,8 @@ def setup_key_actions():
             policy_index=app.policy_index,
             options=(['sample '+str(FLAGS.sample_action)] if FLAGS.sample_action else []) +
                 (['print'] if app.print_action else []) +
-                (['attention'] if app.draw_attention else []))
+                (['attention'] if app.draw_attention else []) +
+                (['pause'] if app.pause else []))
         print(d)
         window.set_caption(str(d))
 
@@ -588,6 +587,8 @@ def setup_key_actions():
             app.draw_attention ^= True
         elif k==ord('w'):
             app.wireframe ^= True
+        elif k==ord('p'):
+            app.pause ^= True
         elif k==ord('q'): on_close()
         else: return
         settings_caption()
@@ -625,10 +626,9 @@ def step_to_frames():
     if ACTION_DOUBLE == 2: a = np.concatenate([a,[1.]*ACTION_DIMS], 0)
 
     if state.count > 0 and app.policy_index != -1:
-        a = action.policy.copy()
-        if 0:#not ACTION_DISCRETE:
-            idx = choose_action(action.policy_value) if FLAGS.sample_action else 0
-            a = ([action.policy] + MULTI_ACTIONS)[idx]
+        stddev = action.policy_stddev * FLAGS.sample_action
+        a = np.random.normal(action.policy, stddev)
+        a = np.clip(a, [-1. if i in ACTION_TANH else 0. for i in range(a.shape[0])], 1.)
     '''
     if FLAGS.sample_action:
         np.random.seed(0)
@@ -681,7 +681,7 @@ def step_to_frames():
 
 ops.inst_step = [frame_to_state] + [
     i for sublist in [
-        [ac.inst_policy[0],# Policy from uploaded state,
+        [ac.inst_policy[0], ac.inst_policy_stddev[0],# Policy from uploaded state,
         ac.value1.inst_policy[0],
         ] + ([ac.inst_attention] if MHDPA_LAYERS else [])
         for ac in allac]
@@ -701,11 +701,9 @@ def append_to_batch():
         save_reward = step_to_frames()
         save_action = action.to_save
 
-    ret = sess.run(ops.inst_step, feed_dict={ph.frame: state.frames, ph.inst_explore: FLAGS.sample_action})
-    save_state = ret[0]
-    action.policy = ret[1]
-    action.policy_value = ret[2]
-    if MHDPA_LAYERS: state.inst_attention = ret[3]
+    ret = sess.run(ops.inst_step, feed_dict={ph.frame: state.frames})
+    [save_state, action.policy, action.policy_stddev, action.policy_value] = ret[:4]
+    if MHDPA_LAYERS: state.inst_attention = ret[4]
     if app.show_state_image:
         app.show_state_image = False
         proc = multiprocessing.Process(target=imshow,
@@ -868,7 +866,9 @@ def rl_loop():
     if FLAGS.inst or not training.enable or training.batches_recorded < FLAGS.batch_keep:
         append_to_batch()
     else:
-        if make_minibatch():
+        if app.pause:
+            time.sleep(0.1)
+        elif make_minibatch():
             train_accum_minibatch()
             train_apply_gradients()
         env_render() # Render needed for keyboard events
