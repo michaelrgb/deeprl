@@ -20,7 +20,8 @@ def variable_summaries(var, scope=None):
         tf.summary.histogram('histogram', var)
 
 # Prevent dead neurons if taking one-sided input
-double_relu = lambda x: tf.nn.relu(tf.concat([x, -x], -1))
+concat_neg = lambda x: tf.concat([x, -x], -1)
+double_relu = lambda x: tf.nn.relu(concat_neg(x))
 
 def conv2d(x, W, stride=1, padding='VALID'):
     return tf.nn.conv2d(x, W, strides=[1, stride, stride, 1], padding=padding)
@@ -117,3 +118,8 @@ def test_lcn(image, sess):
     lcn_op = local_contrast_norm(frame_ph, GAUSS_W)
     lcn = sess.run(lcn_op, feed_dict={frame_ph: image if len(image.shape)==4 else [image]})
     return lcn
+
+def finite_diff(y_diff, x_diff):
+    no_div0 = tf.abs(x_diff) > 1e-2
+    zeros = tf.zeros_like(x_diff)
+    return tf.where(no_div0, tf.expand_dims(y_diff,-1) / x_diff, zeros)
