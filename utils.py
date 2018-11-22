@@ -123,3 +123,16 @@ def finite_diff(y_diff, x_diff):
     no_div0 = tf.abs(x_diff) > 1e-2
     zeros = tf.zeros_like(x_diff)
     return tf.where(no_div0, tf.expand_dims(y_diff,-1) / x_diff, zeros)
+
+@tf.RegisterGradient("CastGrad")
+def _cast_grad(op, grad):
+    return grad
+@tf.RegisterGradient("GreaterGrad")
+def _greater_grad(op, grad):
+    x = op.inputs[0]
+    # During backpropagation heaviside behaves like sigmoid
+    return tf.sigmoid(x) * (1 - tf.sigmoid(x)) * grad, None
+
+def heaviside(x, g=tf.get_default_graph()):
+    with g.gradient_override_map({"Greater": "GreaterGrad", "Cast": "CastGrad"}):
+        return tf.cast(x>0, DTYPE)
