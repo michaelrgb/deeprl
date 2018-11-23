@@ -7,6 +7,9 @@ def wrapList(value):
     return value if type(value) == list else [value]
 class Struct:
     def __init__(self, **entries): self.__dict__.update(entries)
+def softmax(x):
+    e_x = np.exp(x - x.max())
+    return e_x / e_x.sum()
 
 def variable_summaries(var, scope=None):
     if not scope: scope = var.name.split('/')[-1].split(':')[0]

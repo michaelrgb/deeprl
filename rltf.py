@@ -5,17 +5,14 @@ from pprint import pprint
 from utils import *
 import er
 
-# python rltf.py --batch_keep 6 --batch_inst 20 --record 0
-# for i in {1..4}; do python rltf.py --inst $i --batch_per_inst 5 & sleep 1; done
-
 flags = tf.app.flags
 flags.DEFINE_integer('inst', 0, 'ID of agent that accumulates gradients on server')
-flags.DEFINE_integer('batch_keep', 0, 'Batches recorded from user actions')
-flags.DEFINE_integer('batch_inst', 128, 'Batches in queue recorded from agents')
-flags.DEFINE_integer('batch_per_inst', 64, 'Batches recorded per agent instance')
+flags.DEFINE_integer('seq_keep', 0, 'Sequences recorded from user actions')
+flags.DEFINE_integer('seq_inst', 128, 'Sequences in queue recorded from agents')
+flags.DEFINE_integer('seq_per_inst', 64, 'Sequences recorded per agent instance')
 flags.DEFINE_boolean('replay', False, 'Replay actions recorded in memmap array')
 flags.DEFINE_boolean('recreate_states', False, 'Recreate kept states from saved raw frames')
-flags.DEFINE_boolean('record', False, 'Record over kept batches')
+flags.DEFINE_boolean('record', False, 'Record over kept sequences')
 flags.DEFINE_string('summary', '/tmp/tf', 'Summaries path for Tensorboard')
 flags.DEFINE_string('env_seed', '', 'Seed number for new environment')
 flags.DEFINE_float('sample_action', 0., 'Sample actions, or use policy')
@@ -118,10 +115,7 @@ if CONV_NET:
         STATE_DIM[:2] = RESIZE
 STATE_DIM[-1] *= er.ACTION_REPEAT
 
-FIRST_BATCH = -FLAGS.batch_keep
-LAST_BATCH = FLAGS.batch_inst
-
-training = Struct(enable=True, batches_recorded=0, batches_mtime={}, temp_batch=None,
+training = Struct(enable=True, seq_recorded=0, batches_mtime={}, temp_batch=None,
     nsteps=[int(s) for s in FLAGS.nsteps.split(',') if s])
 ph = Struct(
     adv=tf.placeholder('bool', ()),
@@ -130,7 +124,7 @@ ph = Struct(
     states=[tf.placeholder(DTYPE, [FLAGS.minibatch, er.CONCAT_STATES] + STATE_DIM) for n in training.nsteps+[1]],
     rewards=tf.placeholder(DTYPE, [FLAGS.minibatch, len(training.nsteps), er.ER_REWARDS]),
     frame=tf.placeholder(DTYPE, [er.CONCAT_STATES, er.ACTION_REPEAT] + FRAME_DIM),
-    nsteps=tf.placeholder('int32', [len(training.nsteps)]),
+    nsteps=tf.placeholder('int32', [FLAGS.minibatch, len(training.nsteps)]),
     inst_explore=tf.placeholder(DTYPE, [ACTION_DIMS]))
 
 if CONV_NET:
@@ -151,15 +145,16 @@ else:
 app = Struct(policy_index=0, quit=False, update_count=0, print_action=FLAGS.inst==1, show_state_image=False,
     draw_attention=False, wireframe=True, pause=False)
 if FLAGS.inst:
-    FIRST_BATCH = (FLAGS.inst-1)*FLAGS.batch_per_inst
+    FIRST_SEQ = (FLAGS.inst-1)*FLAGS.seq_per_inst
 else:
+    FIRST_SEQ = -FLAGS.seq_keep
     def init_vars(): sess.run(tf.global_variables_initializer())
     if FLAGS.record or FLAGS.replay or FLAGS.recreate_states:
         # Record new arrays
         app.policy_index = -1
     else:
-        training.batches_recorded = FLAGS.batch_keep
-training.append_batch = FIRST_BATCH
+        training.seq_recorded = FLAGS.seq_keep
+training.append_batch = FIRST_SEQ
 
 ops = Struct(
     per_minibatch=[], post_minibatch=[],
@@ -194,6 +189,7 @@ def gradient_override(expr, custom_grad):
 gradient_override.counter = 0
 
 def layer_batch_norm(x):
+    if not BATCH_NORM: return x
     norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.9)
     training_idx = 1
     x = [norm.apply(x[i], training=i==training_idx) for i in range(len(x))]
@@ -235,13 +231,13 @@ def layer_lstm(x, outputs, ac):
 def make_fc(x, actions):
     with tf.variable_scope('hidden1'):
         x = layer_dense(x, FC_UNITS)
-        if BATCH_NORM: x = layer_batch_norm(x)
+        x = layer_batch_norm(x)
         x = [heaviside(n) for n in x]
     with tf.variable_scope('hidden2'):
         if USE_LSTM: x = layer_lstm(x, FC_UNITS, ac)
         else: x = layer_dense(x, FC_UNITS)
 
-        if BATCH_NORM: x = layer_batch_norm(x)
+        x = layer_batch_norm(x)
         if actions:
             with tf.variable_scope('actions'):
                 actions = layer_dense(actions, FC_UNITS)
@@ -275,7 +271,7 @@ def make_conv_net(x):
             for w in conv.weights: variable_summaries(w)
 
             if pool_stride: x = [tf.nn.avg_pool(n, pool_stride, pool_stride, 'VALID') for n in x]
-            if BATCH_NORM: x = layer_batch_norm(x)
+            x = layer_batch_norm(x)
             x = [tf.nn.elu(n) for n in x]
         print(x[0].shape)
     return x
@@ -321,7 +317,8 @@ def make_policy(shared):
             mean, stddev = make_policy_output(hidden)
 
         policy = Struct(inst=mean[0], inst_stddev=stddev[0],
-            weights=shared.weights+scope_vars())
+            weights_nonshared=scope_vars())
+        policy.weights = shared.weights + policy.weights_nonshared
         if not FLAGS.inst:
             [policy.mb, policy.mb_stddev] = [mean[1], stddev[1]]
             policy.next = mean[-len(training.nsteps):]
@@ -357,8 +354,7 @@ def tile_actions(actions):
         actions = [heaviside(a) for a in actions]
     return actions
 
-gamma_nsteps = tf.expand_dims(tf.stack([FLAGS.gamma**tf.cast(ph.nsteps[i], DTYPE)
-    for i in range(len(training.nsteps))]), 0)
+gamma_nsteps = FLAGS.gamma**tf.cast(ph.nsteps, DTYPE)
 TDC_STEPS = len(training.nsteps)
 def make_qvalue(shared, policy):
     state = shared.layers
@@ -390,11 +386,11 @@ def make_qvalue(shared, policy):
         error_weights = scope_vars()
 
     def update_qvalue(target_value, ac=None):
-        td_error = target_value - value.q
-        repl = gradient_override(value.q, td_error)
+        value.td_error = target_value - value.q
+        repl = gradient_override(value.q, value.td_error)
         grad_s = opt.td.compute_gradients(repl, value_weights)
 
-        repl = gradient_override(error_predict, td_error-error_predict)
+        repl = gradient_override(error_predict, value.td_error-error_predict)
         grads = opt.error.compute_gradients(repl, error_weights)
         gnorm_error = accum_gradient(grads, opt.error)
 
@@ -408,7 +404,6 @@ def make_qvalue(shared, policy):
         gnorm = accum_gradient(grad_s, opt.td)
 
         if ac:
-            ac.td_error = td_error
             ac.per_update.gnorm_error = gnorm_error
             ac.per_update.gnorm_qvalue = gnorm
 
@@ -418,7 +413,7 @@ def make_qvalue(shared, policy):
 def make_shared(x):
     print(x[0].shape)
     if CONV_NET: x = make_conv_net(x)
-    elif BATCH_NORM: x = layer_batch_norm(x)
+    else: x = layer_batch_norm(x)
     if MHDPA_LAYERS: x = make_attention_net(x, ac)
 
     x = [tf.layers.flatten(n) for n in x]
@@ -474,7 +469,7 @@ def make_acrl():
     value1.update(return_target, ac)
     value2.update(return_target)
 
-    value_grad = tf.gradients(value1.state, policy.mb)[0]
+    value_grad = tf.gradients(value1.state + value2.state, policy.mb)[0]
     if value_grad is not None:
         value_grad = tf.where(ph.ddpg, value_grad, tf.zeros_like(value_grad))
         repl = gradient_override(policy.mb, value_grad)
@@ -498,11 +493,12 @@ def make_acrl():
             ops.post_update.append(t.assign(FLAGS.tau*w + (1-FLAGS.tau)*t))
 
     ac.per_minibatch.reward_sum = tf.reduce_sum(ph.rewards[:,0,r])
-    ac.per_minibatch.td_error = tf.reduce_sum(ac.td_error**2)
     ac.per_minibatch.policy_max = tf.reduce_max(policy.mb, 0)
     ac.per_minibatch.policy_min = tf.reduce_min(policy.mb, 0)
     ac.per_minibatch.action_max = tf.reduce_max(ph.actions, 0)
     ac.per_minibatch.action_min = tf.reduce_min(ph.actions, 0)
+    ac.per_minibatch.td_error = value1.td_error
+    ac.per_minibatch.td_error_sum = tf.reduce_sum(tf.abs(value1.td_error))
 
 for r in range(er.ER_REWARDS):
     with tf.variable_scope('ac'): make_acrl()
@@ -556,7 +552,7 @@ def setup_key_actions():
             training.enable ^= True
         elif k==ord('k'):
             # Bootstrap learning with user-supplied trajectories, then turn them off
-            FLAGS.batch_keep = 0
+            FLAGS.seq_keep = 0
         elif k==ord('r'):
             state.next_reset = True
         elif k==ord('m'):
@@ -590,9 +586,6 @@ def setup_key_actions():
 
 action = Struct(to_take=None, policy=[], keyboard=setup_key_actions())
 def step_to_frames():
-    def softmax(x):
-        e_x = np.exp(x - x.max())
-        return e_x / e_x.sum()
     def choose_action(value): # Choose from Q-values or softmax policy
         return np.random.choice(value.shape[0], p=softmax(value)) if FLAGS.sample_action else np.argmax(value)
     def interp(f, a, b): return a + f*(b-a)
@@ -649,10 +642,10 @@ def step_to_frames():
     return [reward_sum], action_to_save
 
 def append_to_batch():
-    save_paths = er.batch_paths(training.append_batch)
+    save_paths = er.seq_paths(training.append_batch)
     if not FLAGS.inst and FLAGS.recreate_states:
         if not state.count:
-            training.saved_batch = ermem.mmap_batch(save_paths, 'r', states=False)
+            training.saved_batch = ermem.mmap_seq(save_paths, 'r', states=False)
         batch = training.saved_batch
         state.frames[-1] = batch.rawframes[state.count]
         save_reward, save_action = batch.rewards[state.count], batch.actions[state.count]
@@ -674,9 +667,9 @@ def append_to_batch():
             args=([save_state[0,:,:,CHANNELS*i:CHANNELS*(i+1)] for i in range(er.ACTION_REPEAT)],))
         proc.start()
 
-    temp_paths = er.batch_paths(FLAGS.inst, 'temp')
+    temp_paths = er.seq_paths(FLAGS.inst, 'temp')
     if not training.temp_batch:
-        training.temp_batch = ermem.mmap_batch(temp_paths, 'w+')
+        training.temp_batch = ermem.mmap_seq(temp_paths, 'w+')
     batch = training.temp_batch
     batch.rawframes[state.count] = state.frames[-1]
     batch.states[state.count] = save_state[-1]
@@ -685,7 +678,7 @@ def append_to_batch():
 
     state.count += 1
     if state.count == er.TRAJECTORY_LENGTH:
-        if FLAGS.inst or training.batches_recorded < FLAGS.batch_keep:
+        if FLAGS.inst or training.seq_recorded < FLAGS.seq_keep:
             print('Replacing batch #%i' % training.append_batch)
             for a in batch.arrays: del a
             training.temp_batch = None
@@ -697,11 +690,11 @@ def append_to_batch():
                 os.system('rm -f ' + dst)
                 os.system('mv ' + src + ' ' + dst)
 
-        training.batches_recorded += 1
+        training.seq_recorded += 1
         training.append_batch += 1
-        if FLAGS.inst and training.batches_recorded == FLAGS.batch_per_inst:
-            training.batches_recorded = 0
-            training.append_batch = FIRST_BATCH
+        if FLAGS.inst and training.seq_recorded == FLAGS.seq_per_inst:
+            training.seq_recorded = 0
+            training.append_batch = FIRST_SEQ
         state.count = 0
 
 def tensor_struct_print(r, sname, do_print=True):
@@ -711,7 +704,7 @@ def tensor_struct_print(r, sname, do_print=True):
     d = {s: r[-i-1][policy_index] for i,s in enumerate(reversed(keys))}
     if do_print:
         np.set_printoptions(suppress=True, precision=6, sign=' ')
-        d_str = {k: str(v) for k,v in d.items()}
+        d_str = {k: str(v) for k,v in d.items() if len(str(v).split('\n')) < 10} # Skip large arrays
         pprint({sname: d_str})
     return Struct(**d)
 def tensor_struct_compile(sname):
@@ -737,7 +730,7 @@ if not FLAGS.inst:
         merged = tf.summary.merge_all()
         ops.per_update.insert(0, merged)
 
-ermem = er.ERMemory(FLAGS.minibatch, training.nsteps, STATE_DIM, ACTION_DIMS, FRAME_DIM)
+ermem = er.ERMemory(training.nsteps, STATE_DIM, ACTION_DIMS, FRAME_DIM)
 
 def train_accum_minibatch(mb):
     # Upload & train minibatch
@@ -750,7 +743,9 @@ def train_accum_minibatch(mb):
     for i in range(len(training.nsteps)+1):
         feed_dict[ph.states[i]] = mb.states[i]
     r = sess.run(ops.per_minibatch, feed_dict)
-    tensor_struct_print(r, 'per_minibatch')
+    per_minibatch = tensor_struct_print(r, 'per_minibatch')
+    # Prioritized experience replay according to TD error.
+    mb.td_error[:] = per_minibatch.td_error
 
 def train_apply_gradients(mb):
     r = sess.run(ops.per_update, feed_dict={})
@@ -760,10 +755,10 @@ def train_apply_gradients(mb):
     sess.run(ops.post_update)
     pprint(dict(
         policy_updates=dict(adv=FLAGS.adv, ddpg=FLAGS.ddpg),
-        nsteps=mb.nsteps,
+        nsteps=mb.nsteps[0,:], # Just show the first one
         update_count=app.update_count,
         rates=dict(learning_rate=FLAGS.learning_rate, tau=FLAGS.tau, gamma=FLAGS.gamma),
-        batches=dict(keep=FLAGS.batch_keep,inst=FLAGS.batch_inst,minibatch=FLAGS.minibatch)))
+        batches=dict(keep=FLAGS.seq_keep,inst=FLAGS.seq_inst,minibatch=FLAGS.minibatch)))
     os.system('clear') # Scroll up to see status
 
     if FLAGS.summary and not app.update_count%100:
@@ -772,7 +767,7 @@ def train_apply_gradients(mb):
 
 def rl_loop():
     if app.quit: return False
-    if FLAGS.inst or not training.enable or training.batches_recorded < FLAGS.batch_keep:
+    if FLAGS.inst or not training.enable or training.seq_recorded < FLAGS.seq_keep:
         append_to_batch()
     else:
         if app.pause:
@@ -780,7 +775,7 @@ def rl_loop():
         else:
             mb = ermem.fill_mb()
             if mb != None:
-                if mb.step==0: sess.run(ops.new_batches)
+                #if mb.step==0: sess.run(ops.new_batches) # Minibatch now has different steps
                 train_accum_minibatch(mb)
                 train_apply_gradients(mb)
         env_render() # Render needed for keyboard events

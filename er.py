@@ -13,19 +13,16 @@ CONCAT_STATES = 1
 
 ER_REWARDS = 1
 
-def batch_paths(batch_num, path=None):
+def seq_paths(seq_num, path=None):
     if not path:
-        path = '%s_%i_%i' % (ENV_NAME, ACTION_REPEAT, 1)#ACTION_DOUBLE)
-    os.system('mkdir -p batches')
-    path = ('batches_keep/' if batch_num<0 else 'batches/') + path + '_%i_%s.mmap'
-    return {key: path % (batch_num, key) for key in ['rawframes', 'states', 'actions', 'rewards']}
-
-manager = multiprocessing.Manager()
-batch_sets = manager.list()
+        path = '%s_%i' % (ENV_NAME, ACTION_REPEAT)
+    os.system('mkdir -p sequences; mkdir -p sequences_keep')
+    path = ('sequences_keep/' if seq_num<0 else 'sequences/') + path + '_%i_%s.mmap'
+    seq_num = -seq_num - 1 if seq_num<0 else seq_num
+    return {key: path % (seq_num, key) for key in ['rawframes', 'states', 'actions', 'rewards']}
 
 class ERMemory:
-    def __init__(self, mb_size, nsteps, state_dim, action_dims, frame_dim):
-        self.mb_size = mb_size
+    def __init__(self, nsteps, state_dim, action_dims, frame_dim):
         self.nsteps = nsteps
         self.state_dim = state_dim
         self.action_dims = action_dims
@@ -34,80 +31,110 @@ class ERMemory:
         self.proclist = []
         self.current_step = 0
         self.mb = None
+        self.mb_replace_size = FLAGS.minibatch / 4 # Amount of minibatch to replace each iteration
 
-    def mmap_batch(self, paths, mode, only_actions=False, states=True, rawframes=True):
-        batch = Struct(actions=np.memmap(paths['actions'], DTYPE.name, mode, shape=(TRAJECTORY_LENGTH, self.action_dims)))
+        manager = multiprocessing.Manager()
+        self.seq_sets = manager.list()
+
+    def mmap_seq(self, paths, mode, only_actions=False, states=True, rawframes=True):
+        seq = Struct(actions=np.memmap(paths['actions'], DTYPE.name, mode, shape=(TRAJECTORY_LENGTH, self.action_dims)))
         if only_actions:
-            return batch.actions
-        batch.rewards = np.memmap(paths['rewards'], DTYPE.name, mode, shape=(TRAJECTORY_LENGTH, ER_REWARDS))
-        batch.arrays = [batch.actions, batch.rewards]
+            return seq.actions
+        seq.rewards = np.memmap(paths['rewards'], DTYPE.name, mode, shape=(TRAJECTORY_LENGTH, ER_REWARDS))
+        seq.arrays = [seq.actions, seq.rewards]
         if states:
-            batch.states = np.memmap(paths['states'], DTYPE.name, mode, shape=(TRAJECTORY_LENGTH,) + tuple(self.state_dim))
-            batch.arrays.append(batch.states)
+            seq.states = np.memmap(paths['states'], DTYPE.name, mode, shape=(TRAJECTORY_LENGTH,) + tuple(self.state_dim))
+            seq.arrays.append(seq.states)
         if rawframes:
-            batch.rawframes = np.memmap(paths['rawframes'], DTYPE.name, mode, shape=(TRAJECTORY_LENGTH, ACTION_REPEAT) + tuple(self.frame_dim))
-            batch.arrays.append(batch.rawframes)
-        return batch
+            seq.rawframes = np.memmap(paths['rawframes'], DTYPE.name, mode, shape=(TRAJECTORY_LENGTH, ACTION_REPEAT) + tuple(self.frame_dim))
+            seq.arrays.append(seq.rawframes)
+        return seq
 
-    def proc_batch_set(self):
-        batch_set = {}
-        shuffled = list(range(-1,-(FLAGS.batch_keep+1),-1)) + list(range(FLAGS.batch_inst))
+    def _proc_seq_set(self):
+        seq_set = {}
+        shuffled = list(range(-1,-(FLAGS.seq_keep+1),-1)) + list(range(FLAGS.seq_inst))
         np.random.shuffle(shuffled)
-        while len(batch_set) < FLAGS.minibatch:
+        while len(seq_set) < self.mb_replace_size:
             try:
                 if not len(shuffled): return
                 idx = shuffled.pop()
-                b = self.mmap_batch(batch_paths(idx), 'r', rawframes=False)
-                batch_set[idx] = b
+                b = self.mmap_seq(seq_paths(idx), 'r', rawframes=False)
+                seq_set[idx] = b
             except Exception as e:
                 print(e)
                 continue
-        batch_sets.append(batch_set.values())
+        self.seq_sets.append(seq_set.values())
+    def _get_new_seq_set(self):
+        if 1:
+            PROCESSES = 2
+            while len(self.proclist) < PROCESSES:
+                proc = multiprocessing.Process(target=self._proc_seq_set)
+                proc.start()
+                self.proclist.append(proc)
+            proc = next((proc for proc in self.proclist if not proc.is_alive()), None)
+            if proc:
+                proc.join()
+                self.proclist.remove(proc)
+        else:
+            self._proc_seq_set()
+        self.seq_set = self.seq_sets.pop() if len(self.seq_sets) else None
 
-    def fill_mb(self): # Each minibatch is random subset of batch trajectories
-        step = self.current_step
-        if step+CONCAT_STATES == TRAJECTORY_LENGTH-1:
-            step = 0
+    def _fill_sub_mb(self, seq_step, mb_indices):
+        assert(len(mb_indices) == self.mb_replace_size)
 
-        if step == 0:
-            if 1:
-                PROCESSES = 2
-                while len(self.proclist) < PROCESSES:
-                    proc = multiprocessing.Process(target=self.proc_batch_set)
-                    proc.start()
-                    self.proclist.append(proc)
-                proc = next((proc for proc in self.proclist if not proc.is_alive()), None)
-                if proc:
-                    proc.join()
-                    self.proclist.remove(proc)
-            else:
-                self.proc_batch_set()
-            if not len(batch_sets): return None
-            self.batch_set = batch_sets.pop()
-        self.current_step = step+1
-
-        if not self.mb:
-            self.mb = Struct(
-                actions = np.zeros([self.mb_size, self.action_dims]),
-                states = [np.zeros([self.mb_size, CONCAT_STATES] + self.state_dim) for n in self.nsteps+[1]],
-                rewards = np.zeros([self.mb_size, len(self.nsteps), ER_REWARDS]),
-                nsteps = list(range(len(self.nsteps))))
+        seq_step += CONCAT_STATES
         mb = self.mb
-        mb.step = step
-        step += CONCAT_STATES
-        for b,batch in enumerate(self.batch_set):
-            mb.states[0][b] = batch.states[step-CONCAT_STATES:step]
-            mb.actions[b] = batch.actions[step]
+        for b,mb_idx in enumerate(mb_indices):# indices of entries to replace
+            seq = self.seq_set[b]
+
+            mb.td_error[mb_idx] = -float('inf')
+            mb.states[0][mb_idx] = seq.states[seq_step-CONCAT_STATES:seq_step]
+            mb.actions[mb_idx] = seq.actions[seq_step]
             for i,nsteps in enumerate(self.nsteps):
                 accum_reward = 0.
                 for n in range(nsteps):
-                    next_step = step + n
-                    accum_reward += batch.rewards[next_step] * FLAGS.gamma**n
+                    next_step = seq_step + n
+                    accum_reward += seq.rewards[next_step] * FLAGS.gamma**n
                     next_step += 1
                     if next_step == TRAJECTORY_LENGTH:
                         break
-                mb.rewards[b,i] = accum_reward
-                mb.states[i+1][b] = batch.states[next_step-CONCAT_STATES:next_step]
-                if b==0:
-                    mb.nsteps[i] = next_step - step
-        return mb
+                mb.states[i+1][mb_idx] = seq.states[next_step-CONCAT_STATES:next_step]
+                mb.rewards[mb_idx, i] = accum_reward
+                mb.nsteps[mb_idx, i] = next_step - seq_step
+
+    def fill_mb(self): # Each minibatch is random subset of batch trajectories
+        seq_step = self.current_step
+        if seq_step+CONCAT_STATES == TRAJECTORY_LENGTH-1:
+            seq_step = 0
+
+        if seq_step == 0:
+            self._get_new_seq_set()
+            if not self.seq_set: return None
+        self.current_step = seq_step+1
+
+        first_mb = False
+        if not self.mb:
+            first_mb = True
+            self.mb = Struct(
+                td_error = np.zeros([FLAGS.minibatch]),
+                actions = np.zeros([FLAGS.minibatch, self.action_dims]),
+                states = [np.zeros([FLAGS.minibatch, CONCAT_STATES] + self.state_dim) for n in self.nsteps+[1]],
+                rewards = np.zeros([FLAGS.minibatch, len(self.nsteps), ER_REWARDS]),
+                nsteps = np.zeros([FLAGS.minibatch, len(self.nsteps)]))
+
+        if first_mb:
+            # Fill the entire minibatch
+            for i in range(FLAGS.minibatch / self.mb_replace_size):
+                self._fill_sub_mb(seq_step, range(i*self.mb_replace_size, (i+1)*self.mb_replace_size))
+        else:
+            # Sample minibatch indices to replace
+            all_td_errors = {k: self.mb.td_error[k] for k in range(FLAGS.minibatch)}
+            mb_indices = []
+            for i in range(self.mb_replace_size):
+                idx, td_errors = zip(*all_td_errors.items())
+                probs = softmax(np.array([-abs(e) for e in td_errors]))
+                chosen = idx[np.random.choice(len(idx), p=probs)]
+                all_td_errors.pop(chosen)
+                mb_indices.append(chosen)
+            self._fill_sub_mb(seq_step, mb_indices)
+        return self.mb
