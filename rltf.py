@@ -228,6 +228,7 @@ def layer_lstm(x, outputs, ac):
             if i==1: ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
     return x
 
+CDF_80pc = 0.85
 def make_fc(x, actions):
     with tf.variable_scope('hidden1'):
         x = layer_dense(x, FC_UNITS)
@@ -244,20 +245,20 @@ def make_fc(x, actions):
                 x = [n+a for n,a in zip(x,actions)]
 
         # Offset controls cdf probability of activation being non-zero after batch norm.
-        x = [heaviside(n-0.85) for n in x]
+        x = [heaviside(n-CDF_80pc) for n in x]
     return x
 
 def make_conv_net(x):
     LAYERS = [
-        (32, 8, 4, 0),
-        (32, 4, 2, 0),
+        (32, 8, 3, 0),
+        (32, 3, 3, 0),
         #(64, 3, 1, 0)
     ]
     x = [tf.expand_dims(n,-1) for n in x]
     for l,(filters, width, stride, conv3d) in enumerate(LAYERS):
         with tf.variable_scope('conv_%i' % l):
             pool_stride = None
-            if stride >= 2: pool_stride = [1,2,2,1]; stride /= 2 # Smoothen filter responses
+            #if not stride%2: pool_stride = [1,2,2,1]; stride /= 2 # Smoothen filter responses
 
             kwds = dict(activation=None, use_bias=False)
             if conv3d:
@@ -346,13 +347,11 @@ def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
     return n
 
 def tile_actions(actions):
-    if ACTION_DISCRETE:
-        actions = [tf.concat([a, 1-a], -1) for a in actions]
-    else:
+    if not ACTION_DISCRETE:
         TILES = 10
-        actions = [concat_neg(tf.concat([a*TILES + t for t in range(-TILES+1,TILES)], -1)) for a in actions]
+        actions = [tf.concat([a*TILES + t for t in range(-TILES+1,TILES)], -1) for a in actions]
         actions = [heaviside(a) for a in actions]
-    return actions
+    return [2*a - 1 for a in actions]
 
 gamma_nsteps = FLAGS.gamma**tf.cast(ph.nsteps, DTYPE)
 TDC_STEPS = len(training.nsteps)
@@ -477,9 +476,9 @@ def make_acrl():
         ac.per_update.gnorm_policy_ddpg = accum_gradient(grads, opt.policy)
 
     if 1:
-        return_value = tf.reduce_max(tf.minimum(value1.nstep, value2.nstep), -1)
-        return_adv = return_value - value1.state
-        adv = tf.maximum(0., return_adv) # Only towards better actions
+        return_value = tf.reduce_max(value1.nstep, -1)
+        adv = return_value - value1.state
+        adv = tf.maximum(0., adv) # Only towards better actions
         adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
         adv = tf.tile(tf.expand_dims(adv, -1), [1, policy.mb.shape[1]])
         repl = gradient_override(policy_pdf.log_prob(ph.actions), adv)
