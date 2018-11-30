@@ -291,33 +291,48 @@ def make_attention_net(x, ac):
                 if i==1: ac.per_minibatch.__dict__['attention_minmax_%i'%l] = tf.stack([tf.reduce_min(attention), tf.reduce_max(attention)])
     return x
 
-def make_policy_output(hidden):
-    if POLICY_SOFTMAX:
-        policy = layer_dense(hidden, ACTION_DIMS, tf.nn.softmax)
-        return policy
-    with tf.variable_scope('sigmoid'):
-        policy = layer_dense(hidden, ACTION_DIMS, tf.sigmoid)
+def make_policy_output(hidden, iteration):
+    with tf.variable_scope('output_%i' % iteration):
+        with tf.variable_scope('mean'):
+            if POLICY_SOFTMAX:
+                return layer_dense(hidden, ACTION_DIMS, tf.nn.softmax)
+            policy = layer_dense(hidden, ACTION_DIMS, tf.sigmoid)
 
-    if ACTION_TANH: # Multiply specific axes with tanh
-        with tf.variable_scope('tanh'):
-            tanh = layer_dense(hidden, len(ACTION_TANH), tf.tanh)
-        for i in range(len(policy)):
-            mult = [tf.ones_like(tanh[i][:,0])]*ACTION_DIMS
-            for j,t in enumerate(ACTION_TANH):
-                mult[t] = tanh[i][:,j]
-            policy[i] *= tf.stack(mult, -1)
+        if ACTION_TANH: # Multiply specific axes with tanh
+            with tf.variable_scope('tanh'):
+                tanh = layer_dense(hidden, len(ACTION_TANH), tf.tanh)
+            for i in range(len(policy)):
+                mult = [tf.ones_like(tanh[i][:,0])]*ACTION_DIMS
+                for j,t in enumerate(ACTION_TANH):
+                    mult[t] = tanh[i][:,j]
+                policy[i] *= tf.stack(mult, -1)
 
-    with tf.variable_scope('stddev'):
-        stddev = layer_dense(hidden, policy[0].shape[1], tf.nn.softplus)
-    return policy, stddev
+        with tf.variable_scope('stddev'):
+            stddev = layer_dense(hidden, policy[0].shape[1], tf.nn.softplus)
+        return policy, stddev
 
+POLICY_PDFs = 5
 def make_policy(shared):
     with tf.variable_scope('policy'):
         hidden = make_fc(shared.layers, None)
-        with tf.variable_scope('output'):
-            mean, stddev = make_policy_output(hidden)
 
-        policy = Struct(inst=mean[0], inst_stddev=stddev[0],
+        mean, stddev = zip(*[make_policy_output(hidden, i) for i in range(POLICY_PDFs)])
+        mean_choices = list(map(tf.stack, zip(*mean)))
+        stddev_choices = list(map(tf.stack, zip(*stddev)))
+        if POLICY_PDFs > 1:
+            with tf.variable_scope('choice'):
+                choice_softmax = layer_dense(hidden, POLICY_PDFs, tf.nn.softmax)
+                hardmax = tf.contrib.seq2seq.hardmax
+                choice = [hardmax(c) for c in choice_softmax]
+        else:
+            choice = choice_softmax = [tf.ones(shape=[n.shape[0], 1]) for n in hidden]
+        choice_transpose = [tf.transpose([c], [2,1,0]) for c in choice]
+        mean = [tf.reduce_sum(m*c, 0) for m,c in zip(mean_choices, choice_transpose)]
+        stddev = [tf.reduce_sum(s*c, 0) for s,c in zip(stddev_choices, choice_transpose)]
+
+        policy = Struct(mean=mean, stddev=stddev,
+            choice=choice, choice_softmax=choice_softmax,
+            mean_choices=mean_choices, stddev_choices=stddev_choices,
             weights_nonshared=scope_vars())
         policy.weights = shared.weights + policy.weights_nonshared
         if not FLAGS.inst:
@@ -358,7 +373,7 @@ TDC_STEPS = len(training.nsteps)
 def make_qvalue(shared, policy):
     state = shared.layers
     if policy:
-        actions = [policy.inst]
+        actions = [policy.mean[0]]
         if not FLAGS.inst:
             state = state[:1] + [state[1]]*2 + state[2:]
             actions += [ph.actions, policy.mb] + policy.next
@@ -447,8 +462,9 @@ def make_acrl():
     with tf.variable_scope('main'):
         value1, value2, policy = make_networks()
 
-    ac.per_inst.policy = policy.inst[0]
-    ac.per_inst.policy_stddev = policy.inst_stddev[0]
+    ac.per_inst.policy = policy.mean[0][0]
+    ac.per_inst.policy_stddev = policy.stddev[0][0]
+    ac.per_inst.policy_choice = policy.choice[0][0]
     ac.per_inst.policy_value = value1.inst_policy[0]
     if FLAGS.inst: return
 
@@ -458,10 +474,11 @@ def make_acrl():
         with tf.variable_scope('target'):
             target_value1, target_value2, _ = make_networks()
 
-    policy_pdf = tf.distributions.Normal(policy.mb, policy.mb_stddev)
+    '''
     importance_ratio = tf.reduce_prod(policy_pdf.prob(ph.actions), -1)
     importance_ratio /= tf.reduce_sum(importance_ratio) + 1.
     ac.per_minibatch.importance_ratio = tf.reduce_max(importance_ratio)
+    '''
 
     min_target = tf.minimum(target_value1.nstep, target_value2.nstep) # Prevent overestimation bias
     return_target = tf.reduce_max(min_target, -1) # Maximize over n-step returns
@@ -472,7 +489,8 @@ def make_acrl():
     if value_grad is not None:
         value_grad = tf.where(ph.ddpg, value_grad, tf.zeros_like(value_grad))
         repl = gradient_override(policy.mb, value_grad)
-        grads = opt.policy.compute_gradients(repl, policy.weights[:-1])
+        weights_deterministic = [w for w in policy.weights if not any([name in w.name for name in ['stddev', 'choice']])]
+        grads = opt.policy.compute_gradients(repl, weights_deterministic)
         ac.per_update.gnorm_policy_ddpg = accum_gradient(grads, opt.policy)
 
     if 1:
@@ -480,8 +498,14 @@ def make_acrl():
         adv = return_value - value1.state
         adv = tf.maximum(0., adv) # Only towards better actions
         adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
-        adv = tf.tile(tf.expand_dims(adv, -1), [1, policy.mb.shape[1]])
-        repl = gradient_override(policy_pdf.log_prob(ph.actions), adv)
+
+        # Update policy with max probability of ph.actions
+        log_probs = tf.stack([tf.reduce_sum(tf.minimum(2., tf.distributions.Normal
+            (policy.mean_choices[1][c], policy.stddev_choices[1][c]).log_prob(ph.actions)), -1) for c in range(POLICY_PDFs)], -1)
+        max_indices = tf.one_hot(tf.argmax(log_probs, -1), POLICY_PDFs)
+        log_indexed = tf.reduce_sum(max_indices * (log_probs + tf.log(policy.choice_softmax[1] + 1e-10)), -1)
+
+        repl = gradient_override(log_indexed, adv)
         grads_adv = opt.policy.compute_gradients(repl, policy.weights)
         ac.per_update.gnorm_policy_adv = accum_gradient(grads_adv, opt.policy)
 
