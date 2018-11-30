@@ -142,7 +142,7 @@ if CONV_NET:
 else:
     frame_to_state = tf.reshape(ph.frame, [er.CONCAT_STATES] + STATE_DIM)
 
-app = Struct(policy_index=0, quit=False, update_count=0, print_action=FLAGS.inst==1, show_state_image=False,
+app = Struct(policy_index=0, quit=False, mb_count=0, print_action=FLAGS.inst==1, show_state_image=False,
     draw_attention=False, wireframe=True, pause=False)
 if FLAGS.inst:
     FIRST_SEQ = (FLAGS.inst-1)*FLAGS.seq_per_inst
@@ -160,20 +160,20 @@ ops = Struct(
     per_minibatch=[], post_minibatch=[],
     per_update=[], post_update=[],
     new_batches=[],
-    post_inst=[], per_inst=[frame_to_state])
+    per_inst=[frame_to_state], post_inst=[])
 def accum_value(value):
     accum = tf.Variable(tf.zeros_like(value), trainable=False)
     ops.per_minibatch.append(accum.assign_add(value))
     ops.post_update.append(accum.assign(tf.zeros_like(value)))
     return accum
-def accum_gradient(grads, opt, clip_norm=1.):
-    global_norm = None
+def apply_gradients(grads, opt, accum_until_update=True, clip_norm=1.):
     grads, weights = zip(*grads)
-    grads = [accum_value(g) for g in grads]
+    if accum_until_update:
+        grads = [accum_value(g) for g in grads]
     # Clip gradients by global norm to prevent destabilizing policy
     grads,global_norm = tf.clip_by_global_norm(grads, clip_norm)
     grads = zip(grads, weights)
-    ops.per_update.append(opt.apply_gradients(grads))
+    (ops.per_update if accum_until_update else ops.per_minibatch).append(opt.apply_gradients(grads))
     return global_norm
 
 # Custom gradients to pre-multiply weight gradients before they are aggregated across the batch.
@@ -406,7 +406,7 @@ def make_qvalue(shared, policy):
 
         repl = gradient_override(error_predict, value.td_error-error_predict)
         grads = opt.error.compute_gradients(repl, error_weights)
-        gnorm_error = accum_gradient(grads, opt.error)
+        gnorm_error = apply_gradients(grads, opt.error, False)
 
         # TDC averaged over all n-steps
         for i in range(TDC_STEPS):
@@ -415,11 +415,11 @@ def make_qvalue(shared, policy):
             for i in range(len(grad_s)):
                 (g, w), g2 = grad_s[i], grad_s2[i][0]
                 grad_s[i] = (g+g2, w)
-        gnorm = accum_gradient(grad_s, opt.td)
+        gnorm = apply_gradients(grad_s, opt.td, False)
 
         if ac:
-            ac.per_update.gnorm_error = gnorm_error
-            ac.per_update.gnorm_qvalue = gnorm
+            ac.per_minibatch.gnorm_error = gnorm_error
+            ac.per_minibatch.gnorm_qvalue = gnorm
 
     value.update = update_qvalue
     return value
@@ -491,7 +491,7 @@ def make_acrl():
         repl = gradient_override(policy.mb, value_grad)
         weights_deterministic = [w for w in policy.weights if not any([name in w.name for name in ['stddev', 'choice']])]
         grads = opt.policy.compute_gradients(repl, weights_deterministic)
-        ac.per_update.gnorm_policy_ddpg = accum_gradient(grads, opt.policy)
+        ac.per_update.gnorm_policy_ddpg = apply_gradients(grads, opt.policy)
 
     if 1:
         return_value = tf.reduce_max(value1.nstep, -1)
@@ -507,7 +507,7 @@ def make_acrl():
 
         repl = gradient_override(log_indexed, adv)
         grads_adv = opt.policy.compute_gradients(repl, policy.weights)
-        ac.per_update.gnorm_policy_adv = accum_gradient(grads_adv, opt.policy)
+        ac.per_update.gnorm_policy_adv = apply_gradients(grads_adv, opt.policy)
 
     if FLAGS.tau != 1.:
         copy_vars = scope_vars('target', True), scope_vars('main', True)
@@ -675,9 +675,10 @@ def append_to_batch():
     else:
         save_reward, save_action = step_to_frames()
 
-    r = sess.run(ops.per_inst, feed_dict={ph.frame: state.frames})
+    r, app.per_inst = ops_run('per_inst', {ph.frame: state.frames})
+    if app.print_action:
+        ops_print(app.per_inst)
     save_state = r[0]
-    app.per_inst = tensor_struct_print(r, 'per_inst', app.print_action)
     if app.print_action:
         print(dict(save_action=save_action,
             #save_reward=save_reward
@@ -720,42 +721,43 @@ def append_to_batch():
             training.append_batch = FIRST_SEQ
         state.count = 0
 
-def tensor_struct_print(r, sname, do_print=True):
-    policy_index = 0 if app.policy_index==-1 else app.policy_index
-
-    keys = sorted(allac[0].__dict__[sname].__dict__.keys())
-    d = {s: r[-i-1][policy_index] for i,s in enumerate(reversed(keys))}
-    if do_print:
-        np.set_printoptions(suppress=True, precision=6, sign=' ')
-        d_str = {k: str(v) for k,v in d.items() if len(str(v).split('\n')) < 10} # Skip large arrays
-        pprint({sname: d_str})
-    return Struct(**d)
-def tensor_struct_compile(sname):
-    keys = sorted(allac[0].__dict__[sname].__dict__.keys())
+def ops_finish(sname):
     named_ops = ops.__dict__[sname]
+    keys = sorted(allac[0].__dict__[sname].__dict__.keys())
     named_ops += [tf.concat([[allac[r].__dict__[sname].__dict__[s]]
         for r in range(len(allac))], 0) for s in keys]
 
-with tf.get_default_graph().control_dependencies(ops.per_inst):
-    ops.per_inst.append(tf.group(*ops.post_inst))
-tensor_struct_compile('per_inst')
+def ops_run(sname, feed_dict):
+    named_ops = ops.__dict__[sname]
+    post_ops = ops.__dict__[sname.replace('per_', 'post_')]
+
+    r = sess.run(named_ops, feed_dict)
+    sess.run(post_ops)
+
+    policy_index = 0 if app.policy_index==-1 else app.policy_index
+    keys = sorted(allac[0].__dict__[sname].__dict__.keys())
+    d = {s: r[-i-1][policy_index] for i,s in enumerate(reversed(keys))}
+    return r, Struct(name=sname, **d)
+
+def ops_print(output_struct):
+    np.set_printoptions(suppress=True, precision=6, sign=' ')
+    d = output_struct.__dict__
+    d_str = {k: str(v) for k,v in d.items() if k != 'name' and len(str(v).split('\n')) < 10} # Skip large arrays
+    pprint({d['name']: d_str})
+
 if not FLAGS.inst:
     init_vars()
-
     ops.per_minibatch += tf.get_collection(tf.GraphKeys.UPDATE_OPS) # batch_norm
-    with tf.get_default_graph().control_dependencies(ops.per_minibatch):
-        ops.per_minibatch.append(tf.group(*ops.post_minibatch))
-    tensor_struct_compile('per_minibatch')
-
-    tensor_struct_compile('per_update')
     if FLAGS.summary:
         train_writer = tf.summary.FileWriter(FLAGS.summary, sess.graph)
         merged = tf.summary.merge_all()
-        ops.per_update.insert(0, merged)
+        ops.per_minibatch.insert(0, merged)
 
-ermem = er.ERMemory(training.nsteps, STATE_DIM, ACTION_DIMS, FRAME_DIM)
+    ops_finish('per_minibatch')
+    ops_finish('per_update')
+ops_finish('per_inst')
 
-def train_accum_minibatch(mb):
+def train_minibatch(mb):
     # Upload & train minibatch
     feed_dict = {
         ph.adv: FLAGS.adv,
@@ -765,29 +767,32 @@ def train_accum_minibatch(mb):
         ph.nsteps: mb.nsteps}
     for i in range(len(training.nsteps)+1):
         feed_dict[ph.states[i]] = mb.states[i]
-    r = sess.run(ops.per_minibatch, feed_dict)
-    per_minibatch = tensor_struct_print(r, 'per_minibatch')
+    r, per_minibatch = ops_run('per_minibatch', feed_dict)
+    ops_print(per_minibatch)
     # Prioritized experience replay according to TD error.
     mb.td_error[:] = per_minibatch.td_error
 
-def train_apply_gradients(mb):
-    r = sess.run(ops.per_update, feed_dict={})
-    tensor_struct_print(r, 'per_update')
-
-    app.update_count += 1
-    sess.run(ops.post_update)
+    app.mb_count += 1
     pprint(dict(
         policy_updates=dict(adv=FLAGS.adv, ddpg=FLAGS.ddpg),
         nsteps=mb.nsteps[0,:], # Just show the first one
-        update_count=app.update_count,
+        minibatch=app.mb_count,
         rates=dict(learning_rate=FLAGS.learning_rate, tau=FLAGS.tau, gamma=FLAGS.gamma),
         batches=dict(keep=FLAGS.seq_keep,inst=FLAGS.seq_inst,minibatch=FLAGS.minibatch)))
     os.system('clear') # Scroll up to see status
 
-    if FLAGS.summary and not app.update_count%100:
+    if FLAGS.summary and not app.mb_count%100:
         summary = r[0]
-        train_writer.add_summary(summary, app.update_count)
+        train_writer.add_summary(summary, app.mb_count)
 
+def train_update_policy():
+    MB_PER_UPDATE = 5
+    if app.mb_count >= MB_PER_UPDATE:
+        if not app.mb_count % MB_PER_UPDATE:
+            _, train_update_policy.output = ops_run('per_update', {})
+        ops_print(train_update_policy.output)
+
+ermem = er.ERMemory(training.nsteps, STATE_DIM, ACTION_DIMS, FRAME_DIM)
 def rl_loop():
     if app.quit: return False
     if FLAGS.inst or not training.enable or training.seq_recorded < FLAGS.seq_keep:
@@ -799,8 +804,8 @@ def rl_loop():
             mb = ermem.fill_mb()
             if mb != None:
                 #if mb.step==0: sess.run(ops.new_batches) # Minibatch now has different steps
-                train_accum_minibatch(mb)
-                train_apply_gradients(mb)
+                train_minibatch(mb)
+                train_update_policy()
         env_render() # Render needed for keyboard events
     return True
 import utils; utils.loop_while(rl_loop)
