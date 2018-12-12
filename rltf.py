@@ -238,7 +238,6 @@ def make_fc(x, actions):
     with tf.variable_scope('hidden2'):
         if USE_LSTM: x = layer_lstm(x, FC_UNITS, ac)
         else: x = layer_dense(x, FC_UNITS)
-
         x = layer_batch_norm(x)
         if actions:
             with tf.variable_scope('actions'):
@@ -311,18 +310,17 @@ def make_policy_output(hidden, iteration):
             stddev = layer_dense(hidden, policy[0].shape[1], tf.nn.softplus)
         return policy, stddev
 
-STATE_ACTION_SAMPLES = 100
+STATE_VALUE_ACTIONS = 0
 def make_policy(shared):
     hidden = make_fc(shared.layers, None)
 
-    POLICY_PDFs = 5
+    POLICY_PDFs = 1
     mean, stddev = zip(*[make_policy_output(hidden, i) for i in range(POLICY_PDFs)])
     mean_choices = list(map(tf.stack, zip(*mean)))
     stddev_choices = list(map(tf.stack, zip(*stddev)))
     if POLICY_PDFs > 1:
-        with tf.variable_scope('choice'):
-            choice_dist = layer_dense(hidden, POLICY_PDFs, tf.distributions.Categorical)
-            choice = [tf.one_hot(c.sample() if i==0 else c.mode(), POLICY_PDFs) for i,c in enumerate(choice_dist)]
+        with tf.variable_scope('choice'): choice_dist = layer_dense(hidden, POLICY_PDFs, tf.distributions.Categorical)
+        choice = [tf.one_hot(c.sample() if i==0 else c.mode(), POLICY_PDFs) for i,c in enumerate(choice_dist)]
     else:
         choice = [tf.ones(shape=[n.shape[0], 1]) for n in hidden]
     choice_transpose = [tf.transpose([c], [2,1,0]) for c in choice]
@@ -336,23 +334,26 @@ def make_policy(shared):
     if FLAGS.inst:
         return policy
 
-    log_prob = tf.minimum(10., tf.stack([tf.reduce_sum(tf.distributions.Normal
-        (policy.mean_choices[1][c], policy.stddev_choices[1][c]).log_prob(ph.actions), -1) for c in range(POLICY_PDFs)], -1))
-    log_prob += tf.stack([choice_dist[1].log_prob(c) for c in range(POLICY_PDFs)], -1) if POLICY_PDFs>1 else 0
+    MAX_PDF = 5.
+    log_prob = tf.stack([tf.reduce_sum(tf.minimum(tf.distributions.Normal
+        (policy.mean_choices[1][c], policy.stddev_choices[1][c]).log_prob(ph.actions), MAX_PDF), -1) for c in range(POLICY_PDFs)], -1)
 
-    log_prob = tf.reduce_max(log_prob, -1)# Policy with max probability of ph.actions
-    policy.log_prob = tf.maximum(log_prob, -10.) # Prevent divide-by-0 in ratio
+    if POLICY_PDFs > 1:
+        log_prob += tf.minimum(-1e-2, tf.stack([choice_dist[1].log_prob(c) for c in range(POLICY_PDFs)], -1))
+    policy.log_prob = tf.reduce_max(log_prob, -1)
+
+    policy.log_prob_all = log_prob
+    policy.max_log_idx = tf.one_hot(tf.arg_max(log_prob, -1), POLICY_PDFs)
 
     policy.next = mean[-len(training.nsteps):]
     policy.mb, policy.mb_stddev = mean[1], stddev[1]
-    if STATE_ACTION_SAMPLES > 1:
+    if STATE_VALUE_ACTIONS > 1:
         pdf = tf.distributions.Normal(policy.mb, policy.mb_stddev)
-        sampled = tf.transpose(pdf.sample(STATE_ACTION_SAMPLES), [1, 0, 2])
-        sampled = tf.reshape(sampled, [FLAGS.minibatch * STATE_ACTION_SAMPLES, -1])
+        sampled = tf.transpose(pdf.sample(STATE_VALUE_ACTIONS), [1, 0, 2])
+        sampled = tf.reshape(sampled, [FLAGS.minibatch * STATE_VALUE_ACTIONS, -1])
         policy.mb_sampled = tf.clip_by_value(sampled, *ACTION_CLIP)
     else:
         policy.mb_sampled = policy.mb
-
     return policy
 
 def multi_actions_pre(state, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
@@ -369,11 +370,9 @@ def multi_actions_pre(state, actions, idx, batch_size=FLAGS.minibatch, include_p
     n = tf.reshape(n, [batch_size*num_actions, -1])
     a = tf.reshape(a, [batch_size*num_actions, -1])
     state[idx], actions[idx] = n, a
-def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce_max=False):
-    num_actions = len(DISCRETE_ACTIONS)
-    if not num_actions: return n
+def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce=None):
     n = tf.reshape(n, [batch_size, int(n.shape[0])/batch_size])
-    n = tf.reduce_max(n, 1) if reduce_max else n
+    n = reduce(n, 1) if reduce else n
     return n
 
 def tile_actions(actions):
@@ -384,13 +383,12 @@ def tile_actions(actions):
     return [2*a - 1 for a in actions]
 
 gamma_nsteps = FLAGS.gamma**tf.cast(ph.nsteps, DTYPE)
-TDC_STEPS = len(training.nsteps)
 def make_qvalue(shared, policy):
     state = shared.layers
     if policy:
         actions = [policy.mean[0]]
         if not FLAGS.inst:
-            state = [state[0], state[1], tf.tile(state[1], [STATE_ACTION_SAMPLES, 1])] + state[2:]
+            state = [state[0], state[1], tf.tile(state[1], [STATE_VALUE_ACTIONS, 1])] + state[2:]
             actions += [ph.actions, policy.mb_sampled] + policy.next
         actions = tile_actions(actions)
     else:
@@ -400,13 +398,12 @@ def make_qvalue(shared, policy):
     with tf.variable_scope('output'):
         q = [n[:,0] for n in layer_dense(combined, 1)]
 
-    # Q for all actions in agent's current state
-    q[0] = multi_actions_post(q[0], 1)
+    q[0] = multi_actions_post(q[0], 1) # Q for all actions in agent's current state
     ret = Struct(inst_policy=q[0])
     if FLAGS.inst: return ret
 
-    [ret.q, ret.state] = q[1:3]
-    ret.state = tf.reduce_mean(tf.reshape(ret.state, [FLAGS.minibatch, STATE_ACTION_SAMPLES]), 1)
+    ret.q = q[1]
+    ret.state = multi_actions_post(q[2], reduce=tf.reduce_mean) if policy else ret.q
 
     next_state_value = q[-len(training.nsteps):]
     ret.nstep = ph.rewards[:,:,r] + gamma_nsteps*tf.stack(next_state_value, -1)
@@ -416,18 +413,18 @@ def make_qvalue(shared, policy):
         error_predict = layer_dense(combined, 1)[1][:,0]
         error_weights = scope_vars()
 
-    def update_qvalue(target_value, ac=None):
+    def update_qvalue(target_value, importance_ratio=1., ac=None):
         ret.td_error = target_value - ret.q
 
-        repl = gradient_override(error_predict, ret.td_error-error_predict)
+        repl = gradient_override(error_predict, (ret.td_error-error_predict) * importance_ratio)
         grads = opt.error.compute_gradients(repl, error_weights)
         gnorm_error = apply_gradients(grads, opt.error)
 
-        repl = gradient_override(ret.q, ret.td_error)
+        repl = gradient_override(ret.q, ret.td_error * importance_ratio)
         grad_s = opt.td.compute_gradients(repl, ret.weights)
         # TDC averaged over all n-steps
-        for i in range(TDC_STEPS):
-            repl = gradient_override(next_state_value[i], -gamma_nsteps[:,i]*error_predict / TDC_STEPS)
+        for i in range(len(training.nsteps)):
+            repl = gradient_override(next_state_value[i], -gamma_nsteps[:,i]*error_predict * importance_ratio / len(training.nsteps))
             grad_s2 = opt.td.compute_gradients(repl, ret.weights)
             for i in range(len(grad_s)):
                 (g, w), g2 = grad_s[i], grad_s2[i][0]
@@ -480,7 +477,7 @@ def make_acrl():
         with tf.variable_scope('policy'): policy = make_policy(shared)
         with tf.variable_scope('value'):
             if not SHARED_LAYERS: shared = make_shared(state_inputs)
-            with tf.variable_scope('1'): value1 = make_qvalue(shared, policy)
+            with tf.variable_scope('1'): value1 = make_qvalue(shared, policy if STATE_VALUE_ACTIONS else None)
         return value1, policy
 
     with tf.variable_scope('old'):
@@ -494,15 +491,11 @@ def make_acrl():
 
     with tf.variable_scope('new'):
         new_value1, new_policy = make_networks()
+    copy_networks('old', 'new')
 
-    '''
-    importance_ratio = tf.reduce_prod(policy_pdf.prob(ph.actions), -1)
-    importance_ratio /= tf.reduce_sum(importance_ratio) + 1.
-    ac.per_minibatch.importance_ratio = tf.reduce_max(importance_ratio)
-    '''
-
+    importance_ratio = tf.exp(policy.log_prob - tf.reduce_max(policy.log_prob))
     target_value = tf.reduce_max(value1.nstep, -1) # Maximize over n-step returns
-    new_value1.update(target_value, ac)
+    new_value1.update(target_value, importance_ratio, ac)
 
     value_grad = tf.gradients(value1.state, policy.mb)[0]
     if 0:#value_grad is not None:
@@ -512,20 +505,26 @@ def make_acrl():
         grads = opt.policy.compute_gradients(repl, weights_deterministic)
         ac.per_update.gnorm_policy_ddpg = apply_gradients(grads, opt.policy)
 
-    return_value = tf.reduce_max(value1.nstep, -1)
+    return_value = target_value
     adv = return_value - value1.state
     adv = tf.maximum(0., adv) # Only towards better actions
     adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
 
-    ratio = tf.exp(new_policy.log_prob - policy.log_prob)
+    log_prob = tf.reduce_sum(policy.log_prob_all * policy.max_log_idx, -1)
+    new_log_prob = tf.reduce_sum(new_policy.log_prob_all * policy.max_log_idx, -1)
+
+    ratio = new_log_prob - log_prob
     cliprange = 0.2
-    cost = -adv * tf.minimum(ratio, tf.clip_by_value(ratio, 1-cliprange, 1+cliprange)) # PPO objective
+    if 0:
+        # PPO objective
+        cost = -adv * tf.minimum(ratio, tf.clip_by_value(tf.exp(ratio), 1-cliprange, 1+cliprange))
+    else:
+        cliprange = math.log(cliprange)
+        cost = -adv * tf.minimum(ratio, tf.clip_by_value(ratio, -cliprange, cliprange))
     #cost = gradient_override(policy.log_prob, adv)
 
     grads_adv = opt.policy.compute_gradients(cost, new_policy.weights)
     ac.per_minibatch.gnorm_policy_adv = apply_gradients(grads_adv, opt.policy)
-
-    copy_networks('old', 'new')
 
     ac.per_minibatch.reward_sum = tf.reduce_sum(ph.rewards[:,0,r])
     ac.per_minibatch.policy_max = tf.reduce_max(policy.mb, 0)
@@ -535,7 +534,8 @@ def make_acrl():
     ac.per_minibatch.td_error = new_value1.td_error
     ac.per_minibatch.td_error_sum = tf.reduce_sum(tf.abs(new_value1.td_error))
     ac.per_minibatch.max_log_prob = tf.reduce_max(new_policy.log_prob)
-    ac.per_minibatch.max_ratio = tf.reduce_max(ratio)
+    ac.per_minibatch.max_policy_ratio = tf.reduce_max(ratio)
+    ac.per_minibatch.max_importance_ratio = tf.reduce_max(importance_ratio)
 
 for r in range(er.ER_REWARDS):
     with tf.variable_scope('ac'): make_acrl()
