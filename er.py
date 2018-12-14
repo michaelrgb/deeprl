@@ -87,7 +87,7 @@ class ERMemory:
         for b,mb_idx in enumerate(mb_indices):# indices of entries to replace
             seq = self.seq_set[b]
 
-            mb.td_error[mb_idx] = -float('inf')
+            mb.priority[mb_idx] = -float('inf')
             mb.states[0][mb_idx] = seq.states[seq_step-CONCAT_STATES:seq_step]
             mb.actions[mb_idx] = seq.actions[seq_step]
             for i,nsteps in enumerate(self.nsteps):
@@ -116,7 +116,7 @@ class ERMemory:
         if not self.mb:
             first_mb = True
             self.mb = Struct(
-                td_error = np.zeros([FLAGS.minibatch]),
+                priority = np.zeros([FLAGS.minibatch]),
                 actions = np.zeros([FLAGS.minibatch, self.action_dims]),
                 states = [np.zeros([FLAGS.minibatch, CONCAT_STATES] + self.state_dim) for n in self.nsteps+[1]],
                 rewards = np.zeros([FLAGS.minibatch, len(self.nsteps), ER_REWARDS]),
@@ -128,13 +128,14 @@ class ERMemory:
                 self._fill_sub_mb(seq_step, range(i*self.mb_replace_size, (i+1)*self.mb_replace_size))
         else:
             # Sample minibatch indices to replace
-            all_td_errors = {k: self.mb.td_error[k] for k in range(FLAGS.minibatch)}
+            all_priorities = {k: self.mb.priority[k] for k in range(FLAGS.minibatch)}
             mb_indices = []
             for i in range(self.mb_replace_size):
-                idx, td_errors = zip(*all_td_errors.items())
-                probs = softmax(np.array([-abs(e) for e in td_errors]))
+                idx, priority = zip(*all_priorities.items())
+                scale = -1.
+                probs = softmax(np.array([scale*p for p in priority]))
                 chosen = idx[np.random.choice(len(idx), p=probs)]
-                all_td_errors.pop(chosen)
+                all_priorities.pop(chosen)
                 mb_indices.append(chosen)
             self._fill_sub_mb(seq_step, mb_indices)
         return self.mb
