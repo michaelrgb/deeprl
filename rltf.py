@@ -187,12 +187,13 @@ def gradient_override(expr, custom_grad):
         return tf.identity(expr)
 gradient_override.counter = 0
 
-INST_INFER = 0
-MB_MOMENTS = 1
-MB_INFER = 2
+INST_0 = 0
+MB_1 = 1
+MB_2 = 2
 def layer_batch_norm(x):
-    norm = tf.layers.BatchNormalization(scale=False, center=False)
-    x = [norm.apply(x[i], training=i==layer_batch_norm.training_idx) for i in range(len(x))]
+    norm = tf.layers.BatchNormalization(scale=False, center=False, fused=False)
+    training_idx = MB_1
+    x = [norm.apply(x[i], i==training_idx) for i in range(len(x))]
     for w in norm.weights: variable_summaries(w)
     return x
 
@@ -228,12 +229,11 @@ def layer_lstm(x, outputs, ac):
             if i==1: ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
     return x
 
-CDF_80pc = 0.85
 def make_fc(x, actions):
     with tf.variable_scope('hidden1'):
         x = layer_dense(x, FC_UNITS)
         x = layer_batch_norm(x)
-        x = [heaviside(n) for n in x]
+        x = [tf.nn.relu(n) for n in x]
     with tf.variable_scope('hidden2'):
         if USE_LSTM: x = layer_lstm(x, FC_UNITS, ac)
         else: x = layer_dense(x, FC_UNITS)
@@ -242,9 +242,7 @@ def make_fc(x, actions):
             with tf.variable_scope('actions'):
                 actions = layer_dense(actions, FC_UNITS)
                 x = [n+a for n,a in zip(x,actions)]
-
-        # Offset controls cdf probability of activation being non-zero after batch norm.
-        x = [heaviside(n-CDF_80pc) for n in x]
+        x = [tf.nn.relu(n) for n in x]
     return x
 
 def make_conv_net(x):
@@ -286,7 +284,7 @@ def make_attention_net(x, ac):
             for i,n in enumerate(x):
                 x[i], attention = mhdpa.apply(n)
                 if i==0 and l==(MHDPA_LAYERS-1):
-                    ac.per_inst.attention = attention[INST_INFER] # Display agent attention
+                    ac.per_inst.attention = attention[INST_0] # Display agent attention
                 if i==1: ac.per_minibatch.__dict__['attention_minmax_%i'%l] = tf.stack([tf.reduce_min(attention), tf.reduce_max(attention)])
     return x
 
@@ -319,29 +317,28 @@ def make_policy(shared):
                  stddev_options = list(map(tf.stack, zip(*stddev))))
     if POLICY_OPTIONS > 1:
         with tf.variable_scope('choice'): choice_dist = layer_dense(hidden, POLICY_OPTIONS, tf.distributions.Categorical)
-        ret.choice = [tf.one_hot(c.sample() if i==INST_INFER else c.mode(), POLICY_OPTIONS) for i,c in enumerate(choice_dist)]
+        ret.choice = [tf.one_hot(c.sample() if i==INST_0 else c.mode(), POLICY_OPTIONS) for i,c in enumerate(choice_dist)]
     else:
         ret.choice = [tf.ones(shape=[n.shape[0], 1]) for n in hidden]
     choice_transpose = [tf.transpose([c], [2,1,0]) for c in ret.choice]
     ret.mean = [tf.reduce_sum(m*c, 0) for m,c in zip(ret.mean_options, choice_transpose)]
     ret.stddev = [tf.reduce_sum(s*c, 0) for s,c in zip(ret.stddev_options, choice_transpose)]
 
-    ret.weights = scope_vars('')
-    ret.norm_weights = [w for w in scope_vars('', True) if w not in ret.weights]
+    ret.weights = scope_vars('') + shared.weights
     if FLAGS.inst:
         return ret
 
     MAX_PDF = 3.
     ret.log_prob = tf.stack([tf.reduce_sum(tf.minimum(tf.distributions.Normal
-        (ret.mean_options[MB_INFER][c], ret.stddev_options[MB_INFER][c]).log_prob(ph.actions), MAX_PDF), -1) for c in range(POLICY_OPTIONS)], -1)
+        (ret.mean_options[MB_2][c], ret.stddev_options[MB_2][c]).log_prob(ph.actions), MAX_PDF), -1) for c in range(POLICY_OPTIONS)], -1)
     ret.max_log_idx = tf.one_hot(tf.arg_max(ret.log_prob, -1), POLICY_OPTIONS)
 
     ret.log_prob_subpolicy = ret.log_prob
     if POLICY_OPTIONS > 1:
-        ret.log_prob += tf.minimum(-1e-2, tf.stack([choice_dist[MB_INFER].log_prob(c) for c in range(POLICY_OPTIONS)], -1))
+        ret.log_prob += tf.minimum(-1e-2, tf.stack([choice_dist[MB_2].log_prob(c) for c in range(POLICY_OPTIONS)], -1))
 
     ret.next = mean[-len(training.nsteps):]
-    ret.mb_mean = ret.mean[MB_INFER]
+    ret.mb_mean = ret.mean[MB_2]
     return ret
 
 def multi_actions_pre(state, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
@@ -375,10 +372,10 @@ def make_qvalue(shared, value_mean, policy=None):
     state = shared.layers
     actions = None
     if not FLAGS.inst:
-        state = [state[INST_INFER], state[MB_MOMENTS], state[MB_INFER]] + state[2:]
+        state = [state[INST_0], state[MB_1], state[MB_2]] + state[-len(training.nsteps):]
 
     if 0:#policy:
-        actions = [policy.mean[INST_INFER]]
+        actions = [policy.mean[INST_0]]
         if not FLAGS.inst:
             actions += [ph.actions, policy.mb_mean] + policy.next
         actions = tile_actions(actions)
@@ -388,32 +385,32 @@ def make_qvalue(shared, value_mean, policy=None):
         outputs = POLICY_OPTIONS if value_mean else 1
         q = layer_dense(combined, outputs)
 
-    ret = Struct(q=q, weights=scope_vars(), inst_policy=q[INST_INFER])
+    ret = Struct(q=q, weights=scope_vars(), q_inst=q[INST_0])
     if value_mean:
         ret.weights += value_mean.weights + shared.weights
         for i in range(len(q)):
            q[i] += value_mean.q[i] - tf.reduce_mean(q[i], -1, keep_dims=True)
 
     if FLAGS.inst: return ret
-    q_mb = q[MB_MOMENTS]
-    ret.state = multi_actions_post(q[MB_INFER], reduce=tf.reduce_mean)
+    ret.q_mb = q[MB_1]
+    ret.state = multi_actions_post(q[MB_2], reduce=tf.reduce_mean)
 
     if policy: choice = tf.stack(policy.choice[-len(training.nsteps):], 1)
     next_state_value = tf.stack(q[-len(training.nsteps):], 1)
     ret.nstep_return = ph.rewards[:,:,r] + gamma_nsteps*tf.reduce_max(next_state_value, -1) #tf.reduce_sum(choice*next_state_value, -1)
 
     with tf.variable_scope('error_value'):
-        error_predict = layer_dense(combined, 1)[MB_MOMENTS]
+        error_predict = layer_dense(combined, 1)[MB_1]
         error_weights = scope_vars()
 
-    def update_qvalue(target_value, importance_ratio=1., ac=None):
-        ret.td_error = tf.expand_dims(target_value, -1) - q_mb
+    def update_qvalue(target_value, importance_ratio, ac=None):
+        ret.td_error = td_error = tf.expand_dims(target_value, -1) - ret.q_mb
 
-        repl = gradient_override(error_predict[:,0], tf.reduce_sum(ret.td_error-error_predict, -1))
+        repl = gradient_override(error_predict[:,0], tf.reduce_sum(td_error-error_predict, -1))
         grads = opt.error.compute_gradients(repl, error_weights)
         gnorm_error = apply_gradients(grads, opt.error)
 
-        repl = gradient_override(q_mb, ret.td_error * importance_ratio)
+        repl = gradient_override(ret.q_mb, td_error * importance_ratio)
         grad_s = opt.td.compute_gradients(repl, ret.weights)
         # TDC - target_value is already gamma-discounted, so dont multiply features by gamma.
         if 1:
@@ -431,7 +428,22 @@ def make_qvalue(shared, value_mean, policy=None):
     ret.update = update_qvalue
     return ret
 
-def make_shared(x):
+def make_shared():
+    if not make_shared.inputs:
+        # Move concat states to last dimension
+        state_inputs = [tf.expand_dims(frame_to_state,0)] + ([] if FLAGS.inst else ph.states)
+        idx = range(len(state_inputs[0].shape))
+        idx = [0] + idx[2:]
+        idx.insert(-1, 1)
+        CONCAT_STATE_DIM = STATE_DIM[:]
+        CONCAT_STATE_DIM[-1] *= er.CONCAT_STATES
+        state_inputs = [tf.reshape(tf.transpose(n,idx), [-1]+CONCAT_STATE_DIM) for n in state_inputs]
+        # Get log_prob using current moving batch-norm variables, NOT norm calculated from minibatch
+        if not FLAGS.inst: state_inputs.insert(MB_1, state_inputs[MB_1])
+
+        make_shared.inputs = state_inputs
+    x = make_shared.inputs
+
     print(x[0].shape)
     if CONV_NET: x = make_conv_net(x)
     else: x = layer_batch_norm(x)
@@ -440,6 +452,7 @@ def make_shared(x):
     x = [tf.layers.flatten(n) for n in x]
     print(x[0].shape)
     return Struct(layers=x, weights=scope_vars())
+make_shared.inputs = None
 
 opt = Struct(td=tf.train.AdamOptimizer(FLAGS.learning_rate),
     policy=tf.train.AdamOptimizer(FLAGS.learning_rate/10),
@@ -456,85 +469,77 @@ def make_acrl():
     ac = Struct(per_minibatch=Struct(), per_update=Struct(), per_inst=Struct())
     allac.append(ac)
 
-    # Move concat states to last dimension
-    state_inputs = [tf.expand_dims(frame_to_state,0)] + ([] if FLAGS.inst else ph.states)
-    idx = range(len(state_inputs[0].shape))
-    idx = [0] + idx[2:]
-    idx.insert(-1, 1)
-    CONCAT_STATE_DIM = STATE_DIM[:]
-    CONCAT_STATE_DIM[-1] *= er.CONCAT_STATES
-    state_inputs = [tf.reshape(tf.transpose(n,idx), [-1]+CONCAT_STATE_DIM) for n in state_inputs]
-
-    # Get log_prob using current moving batch-norm variables, NOT norm calculated from minibatch
-    if not FLAGS.inst: state_inputs.insert(MB_INFER, state_inputs[MB_MOMENTS])
-
-    layer_batch_norm.training_idx = MB_MOMENTS
-    with tf.variable_scope('policy'):
-        ac.policy = policy = make_policy(make_shared(state_inputs))
-
-    with tf.variable_scope('value'):
-        shared = make_shared(state_inputs)
+    def _value(shared):
         with tf.variable_scope('mean'): value_mean = make_qvalue(shared, None)
-        with tf.variable_scope('adv'): value1 = make_qvalue(shared, value_mean, policy)
+        with tf.variable_scope('adv'): return make_qvalue(shared, value_mean)
+    def _policy(shared):
+        with tf.variable_scope('_'): return make_policy(shared)
 
-    ac.per_inst.policy_mean = policy.mean[INST_INFER][0]
-    ac.per_inst.policy_stddev = policy.stddev[INST_INFER][0]
-    ac.per_inst.policy_choice = policy.choice[INST_INFER][0]
-    ac.per_inst.policy_value = value1.inst_policy[0]
+    def make_networks():
+        #shared = make_shared()
+        with tf.variable_scope('policy'): policy = _policy(make_shared())
+        with tf.variable_scope('value'): value = _value(make_shared())
+        ret = Struct(policy=policy, value=value, weights=scope_vars())
+        ret.norm_weights = [w for w in scope_vars(GLOBAL=True) if w not in ret.weights]
+        return ret
+
+    with tf.variable_scope('old'):
+        old = make_networks()
+
+    ac.per_inst.policy_mean = old.policy.mean[INST_0][0]
+    ac.per_inst.policy_stddev = old.policy.stddev[INST_0][0]
+    ac.per_inst.policy_choice = old.policy.choice[INST_0][0]
+    ac.per_inst.policy_value = old.value.q_inst[0]
     if FLAGS.inst: return
 
-    layer_batch_norm.training_idx = -1
-    with tf.variable_scope('new_policy'):
-        ac.new_policy = new_policy = make_policy(make_shared(state_inputs))
+    with tf.variable_scope('new'):
+        new = make_networks()
+    ops.post_minibatch += copy_weights(new.norm_weights, old.norm_weights)
+    ops.post_update += copy_weights(old.weights, new.weights)
 
-    # Batch-norm only calculated on current policy because we want policy_ratio
-    # to change only according to PPO objective. Therefore copy norm_weights onto new policy.
-    ops.post_minibatch += copy_weights(new_policy.norm_weights, policy.norm_weights)
-    ops.post_update += copy_weights(policy.weights, new_policy.weights)
-
-    importance_ratio = tf.exp(policy.log_prob_subpolicy - tf.reduce_max(policy.log_prob_subpolicy, 0, keep_dims=True))
+    importance_ratio = tf.exp(old.policy.log_prob_subpolicy - tf.reduce_max(old.policy.log_prob_subpolicy, 0, keep_dims=True))
     importance_ratio /= tf.reduce_sum(importance_ratio, 0, keep_dims=True)
 
-    return_value = tf.reduce_max(value1.nstep_return, -1) # Maximize over n-step returns
-    value1.update(return_value, importance_ratio, ac)
+    target_value = tf.reduce_max(new.value.nstep_return, -1) # Maximize over n-step returns
+    new.value.update(target_value, importance_ratio, ac)
 
-    value_grad = tf.gradients(value1.state, policy.mb_mean)[0]
+    value_grad = tf.gradients(new.value.state, old.policy.mb_mean)[0]
     if 0:#value_grad is not None:
         value_grad = tf.where(ph.ddpg, value_grad, tf.zeros_like(value_grad))
-        repl = gradient_override(policy.mb_mean, value_grad)
-        weights_deterministic = [w for w in policy.weights if not any([name in w.name for name in ['stddev', 'choice']])]
+        repl = gradient_override(old.policy.mb_mean, value_grad)
+        weights_deterministic = [w for w in old.policy.weights if not any([name in w.name for name in ['stddev', 'choice']])]
         grads = opt.policy.compute_gradients(repl, weights_deterministic)
         ac.per_update.gnorm_policy_ddpg = apply_gradients(grads, opt.policy)
 
-    state_value = tf.reduce_sum(value1.state*policy.choice[MB_INFER], -1)
-    adv = return_value - state_value
+    state_value = tf.reduce_sum(new.value.state*new.policy.choice[MB_2], -1)
+    adv = target_value - state_value
     adv = tf.maximum(0., adv) # Only towards better actions
     adv /= (tf.reduce_sum(adv) + 1e-8)
     adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
 
-    new_log_prob = tf.reduce_sum(new_policy.log_prob * policy.max_log_idx, -1)
-    log_prob = tf.reduce_sum(policy.log_prob * policy.max_log_idx, -1)
+    new_log_prob = tf.reduce_sum(new.policy.log_prob * old.policy.max_log_idx, -1)
+    log_prob = tf.reduce_sum(old.policy.log_prob * old.policy.max_log_idx, -1)
 
     ratio = new_log_prob - log_prob
     cliprange = 0.2 # PPO objective
     if 1:
-        cliprange = math.log(cliprange)
+        cliprange = math.log(1.+cliprange)
         cost = -adv * tf.minimum(ratio, tf.clip_by_value(ratio, -cliprange, cliprange))
     else:
         ratio = tf.exp(ratio)
         cost = -adv * tf.minimum(ratio, tf.clip_by_value(ratio, 1-cliprange, 1+cliprange))
     ac.policy_ratio = ratio
-    #cost = gradient_override(policy.log_prob, adv)
+    #cost = gradient_override(new.policy.log_prob, adv)
 
-    grads_adv = opt.policy.compute_gradients(cost, new_policy.weights)
+    grads_adv = opt.policy.compute_gradients(cost, new.policy.weights)
     ac.per_minibatch.gnorm_policy_adv = apply_gradients(grads_adv, opt.policy)
 
     ac.per_minibatch.reward_sum = tf.reduce_sum(ph.rewards[:,0,r])
-    ac.per_minibatch.policy_max = tf.reduce_max(policy.mb_mean, 0)
-    ac.per_minibatch.policy_min = tf.reduce_min(policy.mb_mean, 0)
+    ac.per_minibatch.policy_max = tf.reduce_max(old.policy.mb_mean, 0)
+    ac.per_minibatch.policy_min = tf.reduce_min(old.policy.mb_mean, 0)
     ac.per_minibatch.action_max = tf.reduce_max(ph.actions, 0)
     ac.per_minibatch.action_min = tf.reduce_min(ph.actions, 0)
-    abs_error = tf.abs(value1.td_error)
+    abs_error = tf.abs(new.value.td_error)
     ac.per_minibatch.td_error = abs_error
     ac.per_minibatch.td_error_sum = tf.reduce_sum(abs_error)
     ac.per_minibatch.log_prob_max = tf.reduce_max(log_prob)
