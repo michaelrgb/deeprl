@@ -189,11 +189,11 @@ def gradient_override(expr, custom_grad):
 gradient_override.counter = 0
 
 INST_0 = 0
-MB_1 = 1 # Current batch-norm moving variables
-MB_BN = 2 # Only for training BN variables from minibatch
+MB_1 = MB_BN = 1
 def layer_batch_norm(x):
-    norm = tf.layers.BatchNormalization(scale=False, center=False)
-    x = [norm.apply(x[i], i==layer_batch_norm.training_idx) for i in range(len(x))]
+    norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.9)
+    x = [norm.apply(x[i], #i==layer_batch_norm.training_idx
+        i != INST_0) for i in range(len(x))]
     for w in norm.weights: variable_summaries(w)
     return x
 
@@ -288,7 +288,10 @@ def make_attention_net(x, ac):
                 if i==1: ac.per_minibatch.__dict__['attention_minmax_%i'%l] = tf.stack([tf.reduce_min(attention), tf.reduce_max(attention)])
     return x
 
+POLICY_OPTIONS = 5
 def make_policy_dist(hidden, iteration):
+    #if POLICY_OPTIONS > 1: hidden = [tf.ones_like(n[:,:1]) for n in hidden]# bias only
+
     with tf.variable_scope('output_%i' % iteration):
         with tf.variable_scope('mean'):
             if POLICY_SOFTMAX:
@@ -306,9 +309,9 @@ def make_policy_dist(hidden, iteration):
 
         with tf.variable_scope('stddev'):
             stddev = layer_dense(hidden, mean[0].shape[1], tf.nn.softplus)
-        return [tf.distributions.Normal(m,s) for m,s in zip(mean, stddev)]
+        MIN_STD = 0.1 # Unstable policy gradient for very small stddev
+        return [tf.distributions.Normal(m, s+MIN_STD) for m,s in zip(mean, stddev)]
 
-POLICY_OPTIONS = 5
 def make_policy(shared):
     hidden = make_fc(shared.layers, None)
     rng = range(len(hidden))
@@ -338,8 +341,7 @@ def make_policy(shared):
 
     log_prob = tf.stack([p.log_prob(ph_actions) for p in policy[MB_1]], -1)
     if not POLICY_SOFTMAX:
-        MAX_PDF = 3.
-        log_prob = tf.reduce_sum(tf.minimum(log_prob, MAX_PDF), 1) # Multiply action axes together
+        log_prob = tf.reduce_sum(log_prob, 1) # Multiply action axes together
     ret.log_prob_subpolicy = log_prob
     ret.max_log_idx = tf.one_hot(tf.arg_max(log_prob, -1), POLICY_OPTIONS)
 
@@ -415,7 +417,7 @@ def make_qvalue(shared, value_mean, policy=None):
     def update_qvalue(target_value, importance_ratio, ac=None):
         ret.td_error = td_error = tf.expand_dims(target_value, -1) - ret.q_mb
 
-        repl = gradient_override(error_predict[:,0], tf.reduce_sum(td_error-error_predict, -1))
+        repl = gradient_override(error_predict[:,0], tf.reduce_sum((td_error-error_predict)*importance_ratio, -1))
         grads = opt.error.compute_gradients(repl, error_weights)
         gnorm_error = apply_gradients(grads, opt.error)
 
@@ -447,7 +449,8 @@ def make_shared():
         CONCAT_STATE_DIM = STATE_DIM[:]
         CONCAT_STATE_DIM[-1] *= er.CONCAT_STATES
         state_inputs = [tf.reshape(tf.transpose(n,idx), [-1]+CONCAT_STATE_DIM) for n in state_inputs]
-        if not FLAGS.inst: state_inputs.insert(MB_BN, state_inputs[MB_1])
+        if not FLAGS.inst:
+            if MB_BN != MB_1: state_inputs.insert(MB_BN, state_inputs[MB_1])
 
         make_shared.inputs = state_inputs
     x = make_shared.inputs
@@ -506,7 +509,7 @@ def make_acrl():
     layer_batch_norm.training_idx = MB_BN
     with tf.variable_scope('new'):
         new = make_networks()
-    ops.post_minibatch += copy_weights(old.norm_weights, new.norm_weights)
+    #ops.post_minibatch += copy_weights(old.norm_weights, new.norm_weights)
     ops.post_update += copy_weights(old.weights, new.weights)
 
     importance_ratio = tf.exp(old.policy.log_prob_subpolicy - tf.reduce_max(old.policy.log_prob_subpolicy, 0, keep_dims=True))
@@ -530,11 +533,12 @@ def make_acrl():
     # Normalize the advantages
     #mean, var = tf.nn.moments(adv, -1)
     var = tf.reduce_sum(adv**2)
-    adv /= tf.sqrt(var) + 1e-8
+    adv /= tf.sqrt(var) + 1.
     adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
 
-    new_log_prob = tf.reduce_sum(new.policy.log_prob * old.policy.max_log_idx, -1)
-    log_prob = tf.reduce_sum(old.policy.log_prob * old.policy.max_log_idx, -1)
+    max_log_idx = old.policy.max_log_idx
+    new_log_prob = tf.reduce_sum(new.policy.log_prob * max_log_idx, -1)
+    log_prob = tf.reduce_sum(old.policy.log_prob * max_log_idx, -1)
 
     ratio = new_log_prob - log_prob
     cliprange = 0.2 # PPO objective
@@ -550,19 +554,18 @@ def make_acrl():
     grads_adv = opt.policy.compute_gradients(cost, new.policy.weights)
     ac.per_minibatch.gnorm_policy_adv = apply_gradients(grads_adv, opt.policy)
 
-    ac.per_minibatch.mb_action_max = tf.reduce_max(ph.actions, 0)
-    ac.per_minibatch.mb_action_min = tf.reduce_min(ph.actions, 0)
-    ac.per_minibatch.mb_reward_sum = tf.reduce_sum(ph.rewards[:,0,r])
-    ac.per_minibatch.policy_max = tf.reduce_max(old.policy.mb.mean, 0)
-    ac.per_minibatch.policy_min = tf.reduce_min(old.policy.mb.mean, 0)
+    maxmin = lambda n: (tf.reduce_max(n, 0), tf.reduce_min(n, 0))
+    stats = ac.per_minibatch
+    stats.mb_action_max, stats.mb_action_min = maxmin(ph.actions)
+    stats.mb_reward_sum = tf.reduce_sum(ph.rewards[:,0,r])
+    stats.policy_max, stats.policy_min = maxmin(old.policy.mb.mean)
     abs_error = tf.abs(new.value.td_error)
-    ac.per_minibatch.abs_error = abs_error
-    ac.per_minibatch.abs_error_sum = tf.reduce_sum(abs_error)
-    ac.per_minibatch.policy_ratio_max = tf.reduce_max(ac.policy_ratio)
-    ac.per_minibatch.policy_ratio_mean = tf.reduce_mean(ac.policy_ratio)
-    ac.per_minibatch.importance_ratio_max = tf.reduce_max(importance_ratio, 0)
-    ac.per_minibatch.log_prob_max = tf.reduce_max(old.policy.log_prob, 0)
-    ac.per_minibatch.log_prob_min = tf.reduce_min(old.policy.log_prob, 0)
+    stats.abs_error = abs_error
+    stats.abs_error_sum = tf.reduce_sum(abs_error)
+    stats.policy_ratio_max, _ = maxmin(ac.policy_ratio)
+    stats.policy_ratio_mean = tf.reduce_mean(ac.policy_ratio)
+    stats.importance_ratio_max = tf.reduce_max(importance_ratio, 0)
+    stats.log_prob_max, stats.log_prob_min = maxmin(old.policy.log_prob_subpolicy)
 
 for r in range(er.ER_REWARDS):
     with tf.variable_scope('ac'): make_acrl()
