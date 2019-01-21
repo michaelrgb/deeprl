@@ -58,8 +58,12 @@ class ERMemory:
             try:
                 if not len(shuffled): return
                 idx = shuffled.pop()
-                b = self.mmap_seq(seq_paths(idx), 'r', rawframes=False)
-                seq_set[idx] = b
+                paths = seq_paths(idx)
+                seq = self.mmap_seq(paths, 'r', rawframes=False)
+                if any(np.isnan(seq.actions).flatten()):
+                    print('NAN ACTIONS in ' + paths)
+                    exit
+                seq_set[idx] = seq
             except Exception as e:
                 print(e)
                 continue

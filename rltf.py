@@ -98,6 +98,7 @@ else:
     ACTION_CLIP = [-1. if i in ACTION_TANH else 0. for i in range(ACTION_DIMS)], [1.]*ACTION_DIMS
 MULTI_ACTIONS = tf.constant(MULTI_ACTIONS, DTYPE)
 POLICY_SOFTMAX = ACTION_DISCRETE
+POLICY_BETA = False
 FRAME_DIM = list(env.observation_space.shape)
 
 CONV_NET = len(FRAME_DIM) == 3
@@ -229,11 +230,11 @@ def layer_lstm(x, outputs, ac):
             if i==1: ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
     return x
 
-def make_fc(x, actions):
+def make_fc(x, actions=None, activation=tf.nn.relu):
     with tf.variable_scope('hidden1'):
         x = layer_dense(x, FC_UNITS)
         x = layer_batch_norm(x)
-        x = [tf.nn.relu(n) for n in x]
+        x = [activation(n) for n in x]
     with tf.variable_scope('hidden2'):
         if USE_LSTM: x = layer_lstm(x, FC_UNITS, ac)
         else: x = layer_dense(x, FC_UNITS)
@@ -242,21 +243,18 @@ def make_fc(x, actions):
             with tf.variable_scope('actions'):
                 actions = layer_dense(actions, FC_UNITS)
                 x = [n+a for n,a in zip(x,actions)]
-        x = [tf.nn.relu(n) for n in x]
+        x = [activation(n) for n in x]
     return x
 
 def make_conv_net(x):
     LAYERS = [
-        (32, 6, 3, 0),
+        (32, 8, 2, 0),
+        (32, 8, 2, 0),
         (32, 4, 2, 0),
-        (32, 4, 1, 0),
     ]
     x = [tf.expand_dims(n,-1) for n in x]
     for l,(filters, width, stride, conv3d) in enumerate(LAYERS):
         with tf.variable_scope('conv_%i' % l):
-            pool_stride = None
-            #if not stride%2: pool_stride = [1,2,2,1]; stride /= 2 # Smoothen filter responses
-
             kwds = dict(activation=None, use_bias=False)
             if conv3d:
                 width3d, stride3d = conv3d
@@ -268,11 +266,16 @@ def make_conv_net(x):
             x = [conv.apply(n) for n in x]
             for w in conv.weights: variable_summaries(w)
 
-            if pool_stride: x = [tf.nn.avg_pool(n, pool_stride, pool_stride, 'VALID') for n in x]
             x = layer_batch_norm(x)
             x = [tf.nn.relu(n) for n in x]
+
+            if l==0:
+                # Max pool of entire first layer, for global motion estimation
+                pool_stride = x[0].shape[1]
+                pool_stride = [1,pool_stride,pool_stride,1]
+                max_pool = [tf.layers.flatten(tf.nn.max_pool(n, pool_stride, pool_stride, 'VALID')) for n in x]
         print(x[0].shape)
-    return x
+    return x, max_pool
 
 if MHDPA_LAYERS: from tflayers.mhdpa import *
 def make_attention_net(x, ac):
@@ -290,67 +293,86 @@ def make_attention_net(x, ac):
 
 POLICY_OPTIONS = 5
 def make_policy_dist(hidden, iteration):
-    #if POLICY_OPTIONS > 1: hidden = [tf.ones_like(n[:,:1]) for n in hidden]# bias only
+    #if POLICY_OPTIONS > 1: hidden = [tf.ones_like(n) for n in hidden]# bias only
+
+    def layer(scope, activation, outputs=ACTION_DIMS):
+        with tf.variable_scope(scope):
+            return layer_dense(hidden, outputs, activation)
 
     with tf.variable_scope('output_%i' % iteration):
-        with tf.variable_scope('mean'):
-            if POLICY_SOFTMAX:
-                return layer_dense(hidden, ACTION_DIMS, tf.distributions.Categorical)
-            mean = layer_dense(hidden, ACTION_DIMS, tf.sigmoid)
+        if POLICY_SOFTMAX:
+            return layer('logits', tf.distributions.Categorical)
+
+        if POLICY_BETA: return [tf.distributions.Beta(1.+a, 1.+b) for a,b in
+            zip(layer('alpha', tf.nn.softplus), layer('beta', tf.nn.softplus))]
+
+        mean = layer('mean', tf.sigmoid)
+        #mean = [m*(1+h)/2 for m,h in zip(mean, layer('mult', tf.sigmoid))]
 
         if ACTION_TANH: # Multiply specific axes with tanh
-            with tf.variable_scope('tanh'):
-                tanh = layer_dense(hidden, len(ACTION_TANH), tf.tanh)
+            tanh = layer('tanh', tf.tanh, len(ACTION_TANH))
             for i in range(len(mean)):
                 mult = [tf.ones_like(tanh[i][:,0])]*ACTION_DIMS
                 for j,t in enumerate(ACTION_TANH):
                     mult[t] = tanh[i][:,j]
                 mean[i] *= tf.stack(mult, -1)
 
-        with tf.variable_scope('stddev'):
-            stddev = layer_dense(hidden, mean[0].shape[1], tf.nn.softplus)
         MIN_STD = 0.1 # Unstable policy gradient for very small stddev
-        return [tf.distributions.Normal(m, s+MIN_STD) for m,s in zip(mean, stddev)]
+        return [tf.distributions.Normal(m, s+MIN_STD) for m,s in
+            zip(mean, layer('stddev', tf.nn.softplus))]
 
 def make_policy(shared):
-    hidden = make_fc(shared.layers, None)
+    hidden = make_fc(shared.layers)
     rng = range(len(hidden))
 
     policy = zip(*[make_policy_dist(hidden, i) for i in range(POLICY_OPTIONS)])
     if POLICY_OPTIONS > 1:
-        with tf.variable_scope('choice'): choice_dist = layer_dense(hidden, POLICY_OPTIONS, tf.distributions.Categorical)
-        choice = [tf.one_hot(c.sample() if i==INST_0 else c.mode(), POLICY_OPTIONS) for i,c in enumerate(choice_dist)]
+        with tf.variable_scope('choice'):
+            #hidden = make_fc(shared.layers) # Separate hidden layers
+            choice_dist = layer_dense(hidden, POLICY_OPTIONS, tf.distributions.Categorical)
+        sample_idx = INST_0
+        choice = [tf.one_hot(c.sample() if i==sample_idx else c.mode(), POLICY_OPTIONS) for i,c in enumerate(choice_dist)]
     else:
         choice = [tf.ones(shape=[n.shape[0], 1]) for n in hidden]
     ret = Struct(choice=choice)
-    choice_transpose = [tf.transpose([c], [2,1,0]) for c in ret.choice]
 
-    if POLICY_SOFTMAX:
-        ph_actions = tf.arg_max(ph.actions, -1)
-        ret.mean_options = [tf.stack([p.logits for p in policy[i]], 0) for i in rng]
-    else:
-        ph_actions = ph.actions
-        ret.mean_options = [tf.stack([p.mean() for p in policy[i]], 0) for i in rng]
-        ret.stddev_options = [tf.stack([p.stddev() for p in policy[i]], 0) for i in rng]
-        ret.stddev = [tf.reduce_sum(s*c, 0) for s,c in zip(ret.stddev_options, choice_transpose)]
-    ret.mean = [tf.reduce_sum(m*c, 0) for m,c in zip(ret.mean_options, choice_transpose)]
+    sub_mode = [tf.stack([p.mode() for p in policy[i]], 1) for i in rng]
+    sub_sample = [tf.stack([p.sample() for p in policy[i]], 1) for i in rng]
+    choice_expand = ret.choice if POLICY_SOFTMAX else [tf.expand_dims(c,-1) for c in ret.choice]
+    mode = [tf.reduce_sum(c*m, 1) for c,m in zip(choice_expand, sub_mode)]
+    sample = [tf.reduce_sum(c*s, 1) for c,s in zip(choice_expand, sub_sample)]
 
-    ret.weights = scope_vars('') + shared.weights
+    ret.inst = Struct(mode=mode[INST_0], sample=sample[INST_0], choice=choice[INST_0])
     if FLAGS.inst:
         return ret
+
+    if POLICY_SOFTMAX: ph_actions = tf.arg_max(ph.actions, -1)
+    elif POLICY_BETA:
+        ph_actions = (ph.actions - ACTION_CLIP[0]) / (np.array(ACTION_CLIP[1])-np.array(ACTION_CLIP[0]))
+        ph_actions = tf.clip_by_value(ph_actions, 0.01, 0.99)
+    else: ph_actions = ph.actions
 
     log_prob = tf.stack([p.log_prob(ph_actions) for p in policy[MB_1]], -1)
     if not POLICY_SOFTMAX:
         log_prob = tf.reduce_sum(log_prob, 1) # Multiply action axes together
-    ret.log_prob_subpolicy = log_prob
-    ret.max_log_idx = tf.one_hot(tf.arg_max(log_prob, -1), POLICY_OPTIONS)
+    ret.log_prob_sub = log_prob
 
+    ratio = tf.exp(log_prob - tf.reduce_max(log_prob))#, 0, keep_dims=True))
+    ret.importance_ratio = ratio / tf.reduce_sum(ratio)#, 0, keep_dims=True)
+    #ret.importance_ratio = tf.nn.softmax(ret.log_prob, 0)
+
+    ret.mb = Struct(mode=mode[MB_1], choice=choice[MB_1])
     if POLICY_OPTIONS > 1:
-        log_prob += tf.minimum(-1e-2, tf.stack([choice_dist[MB_1].log_prob(c) for c in range(POLICY_OPTIONS)], -1))
-    ret.log_prob = log_prob
+        subpolicy_prob = tf.nn.softmax(ret.log_prob_sub)
+        logits = choice_dist[MB_1].logits
+        ret.mb.choice_softmax = tf.nn.softmax(logits)
 
-    ret.next = ret.mean[-len(training.nsteps):]
-    ret.mb = Struct(mean=ret.mean[MB_1], choice=choice[MB_1])
+        log_prob *= ret.mb.choice_softmax
+        log_prob += tf.nn.log_softmax(logits) * subpolicy_prob
+
+    ret.log_prob = log_prob
+    ret.next = mode[-len(training.nsteps):]
+    ret.weights = scope_vars('') + shared.weights
     return ret
 
 def multi_actions_pre(state, actions, idx, batch_size=FLAGS.minibatch, include_policy=True):
@@ -381,12 +403,10 @@ gamma_nsteps = FLAGS.gamma**tf.cast(ph.nsteps, DTYPE)
 def make_qvalue(shared, value_mean, policy=None):
     state = shared.layers
     actions = None
-    if not FLAGS.inst:
-        state = [state[INST_0], state[MB_1], state[MB_BN]] + state[-len(training.nsteps):]
-
     if 0:#policy:
         actions = [policy.mean[INST_0]]
         if not FLAGS.inst:
+            state = [state[INST_0], state[MB_1], state[MB_1]] + state[-len(training.nsteps):]
             actions += [ph.actions, policy.mb.mean] + policy.next
         if not ACTION_DISCRETE:
             actions = tile_tensors(actions)
@@ -403,8 +423,7 @@ def make_qvalue(shared, value_mean, policy=None):
            q[i] += value_mean.q[i] - tf.reduce_mean(q[i], -1, keep_dims=True)
 
     if FLAGS.inst: return ret
-    ret.q_mb = q[MB_BN]
-    ret.state = q[MB_1]
+    ret.state = ret.q_mb = q[MB_1]
 
     if policy: choice = tf.stack(policy.choice[-len(training.nsteps):], 1)
     next_state_value = tf.stack(q[-len(training.nsteps):], 1)
@@ -421,6 +440,8 @@ def make_qvalue(shared, value_mean, policy=None):
         grads = opt.error.compute_gradients(repl, error_weights)
         gnorm_error = apply_gradients(grads, opt.error)
 
+        print('VALUE weights')
+        for w in ret.weights: print w.name
         repl = gradient_override(ret.q_mb, td_error * importance_ratio)
         grad_s = opt.td.compute_gradients(repl, ret.weights)
         # TDC - target_value is already gamma-discounted, so dont multiply features by gamma.
@@ -456,19 +477,21 @@ def make_shared():
     x = make_shared.inputs
 
     print(x[0].shape)
-    if CONV_NET: x = make_conv_net(x)
+    if CONV_NET: x, max_pool = make_conv_net(x)
     else:
         x = layer_batch_norm(x)
         x = [double_relu(n) for n in x]
     if MHDPA_LAYERS: x = make_attention_net(x, ac)
 
     x = [tf.layers.flatten(n) for n in x]
+    x = [tf.concat([n,m], -1) for n,m in zip(x, max_pool)]
+
     print(x[0].shape)
     return Struct(layers=x, weights=scope_vars())
 make_shared.inputs = None
 
 opt = Struct(td=tf.train.AdamOptimizer(FLAGS.learning_rate),
-    policy=tf.train.AdamOptimizer(FLAGS.learning_rate),
+    policy=tf.train.AdamOptimizer(FLAGS.learning_rate/1e2),
     error=tf.train.AdamOptimizer(1))
 
 def copy_weights(_to, _from, interp=1.):
@@ -483,16 +506,18 @@ def make_acrl():
     allac.append(ac)
 
     def _value(shared):
+        shared = shared or make_shared()
         with tf.variable_scope('mean'): value_mean = make_qvalue(shared, None)
         with tf.variable_scope('adv'): return make_qvalue(shared, value_mean)
     def _policy(shared):
+        shared = shared or make_shared()
         with tf.variable_scope('_'): return make_policy(shared)
 
     def make_networks():
-        #shared = make_shared()
-        with tf.variable_scope('policy'): policy = _policy(make_shared())
-        with tf.variable_scope('value'): value = _value(make_shared())
-        ret = Struct(policy=policy, value=value, weights=scope_vars())
+        shared = None #make_shared()
+        with tf.variable_scope('policy'): policy = _policy(shared)
+        with tf.variable_scope('value'): value = _value(shared)
+        ret = Struct(policy=policy, value=value, weights=scope_vars() + (shared.weights if shared else[]))
         ret.norm_weights = [w for w in scope_vars(GLOBAL=True) if w not in ret.weights]
         return ret
 
@@ -500,34 +525,31 @@ def make_acrl():
     with tf.variable_scope('old'):
         old = make_networks()
 
-    if not POLICY_SOFTMAX: ac.per_inst.policy_stddev = old.policy.stddev[INST_0][0]
-    ac.per_inst.policy_mean = old.policy.mean[INST_0][0]
-    ac.per_inst.policy_choice = old.policy.choice[INST_0][0]
+    ac.per_inst.policy_mode = old.policy.inst.mode[0]
+    ac.per_inst.policy_sample = old.policy.inst.sample[0]
+    ac.per_inst.policy_choice = old.policy.inst.choice[0]
     ac.per_inst.policy_value = old.value.q_inst[0]
     if FLAGS.inst: return
 
     layer_batch_norm.training_idx = MB_BN
     with tf.variable_scope('new'):
         new = make_networks()
-    #ops.post_minibatch += copy_weights(old.norm_weights, new.norm_weights)
     ops.post_update += copy_weights(old.weights, new.weights)
 
-    importance_ratio = tf.exp(old.policy.log_prob_subpolicy - tf.reduce_max(old.policy.log_prob_subpolicy, 0, keep_dims=True))
-    importance_ratio /= tf.reduce_sum(importance_ratio, 0, keep_dims=True)
-
+    importance_ratio = old.policy.importance_ratio
     target_value = tf.reduce_max(new.value.nstep_return, -1) # Maximize over n-step returns
-    new.value.update(target_value, importance_ratio, ac)
+    new.value.update(target_value, old.policy.importance_ratio, ac)
 
-    value_grad = tf.gradients(new.value.state, new.policy.mb.mean)[0]
+    value_grad = tf.gradients(new.value.state, new.policy.mb.mode)[0]
     if 0:#value_grad is not None:
         value_grad = tf.where(ph.ddpg, value_grad, tf.zeros_like(value_grad))
-        repl = gradient_override(old.policy.mb.mean, value_grad)
+        repl = gradient_override(old.policy.mb.mode, value_grad)
         weights_deterministic = [w for w in old.policy.weights if not any([name in w.name for name in ['stddev', 'choice']])]
         grads = opt.policy.compute_gradients(repl, weights_deterministic)
         ac.per_update.gnorm_policy_ddpg = apply_gradients(grads, opt.policy)
 
-    state_value = tf.reduce_sum(new.value.state*new.policy.mb.choice, -1)
-    adv = target_value - state_value
+    state_value = tf.reduce_sum(new.value.state*new.policy.mb.choice_softmax, -1)
+    adv = tf.stop_gradient(target_value - state_value)
     adv = tf.maximum(0., adv) # Only towards better actions
 
     # Normalize the advantages
@@ -536,11 +558,9 @@ def make_acrl():
     adv /= tf.sqrt(var) + 1.
     adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
 
-    max_log_idx = old.policy.max_log_idx
-    new_log_prob = tf.reduce_sum(new.policy.log_prob * max_log_idx, -1)
-    log_prob = tf.reduce_sum(old.policy.log_prob * max_log_idx, -1)
+    ratio = new.policy.log_prob - old.policy.log_prob
+    ratio = tf.reduce_sum(ratio, -1) # Combined subpolicies
 
-    ratio = new_log_prob - log_prob
     cliprange = 0.2 # PPO objective
     if 1:
         cliprange = math.log(1.+cliprange)
@@ -549,23 +569,25 @@ def make_acrl():
         ratio = tf.exp(ratio)
         cost = -adv * tf.minimum(ratio, tf.clip_by_value(ratio, 1-cliprange, 1+cliprange))
     ac.policy_ratio = ratio
-    #cost = gradient_override(new.policy.log_prob, adv)
 
-    grads_adv = opt.policy.compute_gradients(cost, new.policy.weights)
+    policy_weights = new.policy.weights
+    print('POLICY weights:')
+    for w in policy_weights: print w.name
+    grads_adv = opt.policy.compute_gradients(cost, policy_weights)
     ac.per_minibatch.gnorm_policy_adv = apply_gradients(grads_adv, opt.policy)
 
     maxmin = lambda n: (tf.reduce_max(n, 0), tf.reduce_min(n, 0))
     stats = ac.per_minibatch
     stats.mb_action_max, stats.mb_action_min = maxmin(ph.actions)
     stats.mb_reward_sum = tf.reduce_sum(ph.rewards[:,0,r])
-    stats.policy_max, stats.policy_min = maxmin(old.policy.mb.mean)
+    stats.policy_max, stats.policy_min = maxmin(old.policy.mb.mode)
     abs_error = tf.abs(new.value.td_error)
     stats.abs_error = abs_error
     stats.abs_error_sum = tf.reduce_sum(abs_error)
     stats.policy_ratio_max, _ = maxmin(ac.policy_ratio)
-    stats.policy_ratio_mean = tf.reduce_mean(ac.policy_ratio)
+    stats.policy_ratio_mean = tf.reduce_mean(ac.policy_ratio, 0)
     stats.importance_ratio_max = tf.reduce_max(importance_ratio, 0)
-    stats.log_prob_max, stats.log_prob_min = maxmin(old.policy.log_prob_subpolicy)
+    stats.log_prob_max, stats.log_prob_min = maxmin(old.policy.log_prob_sub)
 
 for r in range(er.ER_REWARDS):
     with tf.variable_scope('ac'): make_acrl()
@@ -661,12 +683,11 @@ def step_to_frames():
     if ACTION_DISCRETE: a = onehot_vector(int(a[0]+1.), ACTION_DIMS)
 
     if state.count > 0 and app.policy_index != -1:
-        if POLICY_SOFTMAX:
-            a = onehot_vector(choose_action(app.per_inst.policy_mean), ACTION_DIMS)
-        else:
-            stddev = app.per_inst.policy_stddev * FLAGS.sample_action
-            a = np.random.normal(app.per_inst.policy_mean, stddev)
-            a = np.clip(a, *ACTION_CLIP)
+        a = app.per_inst.policy_sample if FLAGS.sample_action else app.per_inst.policy_mode
+        if POLICY_SOFTMAX: a = onehot_vector(np.argmax(a), ACTION_DIMS)
+        elif POLICY_BETA: a = a * (np.array(ACTION_CLIP[1])-np.array(ACTION_CLIP[0])) + ACTION_CLIP[0]
+        else: a = np.clip(a, *ACTION_CLIP)
+
     '''
     if FLAGS.sample_action:
         np.random.seed(0)
