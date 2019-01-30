@@ -190,11 +190,15 @@ gradient_override.counter = 0
 
 INST_0 = 0
 MB_1 = MB_BN = 1
-def layer_batch_norm(x):
-    norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.9)
-    x = [norm.apply(x[i], #i==layer_batch_norm.training_idx
-        i != INST_0) for i in range(len(x))]
+def layer_batch_norm(x, activation=None, shared_norm=True):
+    if shared_norm: x = [tf.expand_dims(n, -1) for n in x]
+
+    norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.5)
+    x = [norm.apply(x[i], i != INST_0) for i in range(len(x))]
     for w in norm.weights: variable_summaries(w)
+
+    if shared_norm: x = [tf.reduce_sum(n, -1) for n in x]
+    if activation: x = [activation(n) for n in x]
     return x
 
 def layer_dense(x, outputs, activation=None, use_bias=False, trainable=True):
@@ -232,8 +236,7 @@ def layer_lstm(x, outputs, ac):
 def make_fc(x, actions=None, activation=tf.nn.relu):
     with tf.variable_scope('hidden1'):
         x = layer_dense(x, FC_UNITS)
-        x = layer_batch_norm(x)
-        x = [activation(n) for n in x]
+        x = layer_batch_norm(x, activation)
     return x
 
     with tf.variable_scope('hidden2'):
@@ -271,9 +274,7 @@ def make_conv_net(x):
             x = [conv.apply(n) for n in x]
             for w in conv.weights: variable_summaries(w)
 
-            x = layer_batch_norm(x)
-            x = [tf.nn.relu(n) for n in x]
-
+            x = layer_batch_norm(x, tf.nn.relu)
             print(x[0].shape)
     return x
 
@@ -353,17 +354,15 @@ def make_policy(shared):
         ph_actions = tf.clip_by_value(ph_actions, 0.01, 0.99)
     else: ph_actions = ph.actions
 
-    log_prob = tf.stack([p.log_prob(ph_actions) for p in policy[MB_1]], -1)
-    if not POLICY_SOFTMAX:
-        log_prob = tf.reduce_sum(log_prob, 1) # Multiply action axes together
-    ret.log_prob_sub = log_prob
-
     logits = choice_logits[MB_1]
     ret.mb = Struct(mode=mode[MB_1], choice_softmax=tf.nn.softmax(logits))
     ret.mb.choice_one_hot = tf.one_hot(tf.argmax(ret.mb.choice_softmax, -1), POLICY_OPTIONS)
 
+    log_prob = tf.stack([p.log_prob(ph_actions) for p in policy[MB_1]], -1)
+    if not POLICY_SOFTMAX:
+        log_prob = tf.reduce_sum(log_prob, 1) # Multiply action axes together
+    ret.log_prob_sub = log_prob
     ret.log_prob = tf.reduce_sum(ret.log_prob_sub * ret.mb.choice_softmax, -1)
-    ret.importance_ratio = tf.expand_dims(tf.nn.softmax(ret.log_prob, 0), -1)
 
     ret.next = mode[-len(training.nsteps):]
     ret.weights = scope_vars('') + shared.weights
@@ -476,8 +475,7 @@ def make_shared():
     if CONV_NET:
         x = make_conv_net(x)
     else:
-        x = layer_batch_norm(x)
-        x = [double_relu(n) for n in x]
+        x = layer_batch_norm(x, double_relu, shared_norm=False)
     if MHDPA_LAYERS: x = make_attention_net(x, ac)
 
     x = [tf.layers.flatten(n) for n in x]
@@ -519,7 +517,6 @@ def make_acrl():
         ret.norm_weights = [w for w in scope_vars(GLOBAL=True) if w not in ret.weights]
         return ret
 
-    layer_batch_norm.training_idx = -1
     with tf.variable_scope('old'):
         old = make_networks()
 
@@ -529,16 +526,18 @@ def make_acrl():
     ac.per_inst.policy_value = old.value.q_inst[0]
     if FLAGS.inst: return
 
-    layer_batch_norm.training_idx = MB_BN
     with tf.variable_scope('new'):
         new = make_networks()
     ops.post_update += copy_weights(old.weights, new.weights)
 
+    log_prob = old.policy.log_prob
+    importance_ratio = tf.exp(log_prob - tf.reduce_max(log_prob))
+
     target_value = tf.reduce_max(new.value.nstep_return, -1) # Maximize over n-step returns
-    importance_ratio = old.policy.importance_ratio
     state_value = new.value.state
     if state_value.shape[-1] == 1: # Single value
         state_value = state_value[:,0]
+        importance_ratio = tf.expand_dims(importance_ratio, -1)
     else:
         state_value = tf.reduce_sum(state_value*new.policy.mb.choice_one_hot, -1)
     new.value.update(target_value, importance_ratio, ac)
@@ -561,7 +560,6 @@ def make_acrl():
     adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
 
     ratio = new.policy.log_prob - old.policy.log_prob
-
     cliprange = 0.2 # PPO objective
     if 1:
         cliprange = math.log(1.+cliprange)
