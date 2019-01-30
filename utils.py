@@ -22,6 +22,8 @@ def variable_summaries(var, scope=None):
         tf.summary.scalar('stddev', stddev)
         tf.summary.histogram('histogram', var)
 
+def tf_gradients(cost, weights): return zip(tf.gradients(cost, weights), weights)
+
 # Prevent dead neurons if taking one-sided input
 concat_neg = lambda x: tf.concat([x, -x], -1)
 double_relu = lambda x: tf.nn.relu(concat_neg(x))
