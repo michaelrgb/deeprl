@@ -31,7 +31,10 @@ class ERMemory:
         self.proclist = []
         self.current_step = 0
         self.mb = None
-        self.mb_replace_size = FLAGS.minibatch / 4 # Amount of minibatch to replace each iteration
+
+        self.buffer_size = max(FLAGS.minibatch, 200)
+        # Should not replace more of buffer than we have evalulated via a minibatch
+        self.buffer_replace_size = FLAGS.minibatch
 
         manager = multiprocessing.Manager()
         self.seq_sets = manager.list()
@@ -54,7 +57,7 @@ class ERMemory:
         seq_set = {}
         shuffled = list(range(-1,-(FLAGS.seq_keep+1),-1)) + list(range(FLAGS.seq_inst))
         np.random.shuffle(shuffled)
-        while len(seq_set) < self.mb_replace_size:
+        while len(seq_set) < self.buffer_replace_size:
             try:
                 if not len(shuffled): return
                 idx = shuffled.pop()
@@ -68,7 +71,7 @@ class ERMemory:
                 print(e)
                 continue
         self.seq_sets.append(seq_set.values())
-    def _get_new_seq_set(self):
+    def _new_seq_set(self):
         if 1:
             PROCESSES = 2
             while len(self.proclist) < PROCESSES:
@@ -83,17 +86,14 @@ class ERMemory:
             self._proc_seq_set()
         self.seq_set = self.seq_sets.pop() if len(self.seq_sets) else None
 
-    def _fill_sub_mb(self, seq_step, mb_indices):
-        assert(len(mb_indices) == self.mb_replace_size)
-
+    def _fill_buffer(self, seq_step, buf_indices): # buf_indices to replace
         seq_step += CONCAT_STATES
-        mb = self.mb
-        for b,mb_idx in enumerate(mb_indices):# indices of entries to replace
-            seq = self.seq_set[b]
+        buf = self.buffer
+        for b,buf_idx in enumerate(buf_indices):
+            seq = self.seq_set[b % len(self.seq_set)] # % only for filling the entire initial buffer
 
-            mb.priority[mb_idx] = -float('inf')
-            mb.states[0][mb_idx] = seq.states[seq_step-CONCAT_STATES:seq_step]
-            mb.actions[mb_idx] = seq.actions[seq_step]
+            buf.states[0][buf_idx] = seq.states[seq_step-CONCAT_STATES:seq_step]
+            buf.actions[buf_idx] = seq.actions[seq_step]
             for i,nsteps in enumerate(self.nsteps):
                 accum_reward = 0.
                 for n in range(nsteps):
@@ -102,44 +102,64 @@ class ERMemory:
                     next_step += 1
                     if next_step == TRAJECTORY_LENGTH:
                         break
-                mb.states[i+1][mb_idx] = seq.states[next_step-CONCAT_STATES:next_step]
-                mb.rewards[mb_idx, i] = accum_reward
-                mb.nsteps[mb_idx, i] = next_step - seq_step
+                buf.states[i+1][buf_idx] = seq.states[next_step-CONCAT_STATES:next_step]
+                buf.rewards[buf_idx, i] = accum_reward
+                buf.nsteps[buf_idx, i] = next_step - seq_step
 
-    def fill_mb(self): # Each minibatch is random subset of batch trajectories
+    def _alloc_batch(self, size):
+        return Struct(
+            priority = np.zeros([size]),
+            buffer_idx = np.zeros([size], np.int),
+            actions = np.zeros([size, self.action_dims]),
+            states = [np.zeros([size, CONCAT_STATES] + self.state_dim) for n in self.nsteps+[1]],
+            rewards = np.zeros([size, len(self.nsteps), ER_REWARDS]),
+            nsteps = np.zeros([size, len(self.nsteps)]))
+
+    # Fill entire minibatch from buffer, which is replaced by sampling for lowest buffer priorities.
+    def fill_mb(self):
         seq_step = self.current_step
         if seq_step+CONCAT_STATES == TRAJECTORY_LENGTH-1:
             seq_step = 0
 
         if seq_step == 0:
-            self._get_new_seq_set()
+            self._new_seq_set()
             if not self.seq_set: return None
         self.current_step = seq_step+1
 
-        first_mb = False
         if not self.mb:
-            first_mb = True
-            self.mb = Struct(
-                priority = np.zeros([FLAGS.minibatch]),
-                actions = np.zeros([FLAGS.minibatch, self.action_dims]),
-                states = [np.zeros([FLAGS.minibatch, CONCAT_STATES] + self.state_dim) for n in self.nsteps+[1]],
-                rewards = np.zeros([FLAGS.minibatch, len(self.nsteps), ER_REWARDS]),
-                nsteps = np.zeros([FLAGS.minibatch, len(self.nsteps)]))
+            self.mb = self._alloc_batch(FLAGS.minibatch)
+            self.buffer = self._alloc_batch(self.buffer_size)
 
-        if first_mb:
-            # Fill the entire minibatch
-            for i in range(FLAGS.minibatch / self.mb_replace_size):
-                self._fill_sub_mb(seq_step, range(i*self.mb_replace_size, (i+1)*self.mb_replace_size))
+            # Fill the entire buffer
+            self._fill_buffer(seq_step, range(self.buffer_size))
         else:
-            # Sample minibatch indices to replace
-            all_priorities = {k: self.mb.priority[k] for k in range(FLAGS.minibatch)}
-            mb_indices = []
-            for i in range(self.mb_replace_size):
+            # Copy previous minibatch priorities into buffer
+            for mb_idx in range(FLAGS.minibatch):
+                self.buffer.priority[self.mb.buffer_idx[mb_idx]] = self.mb.priority[mb_idx]
+
+            # Sample lowest priority indices from buffer to replace
+            all_priorities = {k: -self.buffer.priority[k] for k in range(self.buffer_size)}
+            buf_indices = []
+            for i in range(self.buffer_replace_size):
                 idx, priority = zip(*all_priorities.items())
-                scale = -1.
-                probs = softmax(np.array([scale*p for p in priority]))
+                probs = softmax(np.array(priority))
                 chosen = idx[np.random.choice(len(idx), p=probs)]
                 all_priorities.pop(chosen)
-                mb_indices.append(chosen)
-            self._fill_sub_mb(seq_step, mb_indices)
+                buf_indices.append(chosen)
+            #print(self.mb.buffer_idx, buf_indices)
+            self._fill_buffer(seq_step, buf_indices)
+
+        mb, buf = self.mb, self.buffer
+        buf_idx = self.mb.buffer_idx[-1]
+        for mb_idx in range(FLAGS.minibatch):
+            # Replace entire minibatch by looping over buffer
+            buf_idx = (buf_idx+1) % self.buffer_size
+
+            mb.buffer_idx[mb_idx] = buf_idx
+            mb.actions[mb_idx] = buf.actions[buf_idx]
+            mb.rewards[mb_idx] = buf.rewards[buf_idx]
+            mb.nsteps[mb_idx] = buf.nsteps[buf_idx]
+            for n in range(len(self.nsteps)+1):
+                mb.states[n][mb_idx] = buf.states[n][buf_idx]
+
         return self.mb

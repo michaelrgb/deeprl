@@ -160,20 +160,14 @@ ops = Struct(
     per_update=[], post_update=[],
     new_batches=[],
     per_inst=[frame_to_state], post_inst=[])
-def accum_value(value):
-    accum = tf.Variable(tf.zeros_like(value), trainable=False)
-    ops.per_minibatch.append(accum.assign_add(value))
-    ops.post_update.append(accum.assign(tf.zeros_like(value)))
-    return accum
-def apply_gradients(grads, opt, accum_until_update=False, clip_norm=100.):
+
+def apply_gradients(grads, opt, clip_norm=100.):
     grads, weights = zip(*grads)
-    if accum_until_update:
-        grads = [accum_value(g) for g in grads]
     clipped,global_norm = tf.clip_by_global_norm(grads, clip_norm)
     if clip_norm:
         grads = clipped
     grads = zip(grads, weights)
-    (ops.per_update if accum_until_update else ops.per_minibatch).append(opt.apply_gradients(grads))
+    ops.per_minibatch.append(opt.apply_gradients(grads))
     return global_norm
 
 # Custom gradients to pre-multiply weight gradients before they are aggregated across the batch.
@@ -358,11 +352,20 @@ def make_policy(shared):
     ret.mb = Struct(mode=mode[MB_1], choice_softmax=tf.nn.softmax(logits))
     ret.mb.choice_one_hot = tf.one_hot(tf.argmax(ret.mb.choice_softmax, -1), POLICY_OPTIONS)
 
-    log_prob = tf.stack([p.log_prob(ph_actions) for p in policy[MB_1]], -1)
-    if not POLICY_SOFTMAX:
-        log_prob = tf.reduce_sum(log_prob, 1) # Multiply action axes together
-    ret.log_prob_sub = log_prob
-    ret.log_prob = tf.reduce_sum(ret.log_prob_sub * ret.mb.choice_softmax, -1)
+    def action_log_prob(actions):
+        log_prob_sub = tf.stack([p.log_prob(actions(p)) for p in policy[MB_1]], -1)
+        if not POLICY_SOFTMAX:
+            log_prob_sub = tf.reduce_sum(log_prob_sub, 1) # Multiply action axes together
+        log_prob = tf.stop_gradient(ret.mb.choice_softmax) * log_prob_sub
+        return tf.reduce_sum(log_prob, -1), log_prob_sub
+
+    log_prob, ret.log_prob_sub = action_log_prob(lambda _: ph_actions)
+    peak_log_prob, _ = action_log_prob(lambda p: p.mode())
+    ret.importance_ratio = tf.exp(log_prob-peak_log_prob)
+
+    sub_softmax = tf.nn.softmax(ret.log_prob_sub)
+    ret.log_prob = log_prob + tf.reduce_sum(# Not for importance_ratio
+        tf.stop_gradient(sub_softmax) * tf.log(ret.mb.choice_softmax), -1)
 
     ret.next = mode[-len(training.nsteps):]
     ret.weights = scope_vars('') + shared.weights
@@ -389,8 +392,9 @@ def multi_actions_post(n, batch_size=FLAGS.minibatch, reduce=None):
 
 def tile_tensors(x, tiles=10):
     x = [tf.concat([n*tiles + t for t in range(-tiles+1,tiles)], -1) for n in x]
+    x = [tf.concat([n, -n], -1) for n in x]
     x = [tf.clip_by_value(n, 0., 1.) for n in x]
-    return [2*n - 1 for n in x]
+    return x
 
 gamma_nsteps = FLAGS.gamma**tf.cast(ph.nsteps, DTYPE)
 def make_qvalue(shared, value_mean, policy=None):
@@ -475,7 +479,7 @@ def make_shared():
     if CONV_NET:
         x = make_conv_net(x)
     else:
-        x = layer_batch_norm(x, double_relu, shared_norm=False)
+        x = tile_tensors(x)
     if MHDPA_LAYERS: x = make_attention_net(x, ac)
 
     x = [tf.layers.flatten(n) for n in x]
@@ -530,9 +534,7 @@ def make_acrl():
         new = make_networks()
     ops.post_update += copy_weights(old.weights, new.weights)
 
-    log_prob = old.policy.log_prob
-    importance_ratio = tf.exp(log_prob - tf.reduce_max(log_prob))
-
+    importance_ratio = old.policy.importance_ratio
     target_value = tf.reduce_max(new.value.nstep_return, -1) # Maximize over n-step returns
     state_value = new.value.state
     if state_value.shape[-1] == 1: # Single value
@@ -552,11 +554,10 @@ def make_acrl():
 
     adv = tf.stop_gradient(target_value - state_value)
     adv = tf.maximum(0., adv) # Only towards better actions
+    adv_unscaled = adv
 
     # Normalize the advantages
-    #mean, var = tf.nn.moments(adv, -1)
-    var = tf.reduce_sum(adv**2)
-    adv /= tf.sqrt(var) + 1.
+    adv /= tf.reduce_sum(adv) + 1e-8
     adv = tf.where(ph.adv, adv, tf.zeros_like(adv))
 
     ratio = new.policy.log_prob - old.policy.log_prob
@@ -589,10 +590,11 @@ def make_acrl():
     stats.abs_error_sum = tf.reduce_sum(abs_error)
     stats.policy_ratio_max, _ = maxmin(ac.policy_ratio)
     stats.policy_ratio_mean = tf.reduce_mean(ac.policy_ratio, 0)
-    stats.importance_ratio_max = tf.reduce_max(importance_ratio, 0)
+    stats.importance_ratio_max, stats.importance_ratio_min = maxmin(importance_ratio)
     stats.log_prob_max, stats.log_prob_min = maxmin(old.policy.log_prob_sub)
+    stats.choice_softmax_max, _ = maxmin(old.policy.mb.choice_softmax)
 
-    stats.priority = abs_error[:,0] + adv
+    stats.priority = abs_error[:,0] + adv_unscaled
 
 for r in range(er.ER_REWARDS):
     with tf.variable_scope('ac'): make_acrl()
@@ -690,7 +692,8 @@ def step_to_frames():
     if state.count > 0 and app.policy_index != -1:
         a = app.per_inst.policy_sample if FLAGS.sample_action else app.per_inst.policy_mode
         c = app.per_inst.choice_softmax
-        a = a[c.argmax()]
+        #a = a[c.argmax()]
+        a = (a * np.expand_dims(c, -1)).sum(0) # Interpolate between options
 
         if POLICY_SOFTMAX: a = onehot_vector(np.argmax(a), ACTION_DIMS)
         elif POLICY_BETA: a = a * (np.array(ACTION_CLIP[1])-np.array(ACTION_CLIP[0])) + ACTION_CLIP[0]
