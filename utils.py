@@ -24,10 +24,6 @@ def variable_summaries(var, scope=None):
 
 def tf_gradients(cost, weights): return zip(tf.gradients(cost, weights), weights)
 
-# Prevent dead neurons if taking one-sided input
-concat_neg = lambda x: tf.concat([x, -x], -1)
-double_relu = lambda x: tf.nn.relu(concat_neg(x))
-
 def conv2d(x, W, stride=1, padding='VALID'):
     return tf.nn.conv2d(x, W, strides=[1, stride, stride, 1], padding=padding)
 def max_pool(x, size=4, stride=1, padding='VALID'):

@@ -2,6 +2,8 @@ import tensorflow as tf, numpy as np
 from tensorflow.contrib import rnn
 import sys, os, multiprocessing, time, math
 from utils import *
+from tflayers.mhdpa import *
+from tflayers.tfutils import *
 import er
 
 flags = tf.app.flags
@@ -54,29 +56,32 @@ env._max_episode_steps = None # Disable step limit
 envu = env.unwrapped
 
 from pyglet import gl
-def draw_line(a, b, color=(1,1,1,1)):
+def draw_line(a, b, color=(1,1,1), alpha=1.):
     gl.glLineWidth(3)
     gl.glBegin(gl.GL_LINES)
-    gl.glColor4f(*color)
+    gl.glColor4f(*(color+[0.]))
     gl.glVertex3f(window.width*a[0], window.height*(1-a[1]), 0)
+    gl.glColor4f(*(color+[alpha]))
     gl.glVertex3f(window.width*b[0], window.height*(1-b[1]), 0)
     gl.glEnd()
 def draw_attention():
     if not app.draw_attention or not MHDPA_LAYERS:
         return
-    s = app.per_inst.attention.shape[1:3]
+    s = app.per_inst.attention.shape[1:]
     for head in range(3):
         color = onehot_vector(head, 3)
         for y1 in range(s[0]):
             for x1 in range(s[1]):
-                for y2 in range(s[0]):
-                    for x2 in range(s[1]):
-                        f = app.per_inst.attention[0, y1,x1, y2,x2, head]
-                        if f < 0.1: continue
-                        draw_line(
-                            ((x1+0.5)/s[1], (y1+0.5)/s[0]),
-                            ((x2+0.5)/s[1], (y2+0.5)/s[0]),
-                            color+[f])
+                for a in range(s[2]):
+                    f = app.per_inst.attention[0, y1,x1, a, head]
+                    if f < 0.1: continue
+
+                    idx = app.per_inst.top_k_idx[0][a]
+                    y2, x2 = idx/s[0], idx % s[0]
+                    draw_line(
+                        ((x1+0.5)/s[1], (y1+0.5)/s[0]),
+                        ((x2+0.5)/s[1], (y2+0.5)/s[0]),
+                        color, f)
 def hook_swapbuffers():
     flip = window.flip
     def hook():
@@ -184,16 +189,26 @@ gradient_override.counter = 0
 
 INST_0 = 0
 MB_1 = MB_BN = 1
-def layer_batch_norm(x, activation=None, shared_norm=True):
-    if shared_norm: x = [tf.expand_dims(n, -1) for n in x]
-
+def batch_norm_gen(activation=tf.nn.relu, shared_norm=True):
     norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.5)
-    x = [norm.apply(x[i], i != INST_0) for i in range(len(x))]
-    for w in norm.weights: variable_summaries(w)
+    def ret(n, it):
+        if shared_norm: n = tf.expand_dims(n, -1)
 
-    if shared_norm: x = [tf.reduce_sum(n, -1) for n in x]
-    if activation: x = [activation(n) for n in x]
-    return x
+        training = it != INST_0
+        n = norm.apply(n, training)
+        if it == MB_1:
+            for w in norm.weights: variable_summaries(w)
+
+        if shared_norm: n = tf.reduce_sum(n, -1)
+        if activation: n = activation(n)
+        return n
+    it = 0
+    while True:
+        yield lambda n, it=it: ret(n, it)
+        it += 1
+
+def layer_batch_norm(x, *args):
+    return [g(n) for n,g in zip(x, batch_norm_gen(*args))]
 
 def layer_dense(x, outputs, activation=None, use_bias=False, trainable=True):
     dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable)
@@ -227,13 +242,13 @@ def layer_lstm(x, outputs, ac):
             if i==1: ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
     return x
 
-def make_fc(x, actions=None, activation=tf.nn.relu):
-    with tf.variable_scope('hidden1'):
+def make_fc(x, actions=None):
+    with tf.variable_scope('fc'):
         x = layer_dense(x, FC_UNITS)
-        x = layer_batch_norm(x, activation)
+        x = layer_batch_norm(x)
     return x
 
-    with tf.variable_scope('hidden2'):
+    with tf.variable_scope('fc_1'):
         if USE_LSTM: x = layer_lstm(x, FC_UNITS, ac)
         else: x = layer_dense(x, FC_UNITS)
         x = layer_batch_norm(x)
@@ -244,9 +259,27 @@ def make_fc(x, actions=None, activation=tf.nn.relu):
         x = [activation(n) for n in x]
     return x
 
-def max_pool_all(x):
-    pool_stride = [1, x[0].shape[1], x[0].shape[2], 1]
-    return [tf.layers.flatten(tf.nn.max_pool(n, pool_stride, pool_stride, 'VALID')) for n in x]
+def self_attention_layer(x, l, last_layer):
+    if not MHDPA_LAYERS:
+        return x
+    with tf.variable_scope('mhdpa_%i' % l):
+        top_k, top_k_idx = zip(*[top_k_conv(n, 30) for n in x])
+        mhdpa = MHDPA()
+        A, attention = zip(*[mhdpa.apply(n, k, not last_layer) for n,k in zip(x, top_k)])
+        if last_layer: # Max pool entire image
+            x = A
+            for i in range(2):
+                x = [tf.reduce_max(n, 1) for n in x]
+        else:
+            A = layer_batch_norm(A)
+            x = [n+a for n,a in zip(x,A)]
+
+        if not FLAGS.inst:
+            ac.per_minibatch.__dict__['attention_minmax_%i'%l] = tf.stack([tf.reduce_min(attention[MB_1]), tf.reduce_max(attention[MB_1])])
+        if last_layer:
+            ac.per_inst.top_k_idx = top_k_idx[INST_0]
+            ac.per_inst.attention = attention[INST_0] # Display agent attention
+        return x
 
 def make_conv_net(x):
     LAYERS = [
@@ -267,28 +300,42 @@ def make_conv_net(x):
                 conv = tf.layers.Conv2D(filters, width, stride, **kwds)
             x = [conv.apply(n) for n in x]
             for w in conv.weights: variable_summaries(w)
-
-            x = layer_batch_norm(x, tf.nn.relu)
+            x = layer_batch_norm(x)
             print(x[0].shape)
+
+    #x = self_attention_layer(x, 2, False); print(x[0].shape)
+    x = self_attention_layer(x, 3, True)
     return x
 
-if MHDPA_LAYERS: from tflayers.mhdpa import *
-def make_attention_net(x, ac):
-    for l in range(MHDPA_LAYERS):
-        with tf.variable_scope('mhdpa_%i' % l):
-            if l == 0:
-                mhdpa = MHDPA()
-                x = [concat_coord_xy(n) for n in x]
-            for i,n in enumerate(x):
-                x[i], attention = mhdpa.apply(n)
-                if i==0 and l==(MHDPA_LAYERS-1):
-                    ac.per_inst.attention = attention[INST_0] # Display agent attention
-                if i==1: ac.per_minibatch.__dict__['attention_minmax_%i'%l] = tf.stack([tf.reduce_min(attention), tf.reduce_max(attention)])
-    return x
+def make_shared():
+    if not make_shared.inputs:
+        # Move concat states to last dimension
+        state_inputs = [tf.expand_dims(frame_to_state,0)] + ([] if FLAGS.inst else ph.states)
+        idx = range(len(state_inputs[0].shape))
+        idx = [0] + idx[2:]
+        idx.insert(-1, 1)
+        CONCAT_STATE_DIM = STATE_DIM[:]
+        CONCAT_STATE_DIM[-1] *= er.CONCAT_STATES
+        state_inputs = [tf.reshape(tf.transpose(n,idx), [-1]+CONCAT_STATE_DIM) for n in state_inputs]
+        if not FLAGS.inst:
+            if MB_BN != MB_1: state_inputs.insert(MB_BN, state_inputs[MB_1])
 
-POLICY_OPTIONS = 5
+        make_shared.inputs = state_inputs
+    x = make_shared.inputs
+
+    print(x[0].shape)
+    if CONV_NET: x = make_conv_net(x)
+    else: x = tile_tensors(x)
+
+    x = [tf.layers.flatten(n) for n in x]
+    print(x[0].shape)
+    return Struct(layers=x, weights=scope_vars())
+make_shared.inputs = None
+
+POLICY_OPTIONS = 1
+CONST_POLICY = POLICY_OPTIONS > 1
 def make_policy_dist(hidden, iteration):
-    if POLICY_OPTIONS > 1: hidden = [tf.ones_like(n[:,:1]) for n in hidden]# bias only
+    if CONST_POLICY: hidden = [tf.ones_like(n[:,:1]) for n in hidden]
 
     def layer(scope, activation, outputs=ACTION_DIMS):
         with tf.variable_scope(scope):
@@ -429,7 +476,7 @@ def make_qvalue(shared, value_mean, policy=None):
     ret.nstep_return = ph.rewards[:,:,r] + gamma_nsteps*tf.reduce_max(next_state_value, -1) #tf.reduce_sum(choice*next_state_value, -1)
 
     with tf.variable_scope('error_value'):
-        error_predict = layer_dense(combined, 1)[MB_BN]
+        error_predict = layer_dense(combined, 1)[MB_1]
         error_weights = scope_vars()
 
     def update_qvalue(target_value, importance_ratio, ac=None):
@@ -459,39 +506,13 @@ def make_qvalue(shared, value_mean, policy=None):
     ret.update = update_qvalue
     return ret
 
-def make_shared():
-    if not make_shared.inputs:
-        # Move concat states to last dimension
-        state_inputs = [tf.expand_dims(frame_to_state,0)] + ([] if FLAGS.inst else ph.states)
-        idx = range(len(state_inputs[0].shape))
-        idx = [0] + idx[2:]
-        idx.insert(-1, 1)
-        CONCAT_STATE_DIM = STATE_DIM[:]
-        CONCAT_STATE_DIM[-1] *= er.CONCAT_STATES
-        state_inputs = [tf.reshape(tf.transpose(n,idx), [-1]+CONCAT_STATE_DIM) for n in state_inputs]
-        if not FLAGS.inst:
-            if MB_BN != MB_1: state_inputs.insert(MB_BN, state_inputs[MB_1])
-
-        make_shared.inputs = state_inputs
-    x = make_shared.inputs
-
-    print(x[0].shape)
-    if CONV_NET:
-        x = make_conv_net(x)
-    else:
-        x = tile_tensors(x)
-    if MHDPA_LAYERS: x = make_attention_net(x, ac)
-
-    x = [tf.layers.flatten(n) for n in x]
-    print(x[0].shape)
-    return Struct(layers=x, weights=scope_vars())
-make_shared.inputs = None
-
 opt = tf.train.AdamOptimizer
 opt = Struct(td=opt(FLAGS.learning_rate),
     policy=opt(FLAGS.learning_rate/1e2),
     policy_output=opt(1e-1),
     error=opt(1))
+if not CONST_POLICY:
+    opt.policy_output = opt.policy
 
 def copy_weights(_to, _from, interp=1.):
     assert(len(_to) == len(_from))
@@ -514,7 +535,7 @@ def make_acrl():
         with tf.variable_scope('_'): return make_policy(shared)
 
     def make_networks():
-        shared = None #make_shared()
+        shared = make_shared()
         with tf.variable_scope('policy'): policy = _policy(shared)
         with tf.variable_scope('value'): value = _value(shared)
         ret = Struct(policy=policy, value=value, weights=scope_vars() + (shared.weights if shared else[]))
