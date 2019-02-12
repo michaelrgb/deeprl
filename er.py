@@ -29,8 +29,8 @@ class ERMemory:
         self.frame_dim = frame_dim
 
         self.proclist = []
-        self.current_step = 0
-        self.mb = None
+        self.current_step = -1
+        self.mb = self.buffer = None
 
         self.buffer_size = max(FLAGS.minibatch, 200)
         # Should not replace more of buffer than we have evalulated via a minibatch
@@ -86,9 +86,8 @@ class ERMemory:
             self._proc_seq_set()
         self.seq_set = self.seq_sets.pop() if len(self.seq_sets) else None
 
-    def _fill_buffer(self, seq_step, buf_indices): # buf_indices to replace
-        seq_step += CONCAT_STATES
-        buf = self.buffer
+    def _fill_buffer(self, buf, buf_indices): # buf_indices to replace
+        seq_step = self.current_step + CONCAT_STATES
         for b,buf_idx in enumerate(buf_indices):
             seq = self.seq_set[b % len(self.seq_set)] # % only for filling the entire initial buffer
 
@@ -106,6 +105,20 @@ class ERMemory:
                 buf.rewards[buf_idx, i] = accum_reward
                 buf.nsteps[buf_idx, i] = next_step - seq_step
 
+    def _inc_seq_step(self):
+        if not self.mb:
+            self.mb = self._alloc_batch(FLAGS.minibatch)
+
+        seq_step = self.current_step+1
+        if seq_step+CONCAT_STATES == TRAJECTORY_LENGTH-1:
+            seq_step = 0
+
+        if seq_step == 0:
+            self._new_seq_set()
+            if not self.seq_set: return False
+        self.current_step = seq_step
+        return True
+
     def _alloc_batch(self, size):
         return Struct(
             priority = np.zeros([size]),
@@ -116,22 +129,15 @@ class ERMemory:
             nsteps = np.zeros([size, len(self.nsteps)]))
 
     # Fill entire minibatch from buffer, which is replaced by sampling for lowest buffer priorities.
-    def fill_mb(self):
-        seq_step = self.current_step
-        if seq_step+CONCAT_STATES == TRAJECTORY_LENGTH-1:
-            seq_step = 0
+    def fill_mb_prioritized(self):
+        if not self._inc_seq_step():
+            return None
 
-        if seq_step == 0:
-            self._new_seq_set()
-            if not self.seq_set: return None
-        self.current_step = seq_step+1
-
-        if not self.mb:
-            self.mb = self._alloc_batch(FLAGS.minibatch)
+        if not self.buffer:
             self.buffer = self._alloc_batch(self.buffer_size)
 
             # Fill the entire buffer
-            self._fill_buffer(seq_step, range(self.buffer_size))
+            self._fill_buffer(self.buffer, range(self.buffer_size))
         else:
             # Copy previous minibatch priorities into buffer
             for mb_idx in range(FLAGS.minibatch):
@@ -147,7 +153,7 @@ class ERMemory:
                 all_priorities.pop(chosen)
                 buf_indices.append(chosen)
             #print(self.mb.buffer_idx, buf_indices)
-            self._fill_buffer(seq_step, buf_indices)
+            self._fill_buffer(self.buffer, buf_indices)
 
         mb, buf = self.mb, self.buffer
         buf_idx = self.mb.buffer_idx[-1]
@@ -162,4 +168,12 @@ class ERMemory:
             for n in range(len(self.nsteps)+1):
                 mb.states[n][mb_idx] = buf.states[n][buf_idx]
 
+        return self.mb
+
+    # Sequential minibatches, without prioritized buffer.
+    def fill_mb(self):
+        if not self._inc_seq_step():
+            return None
+
+        self._fill_buffer(self.mb, range(FLAGS.minibatch))
         return self.mb
