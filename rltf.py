@@ -4,6 +4,7 @@ import sys, os, multiprocessing, time, math
 from utils import *
 from tflayers.mhdpa import *
 from tflayers.tfutils import *
+from tflayers.inst_gradients import *
 import er
 
 flags = tf.app.flags
@@ -175,17 +176,13 @@ def apply_gradients(grads, opt, clip_norm=100.):
     ops.per_minibatch.append(opt.apply_gradients(grads))
     return global_norm
 
-# Custom gradients to pre-multiply weight gradients before they are aggregated across the batch.
-def gradient_override(expr, custom_grad):
-    new_op_name = 'new_op_' + str(gradient_override.counter)
-    gradient_override.counter += 1
-    @tf.RegisterGradient(new_op_name)
-    def _grad_(op, grad):
-        return -custom_grad
-    g = tf.get_default_graph()
-    with g.gradient_override_map({"Identity": new_op_name}):
-        return tf.identity(expr)
-gradient_override.counter = 0
+def calc_gradients(cost, mult, weights):
+    if 1:
+        grads = inst_gradients(cost, weights)
+        return inst_gradients_multiply(grads, mult)
+    else:
+        repl = gradient_override(cost, mult)
+        return zip(tf.gradients(repl, weights), weights)
 
 INST_0 = 0
 MB_1 = MB_BN = 1
@@ -212,7 +209,7 @@ def layer_batch_norm(x, *args):
 
 def layer_dense(x, outputs, activation=None, use_bias=False, trainable=True):
     dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable)
-    x = [dense.apply(n) for n in x]
+    x = [apply_layer(dense, n) for n in x]
     for w in dense.weights: variable_summaries(w)
     return x
 
@@ -260,12 +257,12 @@ def make_fc(x, actions=None):
     return x
 
 def self_attention_layer(x, l, last_layer):
-    if not MHDPA_LAYERS:
-        return x
+    if not MHDPA_LAYERS: return x
     with tf.variable_scope('mhdpa_%i' % l):
         top_k, top_k_idx = zip(*[top_k_conv(n, 30) for n in x])
         mhdpa = MHDPA()
-        A, attention = zip(*[mhdpa.apply(n, k, not last_layer) for n,k in zip(x, top_k)])
+        apply_layer
+        A, attention = zip(*[apply_layer(mhdpa, n, k, not last_layer) for n,k in zip(x, top_k)])
         if last_layer: # Max pool entire image
             x = A
             for i in range(2):
@@ -298,7 +295,7 @@ def make_conv_net(x):
                 if len(x[0].shape) == 5: # Back to 2D conv
                     x = [tf.reshape(n, n.shape.as_list()[:3] + [-1]) for n in x]
                 conv = tf.layers.Conv2D(filters, width, stride, **kwds)
-            x = [conv.apply(n) for n in x]
+            x = [apply_layer(conv, n) for n in x]
             for w in conv.weights: variable_summaries(w)
             x = layer_batch_norm(x)
             print(x[0].shape)
@@ -482,18 +479,15 @@ def make_qvalue(shared, value_mean, policy=None):
     def update_qvalue(target_value, importance_ratio, ac=None):
         ret.td_error = td_error = tf.expand_dims(target_value, -1) - ret.q_mb
 
-        repl = gradient_override(error_predict[:,0], tf.reduce_sum((td_error-error_predict)*importance_ratio, -1))
-        grads = tf_gradients(repl, error_weights)
+        grads = calc_gradients(error_predict[:,0], tf.reduce_sum((td_error-error_predict)*importance_ratio, -1), error_weights)
         gnorm_error = apply_gradients(grads, opt.error)
 
         print('VALUE weights')
         for w in ret.weights: print w.name
-        repl = gradient_override(ret.q_mb, td_error * importance_ratio)
-        grad_s = tf_gradients(repl, ret.weights)
+        grad_s = calc_gradients(ret.q_mb, td_error * importance_ratio, ret.weights)
         # TDC - target_value is already gamma-discounted, so dont multiply features by gamma.
         if 1:
-            repl = gradient_override(target_value, -error_predict[:,0] * tf.reduce_sum(importance_ratio, -1))
-            grad_s2 = tf_gradients(repl, ret.weights)
+            grad_s2 = calc_gradients(target_value, -error_predict[:,0] * tf.reduce_sum(importance_ratio, -1), ret.weights)
             for i in range(len(grad_s)):
                 (g, w), g2 = grad_s[i], grad_s2[i][0]
                 grad_s[i] = (g+g2, w)
@@ -565,14 +559,6 @@ def make_acrl():
         state_value = tf.reduce_sum(state_value*new.policy.mb.choice_one_hot, -1)
     new.value.update(target_value, importance_ratio, ac)
 
-    value_grad = tf.gradients(new.value.state, new.policy.mb.mode)[0]
-    if 0:#value_grad is not None:
-        value_grad = tf.where(ph.ddpg, value_grad, tf.zeros_like(value_grad))
-        repl = gradient_override(old.policy.mb.mode, value_grad)
-        weights_deterministic = [w for w in old.policy.weights if not any([name in w.name for name in ['stddev', 'choice']])]
-        grads = tf_gradients(repl, weights_deterministic)
-        ac.per_update.gnorm_policy_ddpg = apply_gradients(grads, opt.policy)
-
     adv = tf.stop_gradient(target_value - state_value)
     adv = tf.maximum(0., adv) # Only towards better actions
     adv_unscaled = adv
@@ -585,10 +571,10 @@ def make_acrl():
     cliprange = 0.2 # PPO objective
     if 1:
         cliprange = math.log(1.+cliprange)
-        cost = -adv * tf.minimum(ratio, tf.clip_by_value(ratio, -cliprange, cliprange))
+        cost =  tf.minimum(ratio, tf.clip_by_value(ratio, -cliprange, cliprange))
     else:
         ratio = tf.exp(ratio)
-        cost = -adv * tf.minimum(ratio, tf.clip_by_value(ratio, 1-cliprange, 1+cliprange))
+        cost =  tf.minimum(ratio, tf.clip_by_value(ratio, 1-cliprange, 1+cliprange))
     ac.policy_ratio = ratio
 
     policy_w = new.policy.weights
@@ -597,10 +583,10 @@ def make_acrl():
     policy_w_output = [w for w in policy_w if 'output_' in w.name]
     policy_w = [w for w in policy_w if w not in policy_w_output]
 
-    grads_adv = tf.gradients(cost, policy_w + policy_w_output)
+    grads_adv = calc_gradients(cost, adv, policy_w + policy_w_output)
     ac.per_minibatch.gnorm_policy_adv =\
-    apply_gradients(zip(grads_adv[:len(policy_w)], policy_w), opt.policy)
-    apply_gradients(zip(grads_adv[len(policy_w):], policy_w_output), opt.policy_output)
+    apply_gradients(grads_adv[:len(policy_w)], opt.policy)
+    apply_gradients(grads_adv[len(policy_w):], opt.policy_output)
 
     maxmin = lambda n: (tf.reduce_max(n, 0), tf.reduce_min(n, 0))
     stats = ac.per_minibatch
@@ -868,6 +854,7 @@ if not FLAGS.inst:
 ops_finish('per_inst')
 
 def train_minibatch(mb):
+    start_time = time.time()
     # Upload & train minibatch
     feed_dict = {
         ph.adv: FLAGS.adv,
@@ -879,6 +866,7 @@ def train_minibatch(mb):
         feed_dict[ph.states[i]] = mb.states[i]
     mb.feed_dict = feed_dict
     r, per_minibatch = ops_run('per_minibatch', feed_dict)
+    per_minibatch.elapsed = time.time() - start_time
     ops_print(per_minibatch)
     # Prioritized experience replay according to TD error.
     mb.priority[:] = per_minibatch.priority
