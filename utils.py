@@ -51,12 +51,6 @@ def accum_value(value, ops_add, ops_clear):
     ops_clear.append(accum.assign(tf.zeros_like(value)))
     return accum
 
-def queue_push(value, ops_push, queue_size=100):
-    queue = tf.Variable(tf.zeros([queue_size] + value.shape.as_list()), trainable=False)
-    new_queue_value = tf.concat([[value], queue[:-1]], 0)
-    ops_push.append(queue.assign(new_queue_value))
-    return ops_push[-1]
-
 def imshow(imlist):
     import matplotlib.pyplot as plt
     kwargs = {'interpolation': 'nearest'}
