@@ -32,7 +32,7 @@ sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
 USE_LSTM = False
 MHDPA_LAYERS = 0#3
-FC_UNITS = 500
+FC_UNITS = 256
 
 DISCRETE_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
@@ -192,14 +192,13 @@ def calc_gradients(cost, mult, weights):
 INST_0 = 0
 MB_1 = MB_BN = 1
 def batch_norm_gen(activation=tf.nn.relu, shared_norm=True):
-    norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.5)
+    norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.9)
     def ret(n, it):
         if shared_norm: n = tf.expand_dims(n, -1)
 
         training = it != INST_0
         n = norm.apply(n, training)
-        if it == MB_1:
-            for w in norm.weights: variable_summaries(w)
+        for w in norm.weights: variable_summaries(w)
 
         if shared_norm: n = tf.reduce_sum(n, -1)
         if activation: n = activation(n)
@@ -218,40 +217,43 @@ def layer_dense(x, outputs, activation=None, use_bias=False, trainable=True):
     for w in dense.weights: variable_summaries(w)
     return x
 
+def context_get(caller, create_ctx, i):
+    scope = tf.get_variable_scope().name.replace('/new/', '/old/') + str(i)
+    if 'contexts' not in caller.__dict__:
+        caller.contexts = {}
+    context_vars = caller.contexts.get(scope)
+    if not context_vars:
+        with tf.variable_scope(str(FLAGS.inst)):
+            context_vars = create_ctx()
+            sess.run(tf.variables_initializer(context_vars))
+            caller.contexts[scope] = context_vars
+    return context_vars
+
+def context_save(caller, context_vars, final_state, i):
+    with tf.control_dependencies(final_state):
+        [ops.per_inst, ops.per_mb][i] += [context_vars[c].assign(final_state[c]) for c in range(len(context_vars))]
+    if i==MB_1:
+        ops.new_batches += [context_vars[c].assign(tf.zeros_like(context_vars[c])) for c in range(len(context_vars))]
+
 def layer_lstm(x, outputs):
     cell = rnn.LSTMCell(outputs, use_peepholes=True)
     x = x[:]
     for i in range(len(x)):
-        scope = tf.get_variable_scope().name.replace('/new/', '/old/') + str(i)
-        initial_state = layer_lstm.initial_states.get(scope)
-        if not initial_state:
-            with tf.variable_scope(str(FLAGS.inst)):
-                zero_state = cell.zero_state(x[i].shape[0], DTYPE)
-                vars = [tf.Variable(s, trainable=False, collections=[None]) for s in zero_state]
-                sess.run(tf.variables_initializer(vars))
-                initial_state = tf.contrib.rnn.LSTMStateTuple(*vars)
-                layer_lstm.initial_states[scope] = initial_state
-
-        x[i], final_state = apply_layer(cell, x[i], extra_args=[initial_state], extra_objs=['_linear1'])
-        for w in cell.weights: variable_summaries(w)
-
-        with tf.control_dependencies(final_state):
-            [ops.per_inst, ops.per_mb][i] += [initial_state[c].assign(final_state[c]) for c in range(2)]
-        if i==MB_1: ops.new_batches += [initial_state[c].assign(tf.zeros_like(initial_state[c])) for c in range(2)]
+        def create_ctx(i=i):
+            return [tf.Variable(tf.zeros((x[i].shape[0], outputs)), trainable=False, collections=[None]) for c in range(2)]
+        context = context_get(layer_lstm, create_ctx, i)
+        with tf.variable_scope('lstm'):
+            x[i], final_state = apply_layer(cell, x[i], extra_args=[context], extra_objs=['_linear1'])
+        context_save(layer_lstm, context, final_state, i)
+    for w in cell.weights: variable_summaries(w)
     return x
-layer_lstm.initial_states = {}
 
 def make_fc(x):
     with tf.variable_scope('fc'):
         if USE_LSTM: x = layer_lstm(x, FC_UNITS)
-        else: x = layer_dense(x, FC_UNITS)
-        x = layer_batch_norm(x)
-    return x
-
-    with tf.variable_scope('fc_1'):
-        if USE_LSTM: x = layer_lstm(x, FC_UNITS, ac)
-        else: x = layer_dense(x, FC_UNITS)
-        x = layer_batch_norm(x)
+        else:
+            x = layer_dense(x, FC_UNITS)
+            x = layer_batch_norm(x)
     return x
 
 def self_attention_layer(x, l, last_layer):
@@ -342,20 +344,10 @@ def make_policy_dist(hidden, iteration):
         if POLICY_BETA: return [tf.distributions.Beta(1.+a, 1.+b) for a,b in
             zip(layer('alpha', tf.nn.softplus), layer('beta', tf.nn.softplus))]
 
-        mean = layer('mean', tf.sigmoid)
-        #mean = [m*(1+h)/2 for m,h in zip(mean, layer('mult', tf.sigmoid))]
-
-        if ACTION_TANH: # Multiply specific axes with tanh
-            tanh = layer('tanh', tf.tanh, len(ACTION_TANH))
-            for i in range(len(mean)):
-                mult = [tf.ones_like(tanh[i][:,0])]*ACTION_DIMS
-                for j,t in enumerate(ACTION_TANH):
-                    mult[t] = tanh[i][:,j]
-                mean[i] *= tf.stack(mult, -1)
-
+        mean = layer('mean', None)
         MIN_STD = 0.1 # Unstable policy gradient for very small stddev
-        return [tf.distributions.Normal(m, MIN_STD) for m in mean]
-            #+s) for m,s in zip(mean, layer('stddev', tf.nn.softplus))]
+        return [tf.distributions.Normal(m, MIN_STD#) for m in mean]
+            +s) for m,s in zip(mean, layer('stddev', tf.nn.softplus))]
 
 def make_policy(shared):
     hidden = make_fc(shared.layers)
@@ -425,24 +417,20 @@ def make_qvalue(shared):
     ret = Struct(q=q, weights=scope_vars() + shared.weights, q_inst=q[INST_0])
     if FLAGS.inst: return ret
     ret.q_mb = q[MB_1][:,0]
-
-    rewards = queue_push(ph.rewards[:,r], True)
-    state_values = queue_push(ret.q_mb, True)
-
-    gamma_steps = FLAGS.gamma**tf.cast(range_steps, tf.float32)
-    ret.nstep_return = state_values*gamma_steps +\
-        tf.concat([tf.zeros_like(rewards[:1]), (tf.cumsum(rewards)*gamma_steps)[:-1]], 0)
+    ret.state_values = queue_push(ret.q_mb, True)
 
     with tf.variable_scope('error_value'):
         error_predict = layer_dense(combined, 1)[MB_1][:,0]
         error_weights = scope_vars()
 
-    def update_qvalue(td_error, importance_ratio):
+    def update_qvalue(target_value, importance_ratio):
+        td_error = target_value - ret.state_values[0]
+
         grads = calc_gradients(error_predict, (td_error-error_predict) * importance_ratio, error_weights)
         gnorm_error = apply_gradients(grads, opt.error)
 
         print('VALUE weights')
-        for w in ret.weights: print w.name
+        for w in ret.weights: print(w.name, w.shape.as_list())
         grad_s = calc_gradients(ret.q_mb, td_error * importance_ratio, ret.weights)
         if 0:
             grad_s2 = calc_gradients(target_value, -error_predict * importance_ratio, ret.weights)
@@ -453,13 +441,14 @@ def make_qvalue(shared):
 
         ac.per_mb.gnorm_error = gnorm_error
         ac.per_mb.gnorm_qvalue = gnorm
+        return td_error
 
     ret.update = update_qvalue
     return ret
 
 opt = tf.train.AdamOptimizer
 opt = Struct(td=opt(FLAGS.learning_rate),
-    policy=opt(FLAGS.learning_rate/1e2),
+    policy=opt(FLAGS.learning_rate/10),
     policy_output=opt(1e-1),
     error=opt(1))
 if not CONST_POLICY:
@@ -484,11 +473,10 @@ def make_acrl():
         with tf.variable_scope('_'): return make_policy(shared)
 
     def make_networks():
-        shared = make_shared()
+        shared = make_shared() if 0 else None
         with tf.variable_scope('policy'): policy = _policy(shared)
         with tf.variable_scope('value'): value = _value(shared)
         ret = Struct(policy=policy, value=value, weights=scope_vars() + (shared.weights if shared else[]))
-        ret.norm_weights = [w for w in scope_vars(GLOBAL=True) if w not in ret.weights]
         return ret
 
     with tf.variable_scope('old'):
@@ -507,20 +495,23 @@ def make_acrl():
     seq_len = er.TRAJECTORY_LENGTH
     queue_len = seq_len - tf.mod(ph.mb_count-FLAGS.nsteps+1, seq_len)
 
+    rewards = queue_push(ph.rewards[:,r], True)
+    state_values = old.value.state_values
+
+    gamma_steps = FLAGS.gamma**tf.cast(range_steps, tf.float32)
+    nstep_return = state_values*gamma_steps +\
+        tf.concat([tf.zeros_like(rewards[:1]), (tf.cumsum(rewards)*gamma_steps)[:-1]], 0)
     # Check nsteps from the same sequence as current state
-    nstep_return = new.value.nstep_return
-    state_value = nstep_return[0]
     nstep_return = tf.where(tf.tile(range_steps<queue_len, [1, FLAGS.minibatch]), nstep_return,
         tf.tile([tf.gather(nstep_return, tf.minimum(FLAGS.nsteps, queue_len)-1)], [FLAGS.nsteps, 1]))[1:]
 
     return_value = nstep_return[-1]
-    target_value = tf.maximum(nstep_return[0], nstep_return[-1])
+    target_value = nstep_return[-1]
 
-    td_error = target_value - state_value
     importance_ratio = queue_push(old.policy.importance_ratio)
-    new.value.update(td_error, importance_ratio)
+    td_error = new.value.update(target_value, importance_ratio)
 
-    adv = tf.stop_gradient(return_value - state_value)
+    adv = tf.stop_gradient(return_value - state_values[0])
     adv = tf.maximum(0., adv) # Only towards better actions
     adv_unscaled = adv
 
@@ -539,7 +530,7 @@ def make_acrl():
 
     policy_w = new.policy.weights
     print('POLICY weights:')
-    for w in policy_w: print w.name
+    for w in policy_w: print(w.name, w.shape.as_list())
     policy_w_output = [w for w in policy_w if 'output_' in w.name]
     policy_w = [w for w in policy_w if w not in policy_w_output]
 
@@ -854,7 +845,8 @@ def rl_loop():
             global mb
             mb = ermem.fill_mb()
             if mb != None:
-                #if mb.step==0: sess.run(ops.new_batches) # Minibatch now has different steps
+                if not app.mb_count % er.TRAJECTORY_LENGTH:
+                    sess.run(ops.new_batches)
                 train_minibatch(mb)
                 train_update_policy()
         env_render() # Render needed for keyboard events

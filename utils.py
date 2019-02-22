@@ -12,6 +12,10 @@ def softmax(x):
     return e_x / e_x.sum()
 
 def variable_summaries(var, scope=None):
+    if var.name in variable_summaries.vars:
+        return
+    variable_summaries.vars.append(var)
+
     if not scope: scope = var.name.split('/')[-1].split(':')[0]
     with tf.name_scope(scope):
         tf.summary.scalar('min', tf.reduce_min(var))
@@ -21,6 +25,7 @@ def variable_summaries(var, scope=None):
         stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
         tf.summary.scalar('stddev', stddev)
         tf.summary.histogram('histogram', var)
+variable_summaries.vars = []
 
 def tf_gradients(cost, weights): return zip(tf.gradients(cost, weights), weights)
 
