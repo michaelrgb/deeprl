@@ -30,11 +30,11 @@ if not FLAGS.inst:
     server = tf.train.Server({'local': [PORT]}, protocol=PROTOCOL, start=True)
 sess = tf.InteractiveSession(PROTOCOL+'://'+PORT)
 
-USE_LSTM = False
+LSTM_UNROLL = 0
 MHDPA_LAYERS = 0#3
 FC_UNITS = 256
 
-DISCRETE_ACTIONS = []
+FIXED_ACTIONS = []
 ENV_NAME = os.getenv('ENV')
 er.ENV_NAME = ENV_NAME
 if not ENV_NAME:
@@ -44,6 +44,14 @@ if ENV_NAME == 'CarRacing-v0':
     car_racing = gym.envs.box2d.car_racing
     car_racing.WINDOW_W = 800 # Default is huge
     car_racing.WINDOW_H = 600
+    FIXED_ACTIONS = [
+        [-1., 0., 0.],
+        [1., 0., 0.],
+        [0., 1., 0.],
+        [0., 0., 1.],
+        [0., 0., 0.]]
+elif ENV_NAME == 'MountainCarContinuous-v0':
+    FIXED_ACTIONS = [[-1.], [1.]]
 elif ENV_NAME == 'FlappyBird-v0':
     import gym_ple # [512, 288]
 elif 'Bullet' in ENV_NAME:
@@ -171,18 +179,19 @@ def apply_gradients(grads, opt, clip_norm=100.):
     ops.per_mb.append(opt.apply_gradients(grads))
     return global_norm
 
-def queue_push(value, shift_queue=False):
-    queue_size = FLAGS.nsteps
+def queue_push(value, shift_queue=False, queue_size=FLAGS.nsteps):
     queue = tf.Variable(tf.zeros([queue_size] + value.shape.as_list()), trainable=False)
     if shift_queue:
         # op[0] is oldest value, and the next to be discarded
         new_queue_value = tf.concat([queue[1:], [value]], 0)
         op = queue.assign(new_queue_value)
         ops.per_mb.append(op)
+        ops.new_batches.append(queue.assign(tf.zeros_like(queue)))
+        return new_queue_value
     else:
         op = tf.scatter_update(queue, tf.mod(ph.mb_count-1, FLAGS.nsteps), value)
         op = op[tf.mod(ph.mb_count, FLAGS.nsteps)]
-    return op
+        return op
 
 def calc_gradients(cost, mult, weights):
     grads = inst_gradients(cost, weights)
@@ -191,29 +200,30 @@ def calc_gradients(cost, mult, weights):
 
 INST_0 = 0
 MB_1 = MB_BN = 1
-def batch_norm_gen(activation=tf.nn.relu, shared_norm=True):
-    norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.9)
+def batch_norm_gen(norm_groups=0, activation=tf.nn.relu):
+    norm = tf.layers.BatchNormalization(scale=False, center=False, momentum=0.1)
     def ret(n, it):
-        if shared_norm: n = tf.expand_dims(n, -1)
+        if norm_groups:
+            n = tf.reshape(n, n.shape.as_list()[:-1] + [n.shape[-1]/norm_groups, norm_groups])
 
         training = it != INST_0
         n = norm.apply(n, training)
         for w in norm.weights: variable_summaries(w)
 
-        if shared_norm: n = tf.reduce_sum(n, -1)
+        if norm_groups:
+            n = tf.reshape(n, n.shape.as_list()[:-2] + [-1])
         if activation: n = activation(n)
         return n
     it = 0
     while True:
         yield lambda n, it=it: ret(n, it)
         it += 1
-
 def layer_batch_norm(x, *args):
     return [g(n) for n,g in zip(x, batch_norm_gen(*args))]
 
 def layer_dense(x, outputs, activation=None, use_bias=False, trainable=True):
     dense = tf.layers.Dense(outputs, activation, use_bias, trainable=trainable)
-    x = [apply_layer(dense, n) for n in x]
+    x = [apply_layer(dense, [n]) for n in x]
     for w in dense.weights: variable_summaries(w)
     return x
 
@@ -224,7 +234,7 @@ def context_get(caller, create_ctx, i):
     context_vars = caller.contexts.get(scope)
     if not context_vars:
         with tf.variable_scope(str(FLAGS.inst)):
-            context_vars = create_ctx()
+            context_vars = create_ctx(i)
             sess.run(tf.variables_initializer(context_vars))
             caller.contexts[scope] = context_vars
     return context_vars
@@ -232,28 +242,39 @@ def context_get(caller, create_ctx, i):
 def context_save(caller, context_vars, final_state, i):
     with tf.control_dependencies(final_state):
         [ops.per_inst, ops.per_mb][i] += [context_vars[c].assign(final_state[c]) for c in range(len(context_vars))]
-    if i==MB_1:
-        ops.new_batches += [context_vars[c].assign(tf.zeros_like(context_vars[c])) for c in range(len(context_vars))]
 
 def layer_lstm(x, outputs):
-    cell = rnn.LSTMCell(outputs, use_peepholes=True)
+    batch_norm = batch_norm_gen(None)
+    cell = LSTMCellBN(outputs)
+    #cell = rnn.LSTMCell(outputs)
     x = x[:]
-    for i in range(len(x)):
-        def create_ctx(i=i):
+
+    with tf.variable_scope('lstm'):
+        def create_ctx(i):
             return [tf.Variable(tf.zeros((x[i].shape[0], outputs)), trainable=False, collections=[None]) for c in range(2)]
-        context = context_get(layer_lstm, create_ctx, i)
-        with tf.variable_scope('lstm'):
-            x[i], final_state = apply_layer(cell, x[i], extra_args=[context], extra_objs=['_linear1'])
-        context_save(layer_lstm, context, final_state, i)
+        context = context_get(layer_lstm, create_ctx, INST_0)
+        cell.batch_norm = next(batch_norm)
+        x[INST_0], final_state = apply_layer(cell, [x[INST_0], context], extra_objs=['_linear1'])
+        context_save(layer_lstm, context, final_state, INST_0)
+        if FLAGS.inst:
+            return x
+
+        x[MB_1] = queue_push(x[MB_1], True, LSTM_UNROLL)
+        cell.batch_norm = next(batch_norm)
+        context = None
+        for u in range(LSTM_UNROLL):
+            n, context = apply_layer(cell, [x[MB_1][u], context], extra_objs=['_linear1'])
+        x[MB_1] = n
+
     for w in cell.weights: variable_summaries(w)
     return x
 
 def make_fc(x):
     with tf.variable_scope('fc'):
-        if USE_LSTM: x = layer_lstm(x, FC_UNITS)
+        if LSTM_UNROLL: x = layer_lstm(x, FC_UNITS)
         else:
             x = layer_dense(x, FC_UNITS)
-            x = layer_batch_norm(x)
+            x = layer_batch_norm(x, 32)
     return x
 
 def self_attention_layer(x, l, last_layer):
@@ -261,7 +282,7 @@ def self_attention_layer(x, l, last_layer):
     with tf.variable_scope('mhdpa_%i' % l):
         top_k, top_k_idx = zip(*[top_k_conv(n, 30) for n in x])
         mhdpa = MHDPA()
-        A, attention = zip(*[apply_layer(mhdpa, n, k, not last_layer) for n,k in zip(x, top_k)])
+        A, attention = zip(*[apply_layer(mhdpa, [n, k, not last_layer]) for n,k in zip(x, top_k)])
         if last_layer: # Max pool entire image
             x = A
             for i in range(2):
@@ -294,7 +315,7 @@ def make_conv_net(x):
                 if len(x[0].shape) == 5: # Back to 2D conv
                     x = [tf.reshape(n, n.shape.as_list()[:3] + [-1]) for n in x]
                 conv = tf.layers.Conv2D(filters, width, stride, **kwds)
-            x = [apply_layer(conv, n) for n in x]
+            x = [apply_layer(conv, [n]) for n in x]
             for w in conv.weights: variable_summaries(w)
             x = layer_batch_norm(x)
             print(x[0].shape)
@@ -315,7 +336,6 @@ def make_shared():
         state_inputs = [tf.reshape(tf.transpose(n,idx), [-1]+CONCAT_STATE_DIM) for n in state_inputs]
         if not FLAGS.inst:
             if MB_BN != MB_1: state_inputs.insert(MB_BN, state_inputs[MB_1])
-
         make_shared.inputs = state_inputs
     x = make_shared.inputs
 
@@ -328,10 +348,14 @@ def make_shared():
     return Struct(layers=x, weights=scope_vars())
 make_shared.inputs = None
 
-POLICY_OPTIONS = 1
-CONST_POLICY = POLICY_OPTIONS > 1
+POLICY_OPTIONS = max(1, len(FIXED_ACTIONS))
 def make_policy_dist(hidden, iteration):
-    if CONST_POLICY: hidden = [tf.ones_like(n[:,:1]) for n in hidden]
+    MIN_STD = 0.1 # Unstable policy gradient for very small stddev
+
+    if FIXED_ACTIONS:
+        return [tf.distributions.Normal([FIXED_ACTIONS[iteration]], MIN_STD) for n in hidden]
+    if POLICY_OPTIONS > 1:
+        hidden = [tf.ones_like(n[:,:1]) for n in hidden]
 
     def layer(scope, activation, outputs=ACTION_DIMS):
         with tf.variable_scope(scope):
@@ -345,7 +369,6 @@ def make_policy_dist(hidden, iteration):
             zip(layer('alpha', tf.nn.softplus), layer('beta', tf.nn.softplus))]
 
         mean = layer('mean', None)
-        MIN_STD = 0.1 # Unstable policy gradient for very small stddev
         return [tf.distributions.Normal(m, MIN_STD#) for m in mean]
             +s) for m,s in zip(mean, layer('stddev', tf.nn.softplus))]
 
@@ -356,13 +379,13 @@ def make_policy(shared):
     policy = zip(*[make_policy_dist(hidden, i) for i in range(POLICY_OPTIONS)])
     if POLICY_OPTIONS > 1:
         with tf.variable_scope('choice'):
-            choice_dist = layer_dense(hidden, POLICY_OPTIONS, tf.distributions.Categorical)
+            choice_dist = [tf.distributions.Categorical(n) for n in layer_dense(hidden, POLICY_OPTIONS)]
         sample_idx = INST_0
         choice = [tf.one_hot(c.sample() if i==sample_idx else c.mode(), POLICY_OPTIONS) for i,c in enumerate(choice_dist)]
         choice_logits = [n.logits for n in choice_dist]
     else:
         choice = choice_logits = [tf.ones(shape=[n.shape[0], 1]) for n in hidden]
-    ret = Struct(choice=choice)
+    ret = Struct(choice=choice, weights=scope_vars()+shared.weights)
 
     sub_mode = [tf.stack([p.mode() for p in policy[i]], 1) for i in rng]
     sub_sample = [tf.stack([p.sample() for p in policy[i]], 1) for i in rng]
@@ -381,26 +404,22 @@ def make_policy(shared):
         ph_actions = tf.clip_by_value(ph_actions, 0.01, 0.99)
     else: ph_actions = ph.actions
 
-    logits = choice_logits[MB_1]
-    ret.mb = Struct(mode=mode[MB_1], choice_softmax=tf.nn.softmax(logits))
-    ret.mb.choice_one_hot = tf.one_hot(tf.argmax(ret.mb.choice_softmax, -1), POLICY_OPTIONS)
-
+    ret.mb = Struct(mode=mode[MB_1], choice_softmax=tf.nn.softmax(choice_logits[MB_1]))
+    log_softmax = tf.log(tf.minimum(0.98, ret.mb.choice_softmax))
     def action_log_prob(actions):
         log_prob_sub = tf.stack([p.log_prob(actions(p)) for p in policy[MB_1]], -1)
         if not POLICY_SOFTMAX:
             log_prob_sub = tf.reduce_sum(log_prob_sub, 1) # Multiply action axes together
-        log_prob = tf.stop_gradient(ret.mb.choice_softmax) * log_prob_sub
-        return tf.reduce_sum(log_prob, -1), log_prob_sub
+        log_prob = log_prob_sub + log_softmax
+        return tf.reduce_logsumexp(log_prob, -1), log_prob_sub
 
-    log_prob, ret.log_prob_sub = action_log_prob(lambda _: ph_actions)
-    peak_log_prob, _ = action_log_prob(lambda p: p.mode())
-    ret.importance_ratio = tf.exp(log_prob-peak_log_prob)
+    logsumexp, log_prob_sub = action_log_prob(lambda _: ph_actions)
+    peak_logsumexp, _ = action_log_prob(lambda p: p.mode())
+    ret.importance_ratio = tf.exp(logsumexp-peak_logsumexp)
 
-    sub_softmax = tf.nn.softmax(ret.log_prob_sub)
-    ret.log_prob = log_prob + tf.reduce_sum(# Not for importance_ratio
-        tf.stop_gradient(sub_softmax) * tf.log(ret.mb.choice_softmax), -1)
-
-    ret.weights = scope_vars() + shared.weights
+    ret.log_prob = tf.reduce_sum(
+        tf.stop_gradient(tf.nn.softmax(log_prob_sub)) * log_softmax +
+        tf.stop_gradient(ret.mb.choice_softmax) * log_prob_sub, -1)
     return ret
 
 def tile_tensors(x, tiles=10):
@@ -414,7 +433,7 @@ def make_qvalue(shared):
     with tf.variable_scope('output'):
         q = layer_dense(combined, 1)
 
-    ret = Struct(q=q, weights=scope_vars() + shared.weights, q_inst=q[INST_0])
+    ret = Struct(q=q, weights=shared.weights + scope_vars(), q_inst=q[INST_0])
     if FLAGS.inst: return ret
     ret.q_mb = q[MB_1][:,0]
     ret.state_values = queue_push(ret.q_mb, True)
@@ -449,15 +468,15 @@ def make_qvalue(shared):
 opt = tf.train.AdamOptimizer
 opt = Struct(td=opt(FLAGS.learning_rate),
     policy=opt(FLAGS.learning_rate/10),
-    policy_output=opt(1e-1),
     error=opt(1))
-if not CONST_POLICY:
-    opt.policy_output = opt.policy
 
-def copy_weights(_to, _from, interp=1.):
+def copy_weights(_to, _from, lerp=1.):
     assert(len(_to) == len(_from))
-    return [to.assign(w) for to,w in zip(_to, _from)]
-    #interp*w + (1-interp)*to)
+    copy_ops = [to.assign(lerp*w + (1-lerp)*to) for to,w in zip(_to, _from)]
+    if lerp != 1.:
+        with tf.control_dependencies(copy_ops):
+            copy_ops += copy_weights(_from, _to)
+    return copy_ops
 
 allac = []
 def make_acrl():
@@ -518,26 +537,24 @@ def make_acrl():
     # Normalize the advantages
     #adv /= tf.reduce_sum(adv) + 1e-8
 
-    ratio = new.policy.log_prob - old.policy.log_prob
-    cliprange = 0.2 # PPO objective
-    if 1:
-        cliprange = math.log(1.+cliprange)
-        cost = tf.minimum(ratio, tf.clip_by_value(ratio, -cliprange, cliprange))
-    else:
-        ratio = tf.exp(ratio)
-        cost = tf.minimum(ratio, tf.clip_by_value(ratio, 1-cliprange, 1+cliprange))
-    ac.policy_ratio = ratio
-
     policy_w = new.policy.weights
     print('POLICY weights:')
     for w in policy_w: print(w.name, w.shape.as_list())
     policy_w_output = [w for w in policy_w if 'output_' in w.name]
     policy_w = [w for w in policy_w if w not in policy_w_output]
 
-    grads_adv = calc_gradients(cost, adv, policy_w + policy_w_output)
-    ac.per_mb.gnorm_policy_adv =\
-    apply_gradients(grads_adv[:len(policy_w)], opt.policy)
-    apply_gradients(grads_adv[len(policy_w):], opt.policy_output)
+    policy_ratio = new.policy.log_prob - old.policy.log_prob # PPO objective
+    cliprange = 0.2
+    if 1:
+        policy_ratio = tf.exp(tf.minimum(1., policy_ratio))
+        cliprange += 1.
+    ratio = queue_push(policy_ratio)
+
+    adv = tf.where(ratio < cliprange, adv, tf.zeros_like(adv))
+    grads_adv = calc_gradients(policy_ratio, adv, policy_w + policy_w_output)
+
+    ac.per_mb.gnorm_policy_adv = apply_gradients(grads_adv[:len(policy_w)], opt.policy)
+    if policy_w_output:          apply_gradients(grads_adv[len(policy_w):], opt.policy)
 
     maxmin = lambda n: (tf.reduce_max(n, 0), tf.reduce_min(n, 0))
     stats = ac.per_mb
@@ -546,10 +563,10 @@ def make_acrl():
     stats.policy_max, stats.policy_min = maxmin(old.policy.mb.mode)
     abs_error = tf.abs(td_error)
     stats.abs_error_sum = tf.reduce_sum(abs_error)
-    stats.policy_ratio_max, _ = maxmin(ac.policy_ratio)
-    stats.policy_ratio_mean = tf.reduce_mean(ac.policy_ratio, 0)
+    stats.policy_ratio_max, _ = maxmin(policy_ratio)
+    stats.policy_ratio_mean = tf.reduce_mean(policy_ratio, 0)
     stats.importance_ratio_max, stats.importance_ratio_min = maxmin(importance_ratio)
-    stats.log_prob_max, stats.log_prob_min = maxmin(old.policy.log_prob_sub)
+    stats.log_prob_max, stats.log_prob_min = maxmin(old.policy.log_prob)
     stats.choice_softmax_max, _ = maxmin(old.policy.mb.choice_softmax)
     stats.priority = abs_error + adv_unscaled
 
