@@ -1,4 +1,5 @@
 import tensorflow as tf, numpy as np
+import pudb; dbg = pudb.set_trace
 DTYPE = tf.float32
 
 def loop_while(f):
@@ -6,7 +7,9 @@ def loop_while(f):
 def wrapList(value):
     return value if type(value) == list else [value]
 class Struct:
-    def __init__(self, **entries): self.__dict__.update(entries)
+    def __init__(self, **entries): self.update(**entries)
+    def update(self, **entries): self.__dict__.update(entries)
+
 def softmax(x):
     e_x = np.exp(x - x.max())
     return e_x / e_x.sum()
@@ -31,10 +34,11 @@ def tf_gradients(cost, weights): return zip(tf.gradients(cost, weights), weights
 
 def conv2d(x, W, stride=1, padding='VALID'):
     return tf.nn.conv2d(x, W, strides=[1, stride, stride, 1], padding=padding)
-def max_pool(x, size=4, stride=1, padding='VALID'):
+def pool(x, size, op=tf.nn.max_pool, stride=0, padding='VALID'):
+    stride = stride or size
     x = wrapList(x)
-    return [tf.nn.max_pool(i, ksize=[1, size, size, 1],
-                           strides=[1, stride, stride, 1], padding=padding) for i in x]
+    return [op(i, ksize=[1, size, size, 1],
+               strides=[1, stride, stride, 1], padding=padding) for i in x]
 
 def weight_variable(shape, init_zeros=False):
     return tf.Variable(initial_value=tf.zeros(shape) if init_zeros else

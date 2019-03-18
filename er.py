@@ -9,7 +9,7 @@ TRAJECTORY_LENGTH = 100
 # Frames an action is repeated for, combined into a state
 ACTION_REPEAT = 3
 # Concat frame states instead of repeating actions over multiple frames
-CONCAT_STATES = 1
+CONCAT_STATES = 2
 
 ER_REWARDS = 1
 
